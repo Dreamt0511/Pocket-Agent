@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+Rich UI 组件 - 美化终端界面
+参考 CyberClaw 的 UI 设计
+"""
+
+import sys
+from datetime import datetime
+from typing import Optional
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.live import Live
+from rich.markdown import Markdown
+import time
+
+
+from rich.rule import Rule
+from rich.text import Text
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+import os
+
+class PocketUI:
+    """
+    Pocket-Agent 的 Rich UI 管理
+    """
+    
+    def __init__(self):
+        self.console = Console()
+        # 初始化输入会话，带历史记录
+        history_path = os.path.expanduser("~/.pocket_agent_history")
+        self.prompt_session = PromptSession(history=FileHistory(history_path))
+        
+    def print_banner(self, model_name: str = ""):
+        """打印首页横幅"""
+        model_line = f"\n{model_name}" if model_name else ""
+        banner = f"""
+        
+  █▀█ █▀█ █▀▀ █ █ █▀▀ ▀█▀   █▀█ █▀▀ █▀▀ █▀█ ▀█▀
+ █▀▀ █ █ █   █▀▄ █▀▀  █    █▀█ █ █ █▀▀ █ █  █
+ ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀  ▀    ▀ ▀ ▀▀▀ ▀▀▀ ▀ ▀  ▀                   
+
+  Pocket-Agent — 移动端AI代理帮手
+        
+  轻量、快速、智能{model_line}
+        """
+        
+        self.console.print(Panel(
+            Text(banner, justify="center", style="bold cyan"),
+            border_style="blue",
+            padding=(1, 2)
+        ))
+    
+    def print_tool_call(self, tool_name: str, params: dict):
+        """打印工具调用"""
+        params_text = ", ".join([f"{k}={v}" for k, v in params.items()])
+        
+        self.console.print(Panel(
+            f"✨ 调用 {tool_name}({params_text})",
+            border_style="green",
+            padding=(0, 1)
+        ))
+    
+    def print_tool_result(self, result: str):
+        """打印工具结果"""
+        self.console.print(Panel(
+            result[:500] + "..." if len(result) > 500 else result,
+            title="✅ 工具返回",
+            border_style="cyan",
+            padding=(0, 1)
+        ))
+    
+    def print_agent_thinking(self):
+        """打印代理思考中"""
+        self.console.print(
+            Panel(
+                Text(" ⏳ 代理正在思考...", style="italic yellow"),
+                border_style="yellow",
+                padding=(0, 1)
+            )
+        )
+    
+    def print_agent_response(self, response: str):
+        """打印AI回复 - 纯文本，不渲染Markdown"""
+        # 移除首尾空白，保留结构
+        response = response.strip()
+        # 纯文本直接输出，不处理Markdown
+        self.console.print(f"[cyan]{response}[/cyan]\n")
+    
+    def print_user_input_prompt(self):
+        """打印用户输入提示 - 使用prompt_toolkit解决退格显示问题，双横线包裹输入区域"""
+        from rich.rule import Rule
+        
+        # 非交互模式
+        if not sys.stdin.isatty():
+            # 非交互模式不需要提前显示分隔线
+            try:
+                self.console.print("[bold green]🪀 你:[/bold green] ", end="")
+                input_text = sys.stdin.readline().rstrip('\n')
+                return input_text
+            except (EOFError, KeyboardInterrupt):
+                return "exit"
+        
+        # 交互模式：显示上下分隔线
+        self.console.print(Rule(style="dim cyan"))
+        # 预留输入行
+        self.console.print()  # 空行放用户输入
+        self.console.print(Rule(style="dim cyan"))
+        # 光标上移2行，回到输入位置
+        sys.stdout.write("\x1b[2A\r")
+        sys.stdout.flush()
+        
+        # 交互模式：使用prompt_toolkit优化输入体验
+        try:
+            user_input = self.prompt_session.prompt(
+                "👉 你: ",
+                enable_history_search=True
+            )
+            return user_input
+        except (EOFError, KeyboardInterrupt):
+            return "exit"
+    
+    def print_memory_info(self, memory_content: str):
+        """打印记忆信息"""
+        self.console.print(Panel(
+            memory_content[:300] + "..." if len(memory_content) > 300 else memory_content,
+            title="📚 记忆提取",
+            border_style="magenta",
+            padding=(0, 1)
+        ))
+    
+    def print_system_info(self, info: str):
+        """打印系统信息"""
+        self.console.print(
+            Panel(
+                info,
+                title="💭 系统信息",
+                border_style="dim",
+                padding=(0, 1)
+            )
+        )
+    
+    def show_loading_spinner(self, task_description: str):
+        """显示加载中动画"""
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True
+        ) as progress:
+            progress.add_task(task_description, total=None)
+            time.sleep(1)  # 模拟加载
+    
+    def print_stream_chunk(self, chunk: str):
+        """逐字打印流式输出块，模拟打字机效果（和横幅一样的青蓝色）"""
+        self.console.print(chunk, end="", style="bold cyan", no_wrap=True, overflow="crop")
+        self.console.file.flush()
+    
+    def print_streaming(self, text: str):
+        """打印流式文本"""
+        self.console.print(f"[cyan]正在流式输出: {text}[/cyan]", end="", flush=True)
+    
+    def print_error(self, error_msg: str):
+        """打印错误信息"""
+        self.console.print(
+            Panel(
+                f"⚠️ {error_msg}",
+                border_style="red",
+                style="bold red"
+            )
+        )
+    
+    def print_conversation_stats(self, tool_calls: int, tools_available: int):
+        """打印对话统计信息"""
+        self.console.print(
+            Panel(
+                f"📊 对话统计\n• 工具调用次数: {tool_calls}\n• 可用工具数: {tools_available}",
+                title="💡 统计",
+                border_style="dim cyan",
+                padding=(0, 1)
+            )
+        )
+    
+    def print_success(self, msg: str):
+        """打印成功信息"""
+        self.console.print(f"[bold green]{msg}[/bold green]")
+
+    def print_info(self, msg: str):
+        """打印提示信息"""
+        self.console.print(f"[bold yellow]💡 {msg}[/bold yellow]")
+    
+    def create_ascii_art(self, text: str) -> str:
+        """生成简单的ASCII艺术"""
+        ascii_art = f"""
+{'=' * (len(text) + 4)}
+  {text}  
+{'=' * (len(text) + 4)}
+        """
+        return ascii_art.strip()
+    
+    def show_welcome_screen(self, model_name: str = ""):
+        """显示欢迎界面 — 只保留蓝框横幅"""
+        self.console.clear()
+        self.print_banner(model_name)
+
+
+# 例子使用
+if __name__ == "__main__":
+    ui = PocketUI()
+    ui.show_welcome_screen()
+    
+    # 测试各种组件
+    ui.print_tool_call("get_weather", {"location": "北京"})
+    ui.print_tool_result("北京今天晴朗，25°C")
+    ui.print_agent_response("你好！我是Pocket-Agent，专注于移动端AI助手。")
+    ui.print_memory_info("从记忆中找到了你喜欢看天气预报")

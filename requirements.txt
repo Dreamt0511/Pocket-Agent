@@ -1,0 +1,17 @@
+# Pocket-Agent 依赖文件
+
+# 基础依赖
+rich>=13.0.0    # 终端UI美化
+requests>=2.25.0  # HTTP请求库（用于LLM API）
+
+# 如需更强大的系统信息，可以添加：
+# psutil>=5.8.0    # 系统监控
+
+# 注意：目前版本支持LLM集成
+# 适合移动端和服务器部署
+
+# LangChain 相关依赖
+langchain>=0.2.0
+langgraph>=0.2.0
+langchain-openai>=0.1.0
+python-multipart>=0.0.9
