@@ -23,14 +23,17 @@ from core.langchain_adapter import (
     convert_all_tools
 )
 
-# 导入现有工具
+# 导入现有工具 - 失败时使用空列表不影响基础功能
+BASIC_TOOLS = []
+ALL_MCP_TOOLS = []
 try:
     from tools.basic_tools import ALL_TOOLS as BASIC_TOOLS
+except Exception as e:
+    print(f"⚠️  基础工具加载失败: {str(e)}")
+try:
     from tools.mcp_tools import ALL_MCP_TOOLS
-except ImportError:
-    # 导入失败时使用空列表
-    BASIC_TOOLS = []
-    ALL_MCP_TOOLS = []
+except Exception as e:
+    print(f"⚠️  MCP工具加载失败: {str(e)}")
 
 
 # ── 流式输出回调 ──────────────────────────────────────────────
@@ -105,14 +108,15 @@ class LangChainPocketAgent:
             "model": "gelab-zero-4b-preview",
             "temperature": 0.7,
             "max_tokens": 8000,
-            "timeout": 120,
+            "timeout": 30,  # 缩短超时时间方便调试
         }
         # 合并配置
         config = {**default_config, **self.llm_config}
+        self.llm_config = config  # 保存配置便于调试
 
         # 创建流式回调
         self.streaming_callback = StreamingUICallback(self.ui)
-        callback_manager = CallbackManager([self.streaming_callback]) if self.ui else None
+        callbacks = [self.streaming_callback] if self.ui else []
 
         # 初始化ChatOpenAI客户端（连接本地llama-server）
         self.llm = ChatOpenAI(
@@ -123,7 +127,7 @@ class LangChainPocketAgent:
             max_tokens=config["max_tokens"],
             timeout=config["timeout"],
             streaming=True,
-            callback_manager=callback_manager,
+            callbacks=callbacks,
             # 禁用客户端日志，减少输出
             verbose=False
         )
@@ -165,13 +169,6 @@ class LangChainPocketAgent:
 
     def _create_agent(self) -> None:
         """创建LangChain Agent"""
-        # 构建消息前缀（系统提示词）
-        messages_modifier = None
-        if self.system_prompt:
-            # 添加系统提示词到消息开头
-            def messages_modifier(messages: List[BaseMessage]) -> List[BaseMessage]:
-                return [SystemMessage(content=self.system_prompt)] + messages
-
         # 创建Agent
         self.agent = create_agent(
             model=self.llm,
@@ -182,11 +179,7 @@ class LangChainPocketAgent:
             middleware=[
                 anti_loop_middleware,
                 mcp_health_check_middleware
-            ],
-            # 消息修改器（添加系统提示）
-            messages_modifier=messages_modifier,
-            # 禁用Agent的内置系统提示，使用我们自己的
-            extra_prompt_messages=[]
+            ]
         )
 
     async def run_conversation(self, user_message: str) -> Tuple[str, bool]:
@@ -199,9 +192,15 @@ class LangChainPocketAgent:
         Returns:
             (响应内容, 是否使用了流式输出)
         """
+        import traceback
         try:
             # 清空流式缓冲区
             self.streaming_callback.buffer.clear()
+
+            # 1. 先测试LLM是否正常工作（排除Agent流程问题）
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                test_response = await self.llm.ainvoke(f"请回复: 你好，我是测试助手")
+                return (f"LLM测试正常: {test_response.content}", False)
 
             # 调用Agent
             result = await self.agent.ainvoke(
@@ -215,12 +214,14 @@ class LangChainPocketAgent:
             # 如果已经通过流式输出显示了内容，不需要再返回
             if self.streaming_callback.buffer:
                 full_response = self.streaming_callback.get_full_response()
-                return (full_response, True)
+                return (full_response.strip(), True)
             else:
-                return (last_message.content, False)
+                return (str(last_message.content).strip(), False)
 
         except Exception as e:
-            error_msg = f"❌ Agent 执行错误: {str(e)}"
+            # 详细错误信息，方便调试
+            error_details = traceback.format_exc()
+            error_msg = f"❌ Agent 执行错误: {str(e)}\n{error_details[:500]}..."
             return (error_msg, False)
 
     def clear_history(self) -> None:

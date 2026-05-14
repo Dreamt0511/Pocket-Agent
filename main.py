@@ -100,9 +100,9 @@ async def main():
 4. 工具调用会自动处理，不需要输出特殊格式
 """
 
-        # LLM配置
+        # LLM配置 - 完全从环境变量读取，适配电脑/手机双环境
         llm_config = {
-            "base_url": os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
+            "base_url": os.getenv("DEFAULT_LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
             "api_key": os.getenv("LLM_API_KEY", "dummy"),
             "model": model_name,
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
