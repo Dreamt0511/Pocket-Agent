@@ -14,7 +14,10 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.spinner import Spinner
 import time
+import asyncio
+from datetime import datetime
 
 
 from rich.rule import Rule
@@ -91,37 +94,34 @@ class PocketUI:
         self.console.print(f"[cyan]{response}[/cyan]\n")
     
     def print_user_input_prompt(self):
-        """打印用户输入提示 - 使用prompt_toolkit解决退格显示问题，双横线包裹输入区域"""
-        from rich.rule import Rule
-        
+        """打印用户输入提示 - 固定在底部的输入框"""
         # 非交互模式
         if not sys.stdin.isatty():
-            # 非交互模式不需要提前显示分隔线
             try:
                 self.console.print("[bold green]🪀 你:[/bold green] ", end="")
                 input_text = sys.stdin.readline().rstrip('\n')
                 return input_text
             except (EOFError, KeyboardInterrupt):
                 return "exit"
-        
-        # 交互模式：显示上下分隔线
+
+        # 交互模式：先打印分隔线
         self.console.print(Rule(style="dim cyan"))
-        # 预留输入行
-        self.console.print()  # 空行放用户输入
-        self.console.print(Rule(style="dim cyan"))
-        # 光标上移2行，回到输入位置
-        sys.stdout.write("\x1b[2A\r")
-        sys.stdout.flush()
-        
+
         # 交互模式：使用prompt_toolkit优化输入体验
         try:
             user_input = self.prompt_session.prompt(
                 "👉 你: ",
                 enable_history_search=True
             )
+            # 输入完成后：上移两行（分隔线+输入行），清除后再打印用户消息
+            sys.stdout.write("\x1b[2A\r\x1b[J")
+            sys.stdout.flush()
+            # 打印用户消息到历史区域
+            self.console.print(f"[bold green]🪀 你:[/bold green] {user_input}")
             return user_input
         except (EOFError, KeyboardInterrupt):
             return "exit"
+
     
     def print_memory_info(self, memory_content: str):
         """打印记忆信息"""
@@ -196,24 +196,72 @@ class PocketUI:
         """生成简单的ASCII艺术"""
         ascii_art = f"""
 {'=' * (len(text) + 4)}
-  {text}  
+  {text}
 {'=' * (len(text) + 4)}
         """
         return ascii_art.strip()
-    
+
     def show_welcome_screen(self, model_name: str = ""):
         """显示欢迎界面 — 只保留蓝框横幅"""
         self.console.clear()
         self.print_banner(model_name)
 
+    def create_progress_display(self):
+        """创建实时进度显示，使用Live组件实现单行更新"""
+        return ProgressDisplay(self.console)
 
-# 例子使用
-if __name__ == "__main__":
-    ui = PocketUI()
-    ui.show_welcome_screen()
-    
-    # 测试各种组件
-    ui.print_tool_call("get_weather", {"location": "北京"})
-    ui.print_tool_result("北京今天晴朗，25°C")
-    ui.print_agent_response("你好！我是Pocket-Agent，专注于移动端AI助手。")
-    ui.print_memory_info("从记忆中找到了你喜欢看天气预报")
+
+class ProgressDisplay:
+    """实时进度显示器，单行更新不累积"""
+
+    def __init__(self, console):
+        self.console = console
+        self.live = None
+        self.current_step = ""
+        self.step_start_time = None  # 当前步骤的开始时间
+        self.total_start_time = None  # 整个进度的开始时间
+
+    def _update_display(self):
+        """内部方法：更新显示内容"""
+        if not self.live or not self.step_start_time:
+            return
+
+        elapsed_seconds = int((datetime.now() - self.step_start_time).total_seconds())
+        display_text = f"⏳ {self.current_step} [dim][已耗时 {elapsed_seconds} 秒][/dim]"
+        self.live.update(display_text)
+
+    def __enter__(self):
+        self.live = Live(
+            "⏳ 初始化...",
+            console=self.console,
+            refresh_per_second=4,
+            transient=True
+        )
+        self.live.__enter__()
+        self.total_start_time = datetime.now()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.live:
+            self.live.__exit__(exc_type, exc_val, exc_tb)
+            # 最后显示完成状态和总耗时
+            if exc_type is None:
+                total_seconds = int((datetime.now() - self.total_start_time).total_seconds())
+                self.console.print(f"✅ [dim cyan]完成 (总耗时 {total_seconds} 秒)[/dim cyan]")
+
+    def update(self, step: str = None):
+        """更新当前进度
+        Args:
+            step: 进度描述，如果为None则只更新时间
+        """
+        if not self.live:
+            return
+
+        # 如果是新的步骤，重置步骤开始时间
+        if step is not None and step != self.current_step:
+            self.current_step = step
+            self.step_start_time = datetime.now()
+
+        # 每次调用都更新显示，刷新时间
+        self._update_display()
+

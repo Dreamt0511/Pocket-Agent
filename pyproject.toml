@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocket-agent"
+version = "0.1.0"
+description = "轻量级移动端AI代理 - 真正的agent loop，支持工具调用、技能系统、MCP服务集成"
+authors = [
+    { name = "Dreamt", email = "your-email@example.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    # 基础依赖
+    "rich>=13.0.0",
+    "requests>=2.25.0",
+    "python-dotenv>=1.0.0",
+    "aiohttp>=3.8.0",
+    "nest-asyncio>=1.5.0",
+    "prompt_toolkit>=3.0.0",
+
+    # LangChain 相关
+    "langchain>=0.2.0",
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "langchain-core>=0.2.0",
+]
+
+[project.scripts]
+# 配置全局命令，安装后直接运行 `pocket-agent` 即可启动
+pocket-agent = "main:main"
+
+[tool.setuptools.packages.find]
+# 声明需要打包的包
+where = ["agent"]
+include = ["agent*"]
+
+[tool.black]
+# 代码格式化配置
+line-length = 120
+target-version = ["py310"]
+
+[tool.isort]
+# 导入排序配置
+profile = "black"
+line_length = 120

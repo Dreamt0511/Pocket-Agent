@@ -7,7 +7,7 @@ import json
 import os
 import re
 from typing import Dict, List, Optional
-from core.agent import tool
+from ..agent import tool
 
 
 @tool(

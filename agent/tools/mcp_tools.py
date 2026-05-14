@@ -105,23 +105,10 @@ def {tool_name}({', '.join(parameters)}):
     return decorated_func
 
 
-# 动态加载所有MCP工具（同时加载NeuralBridge和context7两个服务）
-_all_tools = []
-# 加载NeuralBridge工具
-_neuralbridge_tools = _fetch_mcp_tools(NEURALBRIDGE_MCP_URL)
-_all_tools.extend(_neuralbridge_tools)
-# 加载context7工具
-_context7_tools = _fetch_mcp_tools(CONTEXT7_MCP_URL)
-_all_tools.extend(_context7_tools)
+# 注意：新版LangChain架构下，MCP工具不再预先加载
+# MCP服务的检测和调用由模型自主处理，模型会通过shell_exec命令检测服务可用性
+# 并直接构造MCP调用请求，无需预先定义工具
 
-for _tool_def in _all_tools:
-    _tool_func = _create_tool_function(_tool_def)
-    # 将函数注册到模块全局命名空间
-    globals()[_tool_def["name"]] = _tool_func
-
-
-# 导出所有工具名称（用于外部遍历）
-__all__ = [_tool_def["name"] for _tool_def in _all_tools] + ["tool", "mcp_call"]
-
-# 导出所有工具函数列表（供init.py加载）
-ALL_MCP_TOOLS = [globals()[name] for name in __all__ if name not in ["tool", "mcp_call"]]
+# 保留原有接口兼容旧版代码
+ALL_MCP_TOOLS = []
+__all__ = ["tool", "mcp_call"]

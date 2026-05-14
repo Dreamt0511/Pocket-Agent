@@ -1,8 +1,6 @@
 ---
 name: neuralbridge-operation-standard
 description: NeuralBridge MCP Server 标准化操作规范，实现 100% 操作准确率，核心流程：UI 树定位 → 元素确认 → 执行操作 → 结果验证
-type: 操作规范
-priority: 最高
 ---
 
 # NeuralBridge MCP 操作标准规范
