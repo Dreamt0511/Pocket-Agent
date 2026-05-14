@@ -1,0 +1,20 @@
+# 大模型文件
+*.gguf
+*.mmproj
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# 备份目录
+llama-backup/
+ollama-backup/
+
+# 测试图片和临时文件
+*.png
+*.jpg
+*.jpeg
+
+# 模型目录
+暂时保留/
+框架/
