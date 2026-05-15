@@ -14,10 +14,11 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable
 from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain.agents.middleware import ModelCallLimitMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, ModelResponse
 from .config import (
     MAX_ITERATIONS,
     RECURSION_LIMIT,
@@ -328,6 +329,49 @@ ALL_TOOLS = [
 
 
 
+# ── 工具调用ID修复中间件 ──────────────────────────────────────────────
+# 某些LLM（如GLM系列）生成的tool_call缺少id字段，
+# 导致LangGraph的ToolNode创建ToolMessage时tool_call_id为空报错
+import uuid
+
+class ToolCallIdMiddleware(AgentMiddleware):
+    """确保所有工具调用都有有效的id字段"""
+
+    def wrap_model_call(self, request, handler):
+        response = handler(request)
+        return self._fix_tool_call_ids(response)
+
+    async def awrap_model_call(self, request, handler):
+        response = await handler(request)
+        return self._fix_tool_call_ids(response)
+
+    def _fix_tool_call_ids(self, response):
+        result = list(response.result)
+        modified = False
+        for i, msg in enumerate(result):
+            if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                fixed_calls = []
+                for tc in msg.tool_calls:
+                    if not tc.get("id") or not isinstance(tc["id"], str) or tc["id"] == "":
+                        tc = dict(tc)
+                        tc["id"] = f"call_{uuid.uuid4().hex[:12]}"
+                        fixed_calls.append(tc)
+                        modified = True
+                    else:
+                        fixed_calls.append(tc)
+                if modified:
+                    result[i] = AIMessage(
+                        content=msg.content,
+                        tool_calls=fixed_calls,
+                        additional_kwargs=msg.additional_kwargs,
+                        response_metadata=msg.response_metadata,
+                        id=msg.id,
+                    )
+        if modified:
+            return ModelResponse(result=result, structured_response=response.structured_response)
+        return response
+
+
 # ── Agent 核心实现 ──────────────────────────────────────────────
 class LangChainPocketAgent:
     """
@@ -403,6 +447,8 @@ class LangChainPocketAgent:
 
         # 配置中间件
         middleware = [
+            # 修复工具调用ID：某些LLM生成的tool_call缺少id字段
+            ToolCallIdMiddleware(),
             # 模型调用次数限制：单次运行最多调用MAX_ITERATIONS次模型（对应最多MAX_ITERATIONS轮迭代）
             # 达到限制后自动优雅结束，不会报错
             ModelCallLimitMiddleware(
