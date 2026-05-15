@@ -58,7 +58,16 @@ async def main():
 
     while True:
         try:
-            user_input = ui.print_user_input_prompt()
+            # 等待用户输入，捕获所有输入相关异常
+            try:
+                user_input = await ui.async_print_user_input_prompt()
+            except (KeyboardInterrupt, EOFError, SystemExit):
+                # 输入时按Ctrl+C直接退出
+                ui.print_success("\n\n再见！")
+                break
+            except Exception:
+                # 其他输入异常，继续下一轮
+                continue
 
             if user_input.lower() in ['q', 'quit', 'exit', 'bye', '退出']:
                 ui.print_success("再见！")
@@ -70,7 +79,7 @@ async def main():
 - 询问技能 → 直接说"有哪些技能"或"加载XX技能"
 - `/undo` 或 `/撤回` → 撤回上一条发送的消息
 - `q` → 退出程序
-- Ctrl+C → 正在思考时打断，等待输入时退出"""
+- Ctrl+C / 直接输入新内容 → 正在思考时打断，输入新问题"""
                 ui.print_agent_response(help_text)
                 continue
 
@@ -145,19 +154,25 @@ async def main():
 
         except KeyboardInterrupt:
             if is_processing and current_task is not None:
-                # 正在处理中，取消当前任务
+                # 正在处理中，立即取消当前任务
                 current_task.cancel()
-                # 等待任务取消完成
+                # 最多等待500ms让任务取消，超时直接继续
                 try:
-                    await current_task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(current_task, timeout=0.5)
+                except (asyncio.CancelledError, asyncio.TimeoutError, KeyboardInterrupt):
                     pass
+                # 清除当前行，避免显示^C
+                sys.stdout.write("\r\x1b[K")
+                sys.stdout.flush()
+                ui.print_warning("⏹️  已打断当前思考，你可以输入新的问题或指令")
             else:
                 # 没有在处理，直接退出
                 ui.print_success("\n\n再见！")
                 break
         except Exception as e:
-            ui.print_error(f"发现错误: {e}")
+            # 忽略键盘中断相关的异常栈输出
+            if not isinstance(e, KeyboardInterrupt) and "CancelledError" not in str(type(e)):
+                ui.print_error(f"发现错误: {e}")
 
 
 if __name__ == "__main__":
@@ -174,6 +189,37 @@ if __name__ == "__main__":
         print("⚠️  请先安装依赖：pip install nest_asyncio prompt_toolkit")
         sys.exit(1)
 
-    # 统一使用get_event_loop，不使用asyncio.run
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    # 全局异常处理，捕获所有可能的退出异常，确保绝对不会输出错误栈
+    exit_cleanly = False
+    try:
+        # 统一使用get_event_loop，不使用asyncio.run
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
+        exit_cleanly = True
+    except (KeyboardInterrupt, SystemExit):
+        # 直接的键盘中断或系统退出
+        print("\n再见！")
+        exit_cleanly = True
+    except Exception as e:
+        # 检查是否是键盘中断相关的异常（包括嵌套的）
+        exc_str = str(type(e)) + str(e)
+        if "KeyboardInterrupt" in exc_str or "CancelledError" in exc_str:
+            print("\n再见！")
+            exit_cleanly = True
+        else:
+            # 只输出真正的异常，不输出完整栈追踪
+            print(f"\n❌ 程序异常退出: {str(e)}")
+    finally:
+        # 确保事件循环正常关闭，忽略所有关闭过程中的异常
+        try:
+            loop = asyncio.get_event_loop()
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+        except:
+            pass
+        # 确保输出干净
+        if not exit_cleanly:
+            print("\n再见！")

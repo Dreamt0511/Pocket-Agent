@@ -24,7 +24,9 @@ from rich.rule import Rule
 from rich.text import Text
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 import os
+import asyncio
 
 class PocketUI:
     """
@@ -94,44 +96,66 @@ class PocketUI:
         self.console.print(f"[cyan]{response}[/cyan]\n")
     
     def print_user_input_prompt(self):
-        """打印用户输入提示 - 固定在底部的输入框"""
-        # 非交互模式
-        if not sys.stdin.isatty():
-            try:
+        """同步版本用户输入提示 - 捕获所有异常避免报错栈"""
+        try:
+            # 非交互模式
+            if not sys.stdin.isatty():
                 self.console.print("[bold green]🪀 你:[/bold green] ", end="")
                 input_text = sys.stdin.readline().rstrip('\n')
                 return input_text
-            except (EOFError, KeyboardInterrupt):
-                return "exit"
 
-        # 交互模式：先显示完整的输入框结构（上下边框）
-        self.console.print(Rule(style="dim green"))  # 上边框
-        self.console.print(" ")  # 预留输入行位置
-        self.console.print(Rule(style="dim green"))  # 下边框
+            # 交互模式：简单分隔线 + 输入提示符
+            self.console.print()
+            self.console.print(Rule(style="dim cyan"))
 
-        # 将光标上移2行，回到输入行位置等待用户输入
-        sys.stdout.write("\033[2A\r")
-        sys.stdout.flush()
-
-        # 交互模式：使用prompt_toolkit优化输入体验
-        try:
+            # 使用prompt_toolkit输入
             user_input = self.prompt_session.prompt(
-                "👉 你: ",
+                "🪀 你: ",
                 enable_history_search=True
             )
-            # 输入完成后，光标自动到下边框下方，不需要额外处理
-            # 整个输入框已经完整显示在历史记录中
             return user_input
-        except (EOFError, KeyboardInterrupt):
-            # 如果用户中断，将光标移到下边框下方
-            sys.stdout.write("\033[1B\r")
-            sys.stdout.flush()
-            # 清空当前行的内容，避免显示^C
-            sys.stdout.write("\033[K")
-            sys.stdout.flush()
+        except (EOFError, KeyboardInterrupt, SystemExit):
+            # 处理所有退出相关的异常
+            self.console.print()
+            return "exit"
+        except Exception:
+            # 捕获其他任何异常，避免报错栈输出
+            self.console.print()
             return "exit"
 
-    
+    async def async_print_user_input_prompt(self):
+        """异步版本的用户输入提示 - 捕获所有异常避免报错栈"""
+        try:
+            # 非交互模式
+            if not sys.stdin.isatty():
+                self.console.print("[bold green]🪀 你:[/bold green] ", end="")
+                loop = asyncio.get_event_loop()
+                input_text = await loop.run_in_executor(None, sys.stdin.readline)
+                return input_text.rstrip('\n')
+
+            # 交互模式：简单分隔线 + 输入提示符
+            self.console.print()
+            self.console.print(Rule(style="dim cyan"))
+
+            # 异步输入
+            with patch_stdout():
+                user_input = await self.prompt_session.prompt_async(
+                    "🪀 你: ",
+                    enable_history_search=True
+                )
+            return user_input
+        except (EOFError, KeyboardInterrupt, SystemExit):
+            # 处理所有退出相关的异常
+            self.console.print()
+            return "exit"
+        except Exception as e:
+            # 捕获其他任何异常，避免报错栈输出
+            if "KeyboardInterrupt" not in str(type(e)):
+                self.console.print(f"\n⚠️  输入错误: {str(e)}")
+            self.console.print()
+            return "exit"
+
+
     def print_memory_info(self, memory_content: str):
         """打印记忆信息"""
         self.console.print(Panel(

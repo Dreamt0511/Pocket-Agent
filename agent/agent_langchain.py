@@ -391,19 +391,52 @@ class ImageOptimizationMiddleware(AgentMiddleware):
     def _optimize_image_content(self, messages):
         """
         优化消息中的图片内容：
-        1. 保留最新的2条图片消息的原始内容
-        2. 更早的图片消息替换为文本描述，避免base64数据累积
+        1. 自动识别并转换Markdown格式的图片为标准多模态格式
+        2. 保留最新的2条图片消息的原始内容
+        3. 更早的图片消息替换为文本描述，避免base64数据累积
         """
+        import re
         # 倒序查找图片消息，标记哪些需要保留
         image_count = 0
         for msg in reversed(messages):
             if hasattr(msg, 'content'):
+                # 先处理纯文本格式，识别Markdown图片
+                if isinstance(msg.content, str):
+                    content = msg.content
+                    # 匹配Markdown图片格式：![alt](data:image/...;base64,...)
+                    markdown_img_pattern = r'!\[.*?\]\((data:image/[^)]+)\)'
+                    matches = re.findall(markdown_img_pattern, content)
+
+                    if matches:
+                        # 提取出所有图片base64
+                        image_urls = matches
+                        # 把纯文本转换为多模态格式
+                        multimodal_content = []
+                        # 先添加文本部分（去掉图片Markdown）
+                        text_part = re.sub(markdown_img_pattern, '[图片]', content).strip()
+                        if text_part:
+                            multimodal_content.append({
+                                "type": "text",
+                                "text": text_part
+                            })
+                        # 添加图片部分
+                        for img_url in image_urls:
+                            multimodal_content.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": img_url
+                                }
+                            })
+                        # 替换消息内容为多模态格式
+                        msg.content = multimodal_content
+                        image_count += len(image_urls)
+
                 # 处理多模态列表格式
                 if isinstance(msg.content, list):
                     has_image = any(isinstance(item, dict) and item.get("type") == "image_url" for item in msg.content)
                     if has_image:
                         image_count += 1
-                        if image_count > 2:  # 超过2条的历史图片替换为文本
+                        if image_count > 1:  # 只保留最新的1条图片消息，更早的替换为文本
                             optimized_content = []
                             for item in msg.content:
                                 if isinstance(item, dict) and item.get("type") == "image_url":
@@ -414,32 +447,27 @@ class ImageOptimizationMiddleware(AgentMiddleware):
                                 else:
                                     optimized_content.append(item)
                             msg.content = optimized_content
-                # 处理纯文本格式中包含的base64图片（工具返回的结果）
-                elif isinstance(msg.content, str):
-                    # 检测是否是base64图片
-                    if (msg.content.startswith("data:image/") or
-                        (len(msg.content) > 1000 and 'base64' in msg.content.lower()) or
-                        msg.content.strip().startswith('/9j/') or  # jpg
-                        msg.content.strip().startswith('iVBORw0KGgo')):  # png
-                        image_count += 1
-                        if image_count > 2:
-                            msg.content = "[历史图片消息]"
+                        else:
+                            # 最新的图片消息使用低细节模式，减少token消耗
+                            optimized_content = []
+                            for item in msg.content:
+                                if isinstance(item, dict) and item.get("type") == "image_url":
+                                    # 添加detail="low"参数，大幅减少图片token占用
+                                    item["image_url"]["detail"] = "low"
+                                optimized_content.append(item)
+                            msg.content = optimized_content
 
 
-@wrap_tool_call
-def handle_mcp_tool_results(request, handler):
+class MCPToolResultMiddleware(AgentMiddleware):
     """处理MCP工具返回结果，特别是图片数据，转换为正确的多模态格式避免token爆炸"""
-    import json
-    # 执行工具调用
-    result = handler(request)
 
-    # 检查工具返回结果是否包含图片base64
-    if (isinstance(result, ToolMessage) and
-        isinstance(result.content, str) and
-        result.content.strip()):
+    def _process_image_content(self, content):
+        """处理图片内容，转换为标准多模态格式"""
+        import json
+        if not isinstance(content, str) or not content.strip():
+            return None
 
-        content = result.content.strip()
-        original_content = content
+        content = content.strip()
 
         # 尝试解析JSON，处理可能的包装格式
         try:
@@ -490,96 +518,41 @@ def handle_mcp_tool_results(request, handler):
                 image_data = f"data:image/png;base64,{content}"
 
         if is_image:
-            # 转换为OpenAI标准多模态消息格式
-            # 这样图片会被正确识别为图片，不会被当成纯文本计算token
-            result.content = [
+            # 返回OpenAI标准多模态消息格式，使用低细节模式减少token消耗
+            return [
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": image_data
+                        "url": image_data,
+                        "detail": "low"  # 低细节模式，token消耗减少约70%
                     }
                 }
             ]
+        return None
 
-    return result
+    def wrap_tool_call(self, request, handler):
+        """同步版本的工具调用处理"""
+        result = handler(request)
 
+        # 处理ToolMessage中的图片内容
+        if isinstance(result, ToolMessage):
+            processed_content = self._process_image_content(result.content)
+            if processed_content is not None:
+                result.content = processed_content
 
-@wrap_tool_call
-async def ahandle_mcp_tool_results(request, handler):
-    """异步版本的MCP工具结果处理"""
-    import json
-    # 执行工具调用
-    result = await handler(request)
+        return result
 
-    # 检查工具返回结果是否包含图片base64
-    if (isinstance(result, ToolMessage) and
-        isinstance(result.content, str) and
-        result.content.strip()):
+    async def awrap_tool_call(self, request, handler):
+        """异步版本的工具调用处理"""
+        result = await handler(request)
 
-        content = result.content.strip()
-        original_content = content
+        # 处理ToolMessage中的图片内容
+        if isinstance(result, ToolMessage):
+            processed_content = self._process_image_content(result.content)
+            if processed_content is not None:
+                result.content = processed_content
 
-        # 尝试解析JSON，处理可能的包装格式
-        try:
-            if content.startswith(('{', '[')):
-                data = json.loads(content)
-                # 查找可能的图片字段
-                if isinstance(data, dict):
-                    for key in ['image', 'screenshot', 'img', 'base64', 'data']:
-                        if key in data and isinstance(data[key], str):
-                            content = data[key].strip()
-                            break
-        except json.JSONDecodeError:
-            pass
-
-        # 检测是否是图片格式
-        is_image = False
-        image_data = None
-
-        # 情况1：MCP标准返回格式 {"content": [{"type": "image", "data": "base64"}]}
-        try:
-            if content.startswith(('{', '[')):
-                data = json.loads(content)
-                # 处理MCP返回的图片格式
-                if isinstance(data, dict) and 'content' in data:
-                    content_list = data['content']
-                    if isinstance(content_list, list) and len(content_list) > 0:
-                        item = content_list[0]
-                        if isinstance(item, dict) and item.get('type') == 'image' and 'data' in item:
-                            image_base64 = item['data'].strip()
-                            if image_base64.startswith('/9j/'):  # JPG
-                                image_data = f"data:image/jpeg;base64,{image_base64}"
-                            elif image_base64.startswith('iVBORw0KGgo'):  # PNG
-                                image_data = f"data:image/png;base64,{image_base64}"
-                            is_image = True
-        except json.JSONDecodeError:
-            pass
-
-        # 情况2：纯文本base64图片
-        if not is_image:
-            if content.startswith("data:image/"):
-                is_image = True
-                image_data = content
-            elif content.startswith('/9j/'):  # JPG文件头
-                is_image = True
-                image_data = f"data:image/jpeg;base64,{content}"
-            elif content.startswith('iVBORw0KGgo'):  # PNG文件头
-                is_image = True
-                image_data = f"data:image/png;base64,{content}"
-
-        if is_image:
-            # 转换为OpenAI标准多模态消息格式
-            # 这样图片会被正确识别为图片，不会被当成纯文本计算token
-            result.content = [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data
-                    }
-                }
-            ]
-
-    return result
+        return result
 
 
 # ── Agent 核心实现 ──────────────────────────────────────────────
@@ -640,7 +613,8 @@ class LangChainPocketAgent:
             max_tokens=config["max_tokens"],
             timeout=config["timeout"],
             streaming=True,
-            verbose=False
+            verbose=False,
+            max_retries=0  # 取消后不重试
         )
 
     def _create_agent(self) -> None:
@@ -658,17 +632,16 @@ class LangChainPocketAgent:
         # 配置中间件
         middleware = [
             # MCP工具结果处理：将图片base64转换为正确的多模态格式，避免纯文本token爆炸
-            handle_mcp_tool_results,
-            ahandle_mcp_tool_results,
+            MCPToolResultMiddleware(),
             # 图片内容优化：避免历史图片base64数据累积导致token溢出
             ImageOptimizationMiddleware(),
             # 修复工具调用ID：某些LLM生成的tool_call缺少id字段
             ToolCallIdMiddleware(),
-            # 历史消息自动压缩：token超过15000时自动压缩，保留最近30条消息
+            # 历史消息自动压缩：token超过8000时自动压缩，保留最近20条消息
             SummarizationMiddleware(
                 model=self.llm,  # 使用当前配置的模型进行压缩
-                trigger=("tokens", 15000),  # token数超过15000时触发压缩
-                keep=("messages", 30),  # 压缩后保留最近30条消息
+                trigger=("tokens", 8000),  # token数超过8000时触发压缩（移动端小模型阈值调低）
+                keep=("messages", 20),  # 压缩后保留最近20条消息，减少上下文长度
             ),
             # 模型调用次数限制：单次运行最多调用MAX_ITERATIONS次模型（对应最多MAX_ITERATIONS轮迭代）
             # 达到限制后自动优雅结束，不会报错
@@ -791,13 +764,28 @@ class LangChainPocketAgent:
         except asyncio.CancelledError:
             # 任务被取消，确保进度显示被关闭
             if 'progress_display' in locals() and progress_display:
-                progress_display.__exit__(None, None, None)
+                try:
+                    progress_display.__exit__(None, None, None)
+                except:
+                    pass
             # 重新抛出取消异常，让上层处理
+            raise
+        except KeyboardInterrupt:
+            # 键盘中断，确保进度显示被关闭
+            if 'progress_display' in locals() and progress_display:
+                try:
+                    progress_display.__exit__(None, None, None)
+                except:
+                    pass
+            # 重新抛出，让上层处理中断
             raise
         except Exception as e:
             # 确保进度显示被关闭
             if 'progress_display' in locals() and progress_display:
-                progress_display.__exit__(type(e), e, None)
+                try:
+                    progress_display.__exit__(type(e), e, None)
+                except:
+                    pass
 
             import traceback
             error_details = traceback.format_exc()
