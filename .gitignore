@@ -113,4 +113,5 @@ Thumbs.db
 # Claude Code
 .claude/
 CLAUDE.md
-.env.bak.env.bak
+.env.bak
+*.bak
