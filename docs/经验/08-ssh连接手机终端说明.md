@@ -210,3 +210,5 @@ ssh u0_a391@10.143.89.72 -p 8022
 ---
 
 *版本：1.0 | 适用平台：Termux (Android) + Windows/macOS/Linux*
+
+ssh u0_a391@10.143.89.72 -p 8022

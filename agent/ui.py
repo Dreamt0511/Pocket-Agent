@@ -104,8 +104,14 @@ class PocketUI:
             except (EOFError, KeyboardInterrupt):
                 return "exit"
 
-        # 交互模式：先打印分隔线
-        self.console.print(Rule(style="dim cyan"))
+        # 交互模式：先显示完整的输入框结构（上下边框）
+        self.console.print(Rule(style="dim green"))  # 上边框
+        self.console.print(" ")  # 预留输入行位置
+        self.console.print(Rule(style="dim green"))  # 下边框
+
+        # 将光标上移2行，回到输入行位置等待用户输入
+        sys.stdout.write("\033[2A\r")
+        sys.stdout.flush()
 
         # 交互模式：使用prompt_toolkit优化输入体验
         try:
@@ -113,13 +119,16 @@ class PocketUI:
                 "👉 你: ",
                 enable_history_search=True
             )
-            # 输入完成后：上移两行（分隔线+输入行），清除后再打印用户消息
-            sys.stdout.write("\x1b[2A\r\x1b[J")
-            sys.stdout.flush()
-            # 打印用户消息到历史区域
-            self.console.print(f"[bold green]🪀 你:[/bold green] {user_input}")
+            # 输入完成后，光标自动到下边框下方，不需要额外处理
+            # 整个输入框已经完整显示在历史记录中
             return user_input
         except (EOFError, KeyboardInterrupt):
+            # 如果用户中断，将光标移到下边框下方
+            sys.stdout.write("\033[1B\r")
+            sys.stdout.flush()
+            # 清空当前行的内容，避免显示^C
+            sys.stdout.write("\033[K")
+            sys.stdout.flush()
             return "exit"
 
     
@@ -191,6 +200,10 @@ class PocketUI:
     def print_info(self, msg: str):
         """打印提示信息"""
         self.console.print(f"[bold yellow]💡 {msg}[/bold yellow]")
+
+    def print_warning(self, msg: str):
+        """打印警告信息"""
+        self.console.print(f"[bold orange]⚠️  {msg}[/bold orange]")
     
     def create_ascii_art(self, text: str) -> str:
         """生成简单的ASCII艺术"""

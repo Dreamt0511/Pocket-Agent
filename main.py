@@ -53,6 +53,8 @@ async def main():
 
     # 互动式对话循环
     tool_call_count = 0
+    current_task = None  # 记录当前正在执行的任务
+    is_processing = False  # 标记是否正在处理用户请求
 
     while True:
         try:
@@ -67,7 +69,8 @@ async def main():
 - 直接输入问题 → AI agent 自动调用工具回答
 - 询问技能 → 直接说"有哪些技能"或"加载XX技能"
 - `/undo` 或 `/撤回` → 撤回上一条发送的消息
-- `q` → 退出程序"""
+- `q` → 退出程序
+- Ctrl+C → 正在思考时打断，等待输入时退出"""
                 ui.print_agent_response(help_text)
                 continue
 
@@ -96,37 +99,63 @@ async def main():
             # ui.print_info("Agent 思考中...")  # 减少冗余提示
 
             try:
-                response, used_streaming = await agent.run_conversation(user_input)
+                # 标记开始处理
+                is_processing = True
+                # 创建任务以便可以取消
+                current_task = asyncio.create_task(agent.run_conversation(user_input))
+                response, used_streaming = await current_task
+            except asyncio.CancelledError:
+                # 任务被取消（用户打断）
+                # 确保光标在新的一行
+                ui.console.print()
+                ui.print_warning("⏹️  已打断当前思考，你可以输入新的问题或指令")
+                response = None
+                used_streaming = False
             except Exception as e:
                 response = f"❌ Agent 执行错误: {str(e)}"
                 used_streaming = False
+            finally:
+                # 标记处理结束
+                is_processing = False
+                current_task = None
 
-            # 显示AI回复
-            # 如果使用了流式输出，内容已实时显示，不需要再用Panel显示
-            if not used_streaming:
-                ui.print_agent_response(response)
-            else:
-                # 如果使用了流式输出，确保添加一个换行避免格式混乱
-                ui.console.print()
+            # 显示AI回复（如果没有被打断）
+            if response is not None:
+                # 如果使用了流式输出，内容已实时显示，不需要再用Panel显示
+                if not used_streaming:
+                    ui.print_agent_response(response)
+                else:
+                    # 如果使用了流式输出，确保添加一个换行避免格式混乱
+                    ui.console.print()
 
-            # 记录AI回复到记忆
-            try:
-                memory.add_memory(
-                    content=f"AI回答：{response}",
-                    category="对话",
-                    importance=1,
-                    tags=["AI回复"]
-                )
-            except Exception:
-                pass
+                # 记录AI回复到记忆
+                try:
+                    memory.add_memory(
+                        content=f"AI回答：{response}",
+                        category="对话",
+                        importance=1,
+                        tags=["AI回复"]
+                    )
+                except Exception:
+                    pass
 
-            tool_call_count += 1
-            if tool_call_count % 10 == 0:
-                ui.print_conversation_stats(tool_call_count, len(agent.tools))
+                tool_call_count += 1
+                if tool_call_count % 10 == 0:
+                    ui.print_conversation_stats(tool_call_count, len(agent.tools))
 
         except KeyboardInterrupt:
-            ui.print_success("\n\n被中断，再见！")
-            break
+            if is_processing and current_task is not None:
+                # 正在处理中，取消当前任务
+                current_task.cancel()
+                # 等待任务取消完成
+                try:
+                    await current_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                # 没有在处理，直接退出
+                ui.print_success("\n\n再见！")
+                break
         except Exception as e:
             ui.print_error(f"发现错误: {e}")
 
