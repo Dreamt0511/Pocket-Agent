@@ -18,6 +18,12 @@ MAX_ITERATIONS = 100
 RECURSION_LIMIT = 200
 
 # ==============================
+# 上下文窗口配置
+# ==============================
+# 云端API模型的上下文窗口大小（如DeepSeek、Qwen等均为128K）
+MAX_CONTEXT_TOKENS = 128000
+
+# ==============================
 # 技能系统配置
 # ==============================
 # 技能目录路径
@@ -47,3 +53,9 @@ TERMUX_API_INSTALL_GUIDE = """❌ 未安装Termux API，请先执行：
 2. 在手机应用商店安装 Termux:API 应用
 3. 授予Termux相应权限
 """
+
+# 环境传感器采样命令（用于环境状态感知）
+ENV_LIGHT_SENSOR_CMD = 'termux-sensor -s "tcs3760 Ambient Light Sensor Non-wakeup" -n 1'
+ENV_ACCEL_SENSOR_CMD = 'termux-sensor -s "lsm6dsv Accelerometer Non-wakeup" -n 3'
+ENV_TIME_CMD = 'date +"%H:%M"'
+ENV_TIMEZONE_CMD = 'getprop persist.sys.timezone'

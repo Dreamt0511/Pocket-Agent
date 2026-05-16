@@ -223,7 +223,7 @@ class PocketUI:
 
     def print_info(self, msg: str):
         """打印提示信息"""
-        self.console.print(f"[bold yellow]💡 {msg}[/bold yellow]")
+        self.console.print(f"[dim yellow]💡 {msg}[/dim yellow]")
 
     def print_warning(self, msg: str):
         """打印警告信息"""
@@ -247,6 +247,42 @@ class PocketUI:
         """创建实时进度显示，使用Live组件实现单行更新"""
         return ProgressDisplay(self.console)
 
+    @staticmethod
+    def format_context_bar(usage: dict) -> str:
+        """生成图形化上下文用量条
+        Args:
+            usage: {"current": int, "max": int, "percentage": float}
+        Returns:
+            Rich标记格式的字符串，如 "████████░░░░ 45% (58K/128K)"
+        """
+        current = usage.get("current", 0)
+        max_tokens = usage.get("max", 128000)
+        pct = usage.get("percentage", 0.0)
+
+        # 20格的Unicode进度条
+        bar_width = 20
+        filled = int(bar_width * pct / 100)
+        filled = max(0, min(bar_width, filled))
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        # 数值格式化：统一添加tok单位
+        def fmt(n):
+            if n >= 1000000:
+                return f"{n/1000000:.1f}M"
+            elif n >= 1000:
+                return f"{n//1000}K"
+            return str(n)
+
+        # 颜色随用量变化：绿(<50%) → 黄(50-80%) → 红(>80%)
+        if pct < 50:
+            color = "green"
+        elif pct < 80:
+            color = "yellow"
+        else:
+            color = "red"
+
+        return f"[dim]|[/dim] [{color}]{bar}[/{color}] [dim]{pct}% ({fmt(current)}/{fmt(max_tokens)})[/dim]"
+
 
 class ProgressDisplay:
     """实时进度显示器，单行更新不累积"""
@@ -257,6 +293,7 @@ class ProgressDisplay:
         self.current_step = ""
         self.step_start_time = None  # 当前步骤的开始时间
         self.total_start_time = None  # 整个进度的开始时间
+        self.total_seconds = 0  # 总耗时，__exit__时记录
 
     def _update_display(self):
         """内部方法：更新显示内容"""
@@ -281,10 +318,12 @@ class ProgressDisplay:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.live:
             self.live.__exit__(exc_type, exc_val, exc_tb)
-            # 最后显示完成状态和总耗时
             if exc_type is None:
-                total_seconds = int((datetime.now() - self.total_start_time).total_seconds())
-                self.console.print(f"✅ [dim cyan]完成 (总耗时 {total_seconds} 秒)[/dim cyan]")
+                self.total_seconds = int((datetime.now() - self.total_start_time).total_seconds())
+
+    def print_completion(self, suffix: str = ""):
+        """打印完成状态行，可选后缀（如token用量条）"""
+        self.console.print(f"✅ [dim cyan]完成 (总耗时 {self.total_seconds} 秒)[/dim cyan] {suffix}")
 
     def update(self, step: str = None):
         """更新当前进度

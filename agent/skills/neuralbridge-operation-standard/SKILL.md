@@ -1,9 +1,11 @@
 ---
 name: neuralbridge-operation-standard
-description: NeuralBridge MCP Server 标准化操作规范，实现 100% 操作准确率，核心流程：UI 树定位 → 元素确认 → 执行操作 → 结果验证
+description: 【降级方案】NeuralBridge MCP Server 操作规范，仅用于 Android Shell 命令和 Termux API 无法完成的 UI 自动化场景（点击、滑动、UI树定位、截图分析）。执行手机操控任务前，必须先查阅 phone-control-guide skill 查找零 token 方案。
 ---
 
 # NeuralBridge MCP 操作标准规范
+
+> ⚠️ **使用前提**：在执行手机操控任务前，**必须先查阅 `phone-control-guide` skill**，优先使用 Android 原生 Shell 命令或 Termux API 命令。确认零 token 方式无法实现后，再使用以下 NeuralBridge 工具。
 ## 核心三原则（强制执行）
 1. **坐标绝对禁止猜测**：所有点击/长按/滑动的坐标必须 100% 来自 `android_get_ui_tree` 的返回结果，禁止通过截图视觉识别、估算坐标
 2. **每步必验证**：任何操作执行后必须通过截图或 UI 树查询验证操作结果，确认成功后再进行下一步

@@ -6,28 +6,30 @@
 import json
 import os
 import re
+import subprocess
 from typing import Dict, List, Optional
-from ..agent import tool
+from langchain_core.tools import tool
 
 
-@tool(
-    name="file_read",
-    description="读取文件内容",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string", "description": "文件路径"},
-            "max_lines": {"type": "integer", "description": "最大行数", "default": 100}
-        },
-        "required": ["filepath"]
-    }
-)
+@tool
 def file_read(filepath: str, max_lines: int = 100) -> str:
-    """读取文件内容"""
+    """
+    读取文件内容，支持相对于项目根目录的相对路径。
+
+    Args:
+        filepath: 文件路径（支持相对路径）
+        max_lines: 最大读取行数，默认100
+    """
     try:
+        # 支持相对路径：优先尝试相对于项目根目录
+        if not os.path.isabs(filepath):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            project_root = os.path.dirname(project_root)  # 从agent/tools/到项目根目录
+            filepath = os.path.join(project_root, filepath)
+
         if not os.path.exists(filepath):
             return f"文件不存在: {filepath}"
-        
+
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = []
             for i, line in enumerate(f):
@@ -35,73 +37,63 @@ def file_read(filepath: str, max_lines: int = 100) -> str:
                     lines.append("... (已截止)")
                     break
                 lines.append(f"{i+1:3d}| {line.rstrip()}")
-        
+
         return "\n".join(lines)
     except Exception as e:
         return f"读取文件错误: {str(e)}"
 
 
-@tool(
-    name="file_write",
-    description="写入文件内容",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string", "description": "文件路径"},
-            "content": {"type": "string", "description": "要写入的内容"},
-            "append": {"type": "boolean", "description": "是否追加模式", "default": False}
-        },
-        "required": ["filepath", "content"]
-    }
-)
+@tool
 def file_write(filepath: str, content: str, append: bool = False) -> str:
-    """写入文件"""
+    """
+    写入文件内容。
+
+    Args:
+        filepath: 文件路径
+        content: 要写入的内容
+        append: 是否追加模式，默认False
+    """
     try:
         mode = 'a' if append else 'w'
         with open(filepath, mode, encoding='utf-8') as f:
             f.write(content)
-        
+
         action = "追加" if append else "写入"
         return f"文件{action}成功: {filepath}"
     except Exception as e:
         return f"写入文件错误: {str(e)}"
 
 
-@tool(
-    name="file_search",
-    description="搜索文件内容",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pattern": {"type": "string", "description": "正则表达式模式"},
-            "filepath": {"type": "string", "description": "要搜索的文件"},
-            "context_lines": {"type": "integer", "description": "上下文行数", "default": 2}
-        },
-        "required": ["pattern", "filepath"]
-    }
-)
+@tool
 def file_search(pattern: str, filepath: str, context_lines: int = 2) -> str:
-    """在文件中搜索内容"""
+    """
+    在文件中搜索内容。
+
+    Args:
+        pattern: 正则表达式模式
+        filepath: 要搜索的文件路径
+        context_lines: 上下文行数，默认2
+    """
     try:
         if not os.path.exists(filepath):
             return f"文件不存在: {filepath}"
-        
+
         matches = []
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
+
         for i, line in enumerate(lines):
             if re.search(pattern, line):
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
-                
+
                 context = []
                 for j in range(start, end):
                     marker = ">>> " if j == i else "    "
                     context.append(f"{marker}{j+1:3d}| {lines[j].rstrip()}")
-                
+
                 matches.append("\n".join(context))
-        
+
         if matches:
             return f"找到 {len(matches)} 个匹配:\n\n" + "\n\n".join(matches)
         else:
@@ -110,24 +102,19 @@ def file_search(pattern: str, filepath: str, context_lines: int = 2) -> str:
         return f"搜索错误: {str(e)}"
 
 
-@tool(
-    name="directory_list",
-    description="列出目录内容",
-    parameters={
-        "type": "object",
-        "properties": {
-            "directory": {"type": "string", "description": "目录路径"},
-            "pattern": {"type": "string", "description": "文件名筛选模式", "default": "*"}
-        },
-        "required": ["directory"]
-    }
-)
+@tool
 def directory_list(directory: str, pattern: str = "*") -> str:
-    """列出目录内容"""
+    """
+    列出目录内容。
+
+    Args:
+        directory: 目录路径
+        pattern: 文件名筛选模式，默认*
+    """
     try:
         if not os.path.exists(directory):
             return f"目录不存在: {directory}"
-        
+
         items = []
         for item in os.listdir(directory):
             full_path = os.path.join(directory, item)
@@ -136,7 +123,7 @@ def directory_list(directory: str, pattern: str = "*") -> str:
             else:
                 size = os.path.getsize(full_path)
                 items.append(f"📄 {item} ({size} bytes)")  # 文件图标
-        
+
         if items:
             return f"目录 '{directory}' 内容:\n" + "\n".join(sorted(items))
         else:
@@ -145,95 +132,144 @@ def directory_list(directory: str, pattern: str = "*") -> str:
         return f"查看目录错误: {str(e)}"
 
 
-@tool(
-    name="json_read",
-    description="读取JSON文件",
-    parameters={
-        "type": "object",
-        "properties": {
-            "filepath": {"type": "string", "description": "JSON文件路径"},
-            "path": {"type": "string", "description": "JSON路径（选择性）"}
-        },
-        "required": ["filepath"]
-    }
-)
-def json_read(filepath: str, path: Optional[str] = None) -> str:
-    """读取JSON文件"""
-    try:
-        if not os.path.exists(filepath):
-            return f"JSON文件不存在: {filepath}"
-        
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        if path:
-            # 简单的路径支持，例如 "user.name"
-            keys = path.split('.')
-            for key in keys:
-                if isinstance(data, dict) and key in data:
-                    data = data[key]
-                else:
-                    return f"JSON路径 '{path}' 不存在"
-        
-        return json.dumps(data, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return f"读取JSON错误: {str(e)}"
+@tool
+def system_info(info_type: str = "all") -> str:
+    """
+    获取手机系统信息。
+    需要先安装Termux API：pkg install termux-api && 安装手机端Termux:API应用
+    """
+    TERMUX_API_CHECK_CMD = "command -v termux-battery-status"
+    TERMUX_API_INSTALL_GUIDE = """⚠️  请先安装Termux API:
+1. 执行: pkg install termux-api
+2. 在手机应用商店安装 Termux:API 应用
+"""
 
+    def _run_termux_cmd(cmd: str) -> str:
+        """执行Termux API命令，处理异常"""
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                try:
+                    # 尝试格式化JSON输出
+                    data = json.loads(result.stdout.strip())
+                    return json.dumps(data, ensure_ascii=False, indent=2)
+                except:
+                    return result.stdout.strip()
+            else:
+                return f"命令执行失败: {result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return "命令执行超时"
+        except Exception as e:
+            return f"执行错误: {str(e)}"
 
-@tool(
-    name="system_info",
-    description="获取系统信息",
-    parameters={
-        "type": "object",
-        "properties": {
-            "info_type": {
-                "type": "string", 
-                "description": "信息类型",
-                "enum": ["disk", "memory", "cpu", "network"],
-                "default": "disk"
-            }
-        }
-    }
-)
-def system_info(info_type: str = "disk") -> str:
-    """获取系统信息"""
     try:
-        if info_type == "disk":
-            stat = os.statvfs("/")
-            total = stat.f_blocks * stat.f_frsize
-            free = stat.f_bavail * stat.f_frsize
-            used = total - free
-            
-            return (f"磁盘信息:\n"
-                   f"总空间: {total // (1024**3)} GB\n"
-                   f"已使用: {used // (1024**3)} GB\n"
-                   f"可用: {free // (1024**3)} GB")
-        
-        elif info_type == "memory":
-            # 简单的内存信息（实际中可以使用 psutil）
-            return "内存信息: 请安装 psutil 获取更详细信息"
-        
-        else:
-            return f"系统信息 '{info_type}': 暂时不支持"
-    
+        # 检测是否安装了termux-api
+        check = subprocess.run(TERMUX_API_CHECK_CMD, shell=True, capture_output=True)
+        if check.returncode != 0:
+            return TERMUX_API_INSTALL_GUIDE + "\n基础存储信息：\n" + _run_termux_cmd("df -h /sdcard")
+
+        result = []
+        info_type = info_type.lower()
+
+        if info_type in ["all", "battery"]:
+            result.append("📱 电池信息:")
+            result.append(_run_termux_cmd("termux-battery-status"))
+            result.append("")
+
+        if info_type in ["all", "cpu"]:
+            result.append("⚡ CPU信息:")
+            result.append(_run_termux_cmd("cat /proc/cpuinfo | head -30"))
+            result.append("")
+
+        if info_type in ["all", "memory"]:
+            result.append("💾 内存信息:")
+            result.append(_run_termux_cmd("cat /proc/meminfo | head -10"))
+            result.append("")
+
+        if info_type in ["all", "disk", "storage"]:
+            result.append("💽 存储信息:")
+            result.append(_run_termux_cmd("df -h /sdcard"))
+            result.append(_run_termux_cmd("df -h /data"))
+            result.append("")
+
+        if info_type in ["all", "network"]:
+            result.append("📶 WiFi信息:")
+            result.append(_run_termux_cmd("termux-wifi-connectioninfo"))
+            result.append("")
+
+        if info_type in ["all", "device"]:
+            result.append("🔧 设备信息:")
+            result.append(_run_termux_cmd("termux-telephony-deviceinfo"))
+            result.append("")
+
+        if info_type in ["all", "wifi"]:
+            result.append("📶 WiFi信息:")
+            result.append(_run_termux_cmd("termux-wifi-connectioninfo"))
+            result.append("")
+
+        if not result:
+            return f"不支持的信息类型 '{info_type}'\n支持的类型: all/battery/cpu/memory/disk/network/device/wifi"
+
+        return "\n".join(result).strip()
+
     except Exception as e:
         return f"获取系统信息错误: {str(e)}"
 
 
-@tool(
-    name="shell_exec",
-    description="执行shell命令，返回命令输出，仅可执行安全的非高危命令",
-    parameters={
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "要执行的shell命令"}
-        },
-        "required": ["command"]
-    }
-)
+@tool
 def shell_exec(command: str) -> str:
     """执行shell命令"""
-    import subprocess
+    # 截断过长的命令显示（最多50字符）
+    def truncate_cmd(cmd: str, max_len: int = 50) -> str:
+        return cmd[:max_len] + "..." if len(cmd) > max_len else cmd
+
+    # 检测是否在纯Termux终端环境下调用安卓控制命令
+    def check_android_command_environment(cmd: str) -> Optional[str]:
+        """检查安卓控制命令是否可以在当前环境下运行"""
+        android_commands = [
+            "android_click", "android_swipe", "android_input", "android_screenshot",
+            "android_get_installed_apps", "android_launch_app", "android_stop_app"
+        ]
+
+        # 检查是否是安卓控制命令
+        is_android_cmd = any(cmd_name in cmd for cmd_name in android_commands)
+        if not is_android_cmd:
+            return None
+
+        # 跳过MCP/NeuralBridge的curl调用（MCP走HTTP协议，不需要INJECT_EVENTS权限）
+        # 命令中的android_xxx是JSON-RPC参数名，不是直接调用的命令
+        if "curl" in cmd and "mcp" in cmd.lower():
+            return None
+
+        # 检测是否在Termux环境下
+        is_termux = os.path.exists("/data/data/com.termux")
+        if not is_termux:
+            return None
+
+        # 检测是否有图形界面（DISPLAY环境变量）
+        has_display = os.getenv("DISPLAY") is not None
+        if has_display:
+            return None
+
+        # 纯Termux终端环境，没有图形界面
+        return """⚠️  安卓控制功能需要图形界面环境才能使用：
+1. 请在Android系统的图形界面下使用本功能
+2. 或在Termux中配置VNC/GUI环境后再使用
+3. 纯终端命令行环境下无法执行屏幕点击、输入等操作"""
+
+    # 先检查环境
+    env_error = check_android_command_environment(command)
+    if env_error:
+        return env_error
+
+    truncated_cmd = truncate_cmd(command)
+
     try:
         result = subprocess.run(
             command,
@@ -244,17 +280,22 @@ def shell_exec(command: str) -> str:
         )
         output = result.stdout.strip()
         error = result.stderr.strip()
+
         if result.returncode != 0:
-            return f"命令执行失败 (错误码 {result.returncode}):\n{error}"
-        return output if output else "命令执行成功，无输出"
+            return f"执行命令: {truncated_cmd}\n命令执行失败 (错误码 {result.returncode}):\n{error}"
+
+        if output:
+            return f"执行命令: {truncated_cmd}\n{output}"
+        else:
+            return f"执行命令: {truncated_cmd}\n命令执行成功，无输出"
+
     except subprocess.TimeoutExpired:
-        return "命令执行超时"
+        return f"执行命令: {truncated_cmd}\n命令执行超时"
     except Exception as e:
-        return f"执行命令错误: {str(e)}"
+        return f"执行命令: {truncated_cmd}\n执行命令错误: {str(e)}"
 
 
 # 所有工具函数
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list,
-    json_read, system_info, shell_exec
+    file_read, file_write, file_search, directory_list,system_info, shell_exec
 ]

@@ -14,7 +14,7 @@ from paramiko import SSHClient, AutoAddPolicy, SFTPClient
 
 # 配置信息
 SSH_CONFIG = {
-    "host": "10.143.89.72",
+    "host": "10.40.148.132",
     "port": 8022,
     "username": "u0_a391",
     "password": "0511",

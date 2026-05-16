@@ -7,15 +7,13 @@ Pocket-Agent 主程序
 import asyncio
 import sys
 import os
-from dotenv import load_dotenv
-
-# 加载.env环境变量
-load_dotenv()
-
 from datetime import datetime
 from agent.memory import LongTermMemory
 from agent.ui import PocketUI
 from agent.agent_langchain import LangChainPocketAgent
+from dotenv import load_dotenv
+# 从脚本所在目录加载.env，override=True确保覆盖已有环境变量
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 from agent.config import MAX_ITERATIONS
 from agent.prompts.system_base import prompt as system_base_prompt
 
@@ -32,12 +30,27 @@ async def main():
     base_system_prompt = system_base_prompt
 
     # LLM配置 - 完全从环境变量读取，适配电脑/手机双环境
+    # 安全读取数字参数，配置错误时使用默认值
+    try:
+        temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+        # 温度值必须在0-2之间
+        temperature = max(0.0, min(2.0, temperature))
+    except (ValueError, TypeError):
+        temperature = 0.7
+
+    try:
+        max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8000"))
+        # max_tokens必须为正整数
+        max_tokens = max(1, max_tokens)
+    except (ValueError, TypeError):
+        max_tokens = 8000
+
     llm_config = {
         "base_url": os.getenv("DEFAULT_LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
         "api_key": os.getenv("LLM_API_KEY", "dummy"),
         "model": model_name,
-        "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
-        "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "8000")),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
 
     # 创建LangChain Agent
@@ -112,10 +125,10 @@ async def main():
                 is_processing = True
                 # 创建任务以便可以取消
                 current_task = asyncio.create_task(agent.run_conversation(user_input))
-                response, used_streaming = await current_task
-            except asyncio.CancelledError:
-                # 任务被取消（用户打断）
-                # 确保光标在新的一行
+                response, used_streaming, call_count = await current_task
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                # 一次Ctrl+C会同时触发CancelledError和KeyboardInterrupt，
+                # 同时捕获避免后者传播到外层误触"再见！"退出
                 ui.console.print()
                 ui.print_warning("⏹️  已打断当前思考，你可以输入新的问题或指令")
                 response = None
@@ -133,9 +146,6 @@ async def main():
                 # 如果使用了流式输出，内容已实时显示，不需要再用Panel显示
                 if not used_streaming:
                     ui.print_agent_response(response)
-                else:
-                    # 如果使用了流式输出，确保添加一个换行避免格式混乱
-                    ui.console.print()
 
                 # 记录AI回复到记忆
                 try:
@@ -148,27 +158,14 @@ async def main():
                 except Exception:
                     pass
 
-                tool_call_count += 1
-                if tool_call_count % 10 == 0:
+                tool_call_count += call_count
+                if tool_call_count % 10 == 0 and call_count > 0:
                     ui.print_conversation_stats(tool_call_count, len(agent.tools))
 
         except KeyboardInterrupt:
-            if is_processing and current_task is not None:
-                # 正在处理中，立即取消当前任务
-                current_task.cancel()
-                # 最多等待500ms让任务取消，超时直接继续
-                try:
-                    await asyncio.wait_for(current_task, timeout=0.5)
-                except (asyncio.CancelledError, asyncio.TimeoutError, KeyboardInterrupt):
-                    pass
-                # 清除当前行，避免显示^C
-                sys.stdout.write("\r\x1b[K")
-                sys.stdout.flush()
-                ui.print_warning("⏹️  已打断当前思考，你可以输入新的问题或指令")
-            else:
-                # 没有在处理，直接退出
-                ui.print_success("\n\n再见！")
-                break
+            # 意外传播到外层的Ctrl+C（内层已捕获，此处仅作安全兜底）
+            ui.print_success("\n\n再见！")
+            break
         except Exception as e:
             # 忽略键盘中断相关的异常栈输出
             if not isinstance(e, KeyboardInterrupt) and "CancelledError" not in str(type(e)):

@@ -20,253 +20,25 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
 from langchain.agents.middleware.types import AgentMiddleware, ModelResponse
+from langchain_core.messages.utils import count_tokens_approximately
 from .config import (
     MAX_ITERATIONS,
     RECURSION_LIMIT,
+    MAX_CONTEXT_TOKENS,
     SKILLS_DIR,
     SKILL_FILE_NAMES,
     TERMUX_API_CHECK_CMD,
-    TERMUX_API_INSTALL_GUIDE
+    TERMUX_API_INSTALL_GUIDE,
+    ENV_LIGHT_SENSOR_CMD,
+    ENV_ACCEL_SENSOR_CMD,
+    ENV_TIME_CMD,
+    ENV_TIMEZONE_CMD,
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
+from .tools.basic_tools import ALL_TOOLS
 
 
-# ── 基础工具实现（保持原有功能）─────────────────────────────────────────────
-def file_read(filepath: str, max_lines: int = 100) -> str:
-    """
-    读取文件内容。
-
-    Args:
-        filepath: 文件路径（支持相对于项目根目录的相对路径）
-        max_lines: 最大读取行数，默认100
-    """
-    try:
-        # 支持相对路径：优先尝试相对于项目根目录
-        if not os.path.isabs(filepath):
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            filepath = os.path.join(project_root, filepath)
-
-        if not os.path.exists(filepath):
-            return f"文件不存在: {filepath}"
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            lines = []
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    lines.append("... (已截止)")
-                    break
-                lines.append(f"{i+1:3d}| {line.rstrip()}")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"读取文件错误: {str(e)}"
-
-def file_write(filepath: str, content: str, append: bool = False) -> str:
-    """
-    写入文件内容。
-
-    Args:
-        filepath: 文件路径
-        content: 要写入的内容
-        append: 是否追加模式，默认False
-    """
-    try:
-        mode = 'a' if append else 'w'
-        with open(filepath, mode, encoding='utf-8') as f:
-            f.write(content)
-
-        action = "追加" if append else "写入"
-        return f"文件{action}成功: {filepath}"
-    except Exception as e:
-        return f"写入文件错误: {str(e)}"
-
-def file_search(pattern: str, filepath: str, context_lines: int = 2) -> str:
-    """
-    在文件中搜索内容。
-
-    Args:
-        pattern: 正则表达式模式
-        filepath: 要搜索的文件路径
-        context_lines: 上下文行数，默认2
-    """
-    try:
-        if not os.path.exists(filepath):
-            return f"文件不存在: {filepath}"
-
-        matches = []
-        with open(filepath, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        for i, line in enumerate(lines):
-            if re.search(pattern, line):
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-
-                context = []
-                for j in range(start, end):
-                    marker = ">>> " if j == i else "    "
-                    context.append(f"{marker}{j+1:3d}| {lines[j].rstrip()}")
-
-                matches.append("\n".join(context))
-
-        if matches:
-            return f"找到 {len(matches)} 个匹配:\n\n" + "\n\n".join(matches)
-        else:
-            return f"未找到匹配 '{pattern}' 的内容"
-    except Exception as e:
-        return f"搜索错误: {str(e)}"
-
-def directory_list(directory: str, pattern: str = "*") -> str:
-    """
-    列出目录内容。
-
-    Args:
-        directory: 目录路径
-        pattern: 文件名筛选模式，默认*
-    """
-    try:
-        if not os.path.exists(directory):
-            return f"目录不存在: {directory}"
-
-        items = []
-        for item in os.listdir(directory):
-            full_path = os.path.join(directory, item)
-            if os.path.isdir(full_path):
-                items.append(f"{item}/")
-            else:
-                size = os.path.getsize(full_path)
-                items.append(f"{item} ({size} bytes)")
-
-        if items:
-            return f"目录 '{directory}' 内容:\n" + "\n".join(sorted(items))
-        else:
-            return f"目录 '{directory}' 为空"
-    except Exception as e:
-        return f"查看目录错误: {str(e)}"
-
-
-def system_info(info_type: str = "all") -> str:
-    """
-    【Termux专用】获取手机系统信息。
-    需要先安装Termux API：pkg install termux-api && 安装手机端Termux:API应用
-
-    Args:
-        info_type: 信息类型: all/battery/cpu/memory/disk/network/device/wifi，默认all
-    """
-    def _run_termux_cmd(cmd: str) -> str:
-        """执行Termux API命令，处理异常"""
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                try:
-                    # 尝试格式化JSON输出
-                    data = json.loads(result.stdout.strip())
-                    return json.dumps(data, ensure_ascii=False, indent=2)
-                except:
-                    return result.stdout.strip()
-            else:
-                return f"命令执行失败: {result.stderr.strip()}"
-        except subprocess.TimeoutExpired:
-            return "命令执行超时"
-        except Exception as e:
-            return f"执行错误: {str(e)}"
-
-    try:
-        # 检测是否安装了termux-api
-        check = subprocess.run(TERMUX_API_CHECK_CMD, shell=True, capture_output=True)
-        if check.returncode != 0:
-            return TERMUX_API_INSTALL_GUIDE + "\n基础存储信息：\n" + _run_termux_cmd("df -h /sdcard")
-
-        result = []
-        info_type = info_type.lower()
-
-        if info_type in ["all", "battery"]:
-            result.append("📱 电池信息:")
-            result.append(_run_termux_cmd("termux-battery-status"))
-            result.append("")
-
-        if info_type in ["all", "cpu"]:
-            result.append("⚡ CPU信息:")
-            result.append(_run_termux_cmd("termux-cpu-info"))
-            result.append("")
-
-        if info_type in ["all", "memory"]:
-            result.append("💾 内存信息:")
-            result.append(_run_termux_cmd("termux-memory-info"))
-            result.append("")
-
-        if info_type in ["all", "disk", "storage"]:
-            result.append("💽 存储信息:")
-            result.append(_run_termux_cmd("df -h /sdcard"))
-            result.append(_run_termux_cmd("df -h /data"))
-            result.append("")
-
-        if info_type in ["all", "network"]:
-            result.append("🌐 网络信息:")
-            result.append(_run_termux_cmd("termux-network-status"))
-            result.append("")
-
-        if info_type in ["all", "device"]:
-            result.append("🔧 设备信息:")
-            result.append(_run_termux_cmd("termux-telephony-deviceinfo"))
-            result.append("")
-
-        if info_type in ["all", "wifi"]:
-            result.append("📶 WiFi信息:")
-            result.append(_run_termux_cmd("termux-wifi-connectioninfo"))
-            result.append("")
-
-        if not result:
-            return f"不支持的信息类型 '{info_type}'\n支持的类型: all/battery/cpu/memory/disk/network/device/wifi"
-
-        return "\n".join(result).strip()
-
-    except Exception as e:
-        return f"获取系统信息错误: {str(e)}"
-
-def shell_exec(command: str) -> str:
-    """
-    执行shell命令，返回命令输出。
-
-    Args:
-        command: 要执行的shell命令
-    """
-    # 截断过长的命令显示（最多50字符）
-    def truncate_cmd(cmd: str, max_len: int = 50) -> str:
-        return cmd[:max_len] + "..." if len(cmd) > max_len else cmd
-
-    truncated_cmd = truncate_cmd(command)
-
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        output = result.stdout.strip()
-        error = result.stderr.strip()
-
-        if result.returncode != 0:
-            return f"执行命令: {truncated_cmd}\n命令执行失败 (错误码 {result.returncode}):\n{error}"
-
-        if output:
-            return f"执行命令: {truncated_cmd}\n{output}"
-        else:
-            return f"执行命令: {truncated_cmd}\n命令执行成功，无输出"
-
-    except subprocess.TimeoutExpired:
-        return f"执行命令: {truncated_cmd}\n命令执行超时"
-    except Exception as e:
-        return f"执行命令: {truncated_cmd}\n执行命令错误: {str(e)}"
-
+# ── 技能加载工具 ──────────────────────────────────────────────
 def load_skills_list() -> str:
     """
     预加载所有可用技能的名称和描述，用于系统提示词
@@ -318,14 +90,7 @@ def load_skills_list() -> str:
 
 
 # ── 工具初始化 ──────────────────────────────────────────────
-ALL_TOOLS = [
-    StructuredTool.from_function(file_read),
-    StructuredTool.from_function(file_write),
-    StructuredTool.from_function(file_search),
-    StructuredTool.from_function(directory_list),
-    StructuredTool.from_function(system_info),
-    StructuredTool.from_function(shell_exec),
-]
+# 从basic_tools导入的ALL_TOOLS已经是@tool装饰的函数，直接使用即可
 
 
 
@@ -377,157 +142,187 @@ class ImageOptimizationMiddleware(AgentMiddleware):
     """优化多模态消息中的图片内容，避免图片base64数据累积导致token溢出"""
 
     def wrap_model_call(self, request, handler):
-        # 处理请求中的历史消息，优化图片内容
-        self._optimize_image_content(request.messages)
+        # 处理请求中的历史消息，移除所有图片base64数据
+        self._remove_image_content(request.messages)
         response = handler(request)
         return response
 
     async def awrap_model_call(self, request, handler):
-        # 处理请求中的历史消息，优化图片内容
-        self._optimize_image_content(request.messages)
+        # 处理请求中的历史消息，移除所有图片base64数据
+        self._remove_image_content(request.messages)
         response = await handler(request)
         return response
 
-    def _optimize_image_content(self, messages):
+    def _remove_image_content(self, messages):
         """
-        优化消息中的图片内容：
-        1. 自动识别并转换Markdown格式的图片为标准多模态格式
-        2. 保留最新的2条图片消息的原始内容
-        3. 更早的图片消息替换为文本描述，避免base64数据累积
+        移除所有消息中的图片base64数据，替换为文本描述
+        彻底避免图片数据累积导致token溢出
         """
         import re
-        # 倒序查找图片消息，标记哪些需要保留
-        image_count = 0
-        for msg in reversed(messages):
+        for msg in messages:
             if hasattr(msg, 'content'):
-                # 先处理纯文本格式，识别Markdown图片
+                # 处理纯文本格式，移除Markdown图片的base64
                 if isinstance(msg.content, str):
                     content = msg.content
                     # 匹配Markdown图片格式：![alt](data:image/...;base64,...)
-                    markdown_img_pattern = r'!\[.*?\]\((data:image/[^)]+)\)'
-                    matches = re.findall(markdown_img_pattern, content)
+                    markdown_img_pattern = r'!\[.*?\]\(data:image/[^)]+\)'
+                    if re.search(markdown_img_pattern, content):
+                        # 把图片替换为文本描述
+                        msg.content = re.sub(markdown_img_pattern, '[截图已保存]', content).strip()
 
-                    if matches:
-                        # 提取出所有图片base64
-                        image_urls = matches
-                        # 把纯文本转换为多模态格式
-                        multimodal_content = []
-                        # 先添加文本部分（去掉图片Markdown）
-                        text_part = re.sub(markdown_img_pattern, '[图片]', content).strip()
-                        if text_part:
-                            multimodal_content.append({
-                                "type": "text",
-                                "text": text_part
-                            })
-                        # 添加图片部分
-                        for img_url in image_urls:
-                            multimodal_content.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": img_url
-                                }
-                            })
-                        # 替换消息内容为多模态格式
-                        msg.content = multimodal_content
-                        image_count += len(image_urls)
-
-                # 处理多模态列表格式
+                # 处理多模态列表格式，移除图片数据
                 if isinstance(msg.content, list):
-                    has_image = any(isinstance(item, dict) and item.get("type") == "image_url" for item in msg.content)
-                    if has_image:
-                        image_count += 1
-                        if image_count > 1:  # 只保留最新的1条图片消息，更早的替换为文本
-                            optimized_content = []
-                            for item in msg.content:
-                                if isinstance(item, dict) and item.get("type") == "image_url":
-                                    optimized_content.append({
-                                        "type": "text",
-                                        "text": "[历史图片消息]"
-                                    })
-                                else:
-                                    optimized_content.append(item)
-                            msg.content = optimized_content
-                        else:
-                            # 最新的图片消息使用低细节模式，减少token消耗
-                            optimized_content = []
-                            for item in msg.content:
-                                if isinstance(item, dict) and item.get("type") == "image_url":
-                                    # 添加detail="low"参数，大幅减少图片token占用
-                                    item["image_url"]["detail"] = "low"
+                    optimized_content = []
+                    for item in msg.content:
+                        if isinstance(item, dict):
+                            # 处理OpenAI格式image_url类型
+                            if item.get("type") == "image_url":
+                                # 图片替换为文本
+                                optimized_content.append({
+                                    "type": "text",
+                                    "text": "[截图已保存]"
+                                })
+                            # 处理MCP标准image类型
+                            elif item.get("type") == "image":
+                                # 图片替换为文本
+                                optimized_content.append({
+                                    "type": "text",
+                                    "text": "[截图已保存]"
+                                })
+                            else:
                                 optimized_content.append(item)
-                            msg.content = optimized_content
+                        else:
+                            optimized_content.append(item)
+                    msg.content = optimized_content
 
 
 class MCPToolResultMiddleware(AgentMiddleware):
     """处理MCP工具返回结果，特别是图片数据，转换为正确的多模态格式避免token爆炸"""
 
     def _process_image_content(self, content):
-        """处理图片内容，转换为标准多模态格式"""
+        """处理图片内容，避免大体积base64导致token超限"""
         import json
+
+        # 处理多模态列表格式的内容
+        if isinstance(content, list):
+            has_image = False
+            image_info = {}
+            text_parts = []
+
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get('type')
+                    # 处理文本内容，保留
+                    if item_type == 'text' and 'text' in item:
+                        text_parts.append(item['text'])
+                    # 处理MCP标准image类型
+                    elif item_type == 'image' and 'data' in item:
+                        has_image = True
+                        image_data = item['data'].strip()
+                        image_size_kb = len(image_data) * 3 / 4 / 1024
+                        image_info['size_kb'] = round(image_size_kb, 2)
+                        if 'width' in item:
+                            image_info['width'] = item['width']
+                        if 'height' in item:
+                            image_info['height'] = item['height']
+                    # 处理OpenAI格式image_url类型
+                    elif item_type == 'image_url' and 'image_url' in item:
+                        url = item['image_url'].get('url', '')
+                        if url.startswith('data:image/') or url.startswith('/9j/') or url.startswith('iVBORw0KGgo'):
+                            has_image = True
+                            image_size_kb = len(url) * 3 / 4 / 1024
+                            image_info['size_kb'] = round(image_size_kb, 2)
+
+            if has_image:
+                # 先保留原有的文本内容
+                result = []
+                if text_parts:
+                    result.append("\n".join(text_parts))
+
+                # 添加图片描述
+                info_text = "✅ 已成功截取当前页面的截图"
+                if image_info:
+                    details = []
+                    if 'width' in image_info and 'height' in image_info:
+                        details.append(f"分辨率：{image_info['width']} x {image_info['height']}")
+                    if 'size_kb' in image_info:
+                        details.append(f"大小：{image_info['size_kb']} KB")
+                    details.append("格式：JPEG")
+                    if details:
+                        info_text += "，截图参数：\n- " + "\n- ".join(details)
+                info_text += "\n\n你可以直接查看生成的截图内容。如果需要分析图片内容，请明确说明。"
+                result.append(info_text)
+
+                return "\n\n".join(result)
+            return None
+
+        # 处理字符串格式的内容
         if not isinstance(content, str) or not content.strip():
             return None
 
         content = content.strip()
-
-        # 尝试解析JSON，处理可能的包装格式
-        try:
-            if content.startswith(('{', '[')):
-                data = json.loads(content)
-                # 查找可能的图片字段
-                if isinstance(data, dict):
-                    for key in ['image', 'screenshot', 'img', 'base64', 'data']:
-                        if key in data and isinstance(data[key], str):
-                            content = data[key].strip()
-                            break
-        except json.JSONDecodeError:
-            pass
-
-        # 检测是否是图片格式
         is_image = False
-        image_data = None
+        image_info = {}
 
-        # 情况1：MCP标准返回格式 {"content": [{"type": "image", "data": "base64"}]}
+        # 尝试解析JSON，检测是否是图片返回
         try:
             if content.startswith(('{', '[')):
                 data = json.loads(content)
-                # 处理MCP返回的图片格式
+
+                # 情况1：MCP标准返回格式 {"content": [{"type": "image", "data": "base64"}]}
                 if isinstance(data, dict) and 'content' in data:
                     content_list = data['content']
                     if isinstance(content_list, list) and len(content_list) > 0:
                         item = content_list[0]
                         if isinstance(item, dict) and item.get('type') == 'image' and 'data' in item:
-                            image_base64 = item['data'].strip()
-                            if image_base64.startswith('/9j/'):  # JPG
-                                image_data = f"data:image/jpeg;base64,{image_base64}"
-                            elif image_base64.startswith('iVBORw0KGgo'):  # PNG
-                                image_data = f"data:image/png;base64,{image_base64}"
                             is_image = True
+                            image_data = item['data'].strip()
+                            # 估算图片大小
+                            image_size_kb = len(image_data) * 3 / 4 / 1024
+                            image_info['size_kb'] = round(image_size_kb, 2)
+                            # 尝试提取分辨率信息（如果有）
+                            if 'width' in item:
+                                image_info['width'] = item['width']
+                            if 'height' in item:
+                                image_info['height'] = item['height']
+
+                # 情况2：其他JSON格式的图片返回
+                if not is_image and isinstance(data, dict):
+                    for key in ['image', 'screenshot', 'img', 'base64', 'data']:
+                        if key in data and isinstance(data[key], str):
+                            val = data[key].strip()
+                            if val.startswith('/9j/') or val.startswith('iVBORw0KGgo') or val.startswith('data:image/'):
+                                is_image = True
+                                image_size_kb = len(val) * 3 / 4 / 1024
+                                image_info['size_kb'] = round(image_size_kb, 2)
+                                break
         except json.JSONDecodeError:
             pass
 
-        # 情况2：纯文本base64图片
+        # 情况3：纯文本base64图片
         if not is_image:
-            if content.startswith("data:image/"):
+            if content.startswith("data:image/") or content.startswith('/9j/') or content.startswith('iVBORw0KGgo'):
                 is_image = True
-                image_data = content
-            elif content.startswith('/9j/'):  # JPG文件头
-                is_image = True
-                image_data = f"data:image/jpeg;base64,{content}"
-            elif content.startswith('iVBORw0KGgo'):  # PNG文件头
-                is_image = True
-                image_data = f"data:image/png;base64,{content}"
+                image_size_kb = len(content) * 3 / 4 / 1024
+                image_info['size_kb'] = round(image_size_kb, 2)
 
         if is_image:
-            # 返回OpenAI标准多模态消息格式，使用低细节模式减少token消耗
-            return [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data,
-                        "detail": "low"  # 低细节模式，token消耗减少约70%
-                    }
-                }
-            ]
+            # 【关键优化】不返回图片base64给LLM，直接返回文本描述
+            # 避免大体积图片导致token超限，LLM不需要看到图片二进制数据
+            info_text = "✅ 已成功截取当前页面的截图"
+            if image_info:
+                details = []
+                if 'width' in image_info and 'height' in image_info:
+                    details.append(f"分辨率：{image_info['width']} x {image_info['height']}")
+                if 'size_kb' in image_info:
+                    details.append(f"大小：{image_info['size_kb']} KB")
+                details.append("格式：JPEG")
+                if details:
+                    info_text += "，截图参数：\n- " + "\n- ".join(details)
+            info_text += "\n\n你可以直接查看生成的截图内容。如果需要分析图片内容，请明确说明。"
+
+            # 返回纯文本，不返回图片数据，彻底解决token超限问题
+            return info_text
         return None
 
     def wrap_tool_call(self, request, handler):
@@ -592,6 +387,148 @@ class LangChainPocketAgent:
         # 暴露工具列表
         self.tools = ALL_TOOLS
 
+        # 环境感知缓存 — 后台刷新，不阻塞对话
+        self._cached_env_tag = None
+        self._refresh_env_lock = asyncio.Lock()
+
+    def _run_sensor(self, cmd: str, timeout: int = 5) -> Optional[str]:
+        """执行Termux传感器命令，返回stdout或None"""
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _sense_environment(self) -> Optional[str]:
+        """采集环境状态，返回自然语言格式的环境标签或None"""
+        try:
+            # 时间与时区
+            time_out = self._run_sensor(ENV_TIME_CMD)
+            tz_out = self._run_sensor(ENV_TIMEZONE_CMD)
+            if not time_out:
+                return None
+            hour = int(time_out.split(":")[0])
+            tz = tz_out or ""
+
+            descs = []
+
+            # 时段判断
+            if hour >= 6 and hour < 12:
+                descs.append(f"现在是{time_out}({tz})，上午工作时段")
+            elif hour >= 12 and hour < 14:
+                descs.append(f"现在是{time_out}({tz})，中午休息时段")
+            elif hour >= 14 and hour < 18:
+                descs.append(f"现在是{time_out}({tz})，下午工作时段")
+            elif hour >= 18 and hour < 22:
+                descs.append(f"现在是{time_out}({tz})，傍晚休息时段")
+            else:
+                descs.append(f"现在是{time_out}({tz})，深夜休息时段")
+
+            # 光照
+            light_out = self._run_sensor(ENV_LIGHT_SENSOR_CMD)
+            if light_out:
+                try:
+                    light_data = json.loads(light_out)
+                    for v in light_data.values():
+                        if isinstance(v, dict) and "values" in v and v["values"]:
+                            lux = v["values"][0]
+                            if lux < 1:
+                                descs.append("环境极暗")
+                            elif lux < 50:
+                                descs.append("环境较暗")
+                            elif lux < 500:
+                                descs.append("光线正常，室内")
+                            else:
+                                descs.append("光线明亮")
+                            break
+                except json.JSONDecodeError:
+                    pass
+
+            # 加速度计判断活动状态
+            accel_out = self._run_sensor(ENV_ACCEL_SENSOR_CMD)
+            if accel_out:
+                try:
+                    accel_data = json.loads(accel_out)
+                    for v in accel_data.values():
+                        if isinstance(v, dict) and "values" in v:
+                            vals = v["values"]
+                            if len(vals) >= 3:
+                                x_vals = vals[0::3][:3]
+                                y_vals = vals[1::3][:3]
+                                z_vals = vals[2::3][:3]
+                                max_diff = max(
+                                    max(x_vals) - min(x_vals),
+                                    max(y_vals) - min(y_vals),
+                                    max(z_vals) - min(z_vals),
+                                )
+                                if max_diff < 0.3:
+                                    descs.append("手机静止，用户可能坐着或没在使用手机")
+                                elif max_diff < 2.0:
+                                    descs.append("手机有轻微活动")
+                                else:
+                                    descs.append("手机在移动中，用户可能在走路或活动")
+                            break
+                except json.JSONDecodeError:
+                    pass
+
+            # 电池
+            batt_out = self._run_sensor("termux-battery-status")
+            if batt_out:
+                try:
+                    batt = json.loads(batt_out)
+                    pct = batt.get("percentage", 0)
+                    plugged = batt.get("plugged", "")
+                    if pct < 20:
+                        descs.append(f"电量不足({pct}%，建议简短回复)")
+                    elif pct < 100 and plugged == "UNPLUGGED":
+                        descs.append(f"电量{pct}%未充电")
+                    else:
+                        pct_info = f"电量{pct}%"
+                        if plugged != "UNPLUGGED":
+                            pct_info += "充电中"
+                        descs.append(pct_info)
+                except json.JSONDecodeError:
+                    pass
+
+            # 步数
+            step_out = self._run_sensor('termux-sensor -s "step_counter  Non-wakeup" -n 1')
+            if step_out:
+                try:
+                    step_data = json.loads(step_out)
+                    for v in step_data.values():
+                        if isinstance(v, dict) and "values" in v and v["values"]:
+                            steps = int(v["values"][0])
+                            if steps > 0:
+                                descs.append(f"今日走路{steps}步")
+                            break
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # 位置
+            loc_out = self._run_sensor('termux-location -p network', timeout=3)
+            if loc_out:
+                try:
+                    loc = json.loads(loc_out)
+                    lat, lng = loc.get("latitude"), loc.get("longitude")
+                    if lat and lng:
+                        descs.append(f"定位({lat:.2f},{lng:.2f})")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            return "[环境状态感知] " + "；".join(descs) + "。据此调整回复语气。但不要反复重复提醒，避免用户反感。"
+        except Exception:
+            return None
+
+    async def _refresh_env_cache(self) -> None:
+        """后台异步刷新环境感知缓存，不阻塞主流程"""
+        if self._refresh_env_lock.locked():
+            return  # 已有刷新任务在进行，跳过本次
+        async with self._refresh_env_lock:
+            loop = asyncio.get_event_loop()
+            tag = await loop.run_in_executor(None, self._sense_environment)
+            if tag:
+                self._cached_env_tag = tag
+
     def _init_llm(self) -> None:
         """初始化LLM客户端"""
         default_config = {
@@ -600,7 +537,8 @@ class LangChainPocketAgent:
             "model": "gelab-zero-4b-preview",
             "temperature": 0.7,
             "max_tokens": 8000,
-            "timeout": 30,
+            "timeout": 30,  # 总超时30秒
+            "max_retries": 2,  # 失败后最多重试2次
         }
         config = {**default_config, **self.llm_config}
 
@@ -614,7 +552,7 @@ class LangChainPocketAgent:
             timeout=config["timeout"],
             streaming=True,
             verbose=False,
-            max_retries=0  # 取消后不重试
+            max_retries=config.get("max_retries", 2),  # 失败后重试
         )
 
     def _create_agent(self) -> None:
@@ -637,10 +575,10 @@ class LangChainPocketAgent:
             ImageOptimizationMiddleware(),
             # 修复工具调用ID：某些LLM生成的tool_call缺少id字段
             ToolCallIdMiddleware(),
-            # 历史消息自动压缩：token超过8000时自动压缩，保留最近20条消息
+            # 历史消息自动压缩：token超过64K时自动压缩，保留最近20条消息
             SummarizationMiddleware(
                 model=self.llm,  # 使用当前配置的模型进行压缩
-                trigger=("tokens", 8000),  # token数超过8000时触发压缩（移动端小模型阈值调低）
+                trigger=("tokens", MAX_CONTEXT_TOKENS // 2),  # token数超过64K时触发压缩
                 keep=("messages", 20),  # 压缩后保留最近20条消息，减少上下文长度
             ),
             # 模型调用次数限制：单次运行最多调用MAX_ITERATIONS次模型（对应最多MAX_ITERATIONS轮迭代）
@@ -654,6 +592,9 @@ class LangChainPocketAgent:
         # 持久化存储
         self.checkpointer = MemorySaver()
 
+        # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
+        self._system_prompt = enhanced_system_prompt
+
         # 使用官方create_agent创建Agent，递归限制在config中配置
         self.agent = create_agent(
             model=self.llm,
@@ -663,17 +604,53 @@ class LangChainPocketAgent:
             middleware=middleware,
         )
 
-    async def run_conversation(self, user_message: str) -> Tuple[str, bool]:
+    async def get_context_usage(self) -> dict:
+        """获取当前完整上下文的token用量
+        直接构建实际发送给AI的完整messages数组+工具定义，一次性估算。
+        Returns:
+            {"current": int, "max": int, "percentage": float}
+            失败时返回0/128000/0
+        """
+        try:
+            state = await self.agent.aget_state(self.config)
+            state_messages = state.values.get("messages", []) or []
+
+            # 构建实际发送给LLM的完整messages：[系统提示词, *对话历史, *当前输入]
+            full_messages = []
+            sys_prompt = getattr(self, '_system_prompt', '')
+            if sys_prompt:
+                full_messages.append(SystemMessage(content=sys_prompt))
+            full_messages.extend(state_messages)
+
+            # 一次性估算：messages（含tool_calls）+ tools（按JSON schema格式）
+            # chars_per_token=2.0 更适合中英文混合场景（默认4.0偏英文）
+            current_tokens = count_tokens_approximately(
+                full_messages,
+                tools=list(ALL_TOOLS),
+                chars_per_token=2.0,
+            )
+
+            return {
+                "current": current_tokens,
+                "max": MAX_CONTEXT_TOKENS,
+                "percentage": round(current_tokens / MAX_CONTEXT_TOKENS * 100, 1)
+            }
+        except Exception:
+            return {"current": 0, "max": MAX_CONTEXT_TOKENS, "percentage": 0.0}
+
+    async def run_conversation(self, user_message: str) -> Tuple[str, bool, int]:
         """
         运行对话
         Args:
             user_message: 用户输入消息
         Returns:
-            (响应内容, 是否使用了流式输出)
+            (响应内容, 是否使用了流式输出, 本次对话调用工具次数)
         """
         try:
             full_response = ""
             progress_display = None
+            tool_call_count = 0  # 统计本次对话的工具调用次数
+            start_time = datetime.now()  # 记录开始时间，用于总耗时
 
             # 初始化进度显示
             if self.ui and hasattr(self.ui, 'create_progress_display'):
@@ -681,9 +658,14 @@ class LangChainPocketAgent:
                 progress_display.__enter__()
                 progress_display.update("思考中")
 
+            # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
+            # 首次对话无缓存时跳过，后续由后台任务自动刷新
+            env_tag = getattr(self, '_cached_env_tag', None)
+            enriched_message = f"{env_tag}\n\n{user_message}" if env_tag else user_message
+
             # 使用多种stream模式同时获取消息流和执行更新
             async for chunk in self.agent.astream(
-                {"messages": [HumanMessage(content=user_message)]},
+                {"messages": [HumanMessage(content=enriched_message)]},
                 config=self.config,
                 stream_mode=["messages", "updates"],
                 version="v2"
@@ -718,6 +700,7 @@ class LangChainPocketAgent:
                             if hasattr(message, 'tool_calls') and message.tool_calls:
                                 # 检测到工具调用
                                 for tc in message.tool_calls:
+                                    tool_call_count += 1  # 工具调用计数+1
                                     tool_name = tc["name"]
                                     tool_args = tc["args"]
 
@@ -755,11 +738,27 @@ class LangChainPocketAgent:
                 last_message = result["messages"][-1]
                 full_response = str(last_message.content).strip()
 
-            # 回复结束后换行
-            if self.ui and full_response:
-                self.ui.console.print()
+                # 统计ainvoke模式下的工具调用次数
+                for msg in result["messages"]:
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        tool_call_count += len(msg.tool_calls)
 
-            return (full_response.strip(), True)
+            # 计算总耗时并获取token用量，打印完成行 | 上下文条
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            usage = await self.get_context_usage()
+            if self.ui:
+                bar_text = ""
+                if usage["current"] > 0:
+                    bar_text = self.ui.format_context_bar(usage)
+                # 先换行再打印，与AI回复内容分开
+                self.ui.console.print(
+                    f"\n\n✅ [dim cyan]完成 (总耗时 {elapsed} 秒)[/dim cyan] {bar_text}"
+                )
+
+            # 后台刷新环境感知缓存，为下一次对话准备（不阻塞本次返回）
+            asyncio.create_task(self._refresh_env_cache())
+
+            return (full_response.strip(), True, tool_call_count)
 
         except asyncio.CancelledError:
             # 任务被取消，确保进度显示被关闭
@@ -789,8 +788,17 @@ class LangChainPocketAgent:
 
             import traceback
             error_details = traceback.format_exc()
-            error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
-            return (error_msg, False)
+
+            # 特殊处理超时错误
+            error_str = str(e).lower()
+            if "timeout" in error_str or "timed out" in error_str or "time out" in error_str:
+                error_msg = "⏱️  请求超时，请检查网络连接或稍后再试。如果问题持续存在，可以尝试降低模型输出长度或切换到更小的模型。"
+            elif "connection" in error_str or "network" in error_str or "refused" in error_str:
+                error_msg = "🔌  网络连接失败，请检查LLM服务是否正常运行，API地址和密钥是否配置正确。"
+            else:
+                error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
+
+            return (error_msg, False, tool_call_count)
 
     def clear_history(self) -> None:
         """清空对话历史"""
