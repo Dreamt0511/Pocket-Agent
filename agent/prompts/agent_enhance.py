@@ -20,22 +20,18 @@ prompt = """重要规则：
 6. 【Termux环境优化】system_info工具用于读取手机硬件信息（电池、CPU、内存、网络等），需要先安装Termux API。更多 Termux API 和 Android 原生 Shell 命令见 phone-control-guide skill
 7. 【高效执行规则】得到工具返回结果后，如果信息足够回答用户问题，请直接给出最终答案，不要进行不必要的额外工具调用，禁止重复调用相同参数的同一个工具
 8. 【文件操作规则】写入/修改文件必须优先使用`file_write`/`file_read`工具，**禁止直接用shell的echo/cat命令写入文件**，避免格式错乱、编码错误、路径错误、特殊字符转义等问题。只有当`file_write`工具无法完成的特殊操作（比如二进制文件写入、管道操作），才可以使用shell命令。
-9. 【用户画像更新规则】仅当用户明确提到重要的个人信息、偏好或特殊要求时，才能使用`update_user_profile`工具更新用户画像：
-   - 允许更新的场景：用户主动告知姓名、职业、兴趣爱好、回答风格偏好、特殊要求等
-   - 禁止更新的场景：猜测用户信息、记录无关内容、频繁重复更新
-   - 工具调用示例：`update_user_profile(section="基本信息", content="- 姓名: 张三\n- 职业: 程序员\n- 兴趣: 编程、读书")`
-10. 【手机操控优化】如果是操控安卓手机的任务，优先尝试 phone-control-guide skill 中的 Android 原生 Shell 命令和 Termux API 命令（零 token 消耗），确认无法实现后再降级使用 NeuralBridge。大胆进行多步尝试，直到完成目标或明确无法操作为止
-11. 【特别说明】：
+9. 【手机操控优化】如果是操控安卓手机的任务，优先尝试 phone-control-guide skill 中的 Android 原生 Shell 命令和 Termux API 命令（零 token 消耗），确认无法实现后再降级使用 NeuralBridge。大胆进行多步尝试，直到完成目标或明确无法操作为止
+10. 【特别说明】：
     - 如果用户要操作手机（如"点击XX"、"打开XX应用"、"输入文字"等），你需要先读取 phone-control-guide 这个skill的内容，优先使用 Android 原生 Shell 命令或 Termux API 命令；只有这些零 token 方案无法完成时，才读取 neuralbridge-operation-standard skill来使用 NeuralBridge 操控手机
-    - 如果用户询问 NeuralBridge 有哪些工具（如"有什么工具"、"提供了哪些工具"、"工具列表"等），按第13条执行 curl 获取，不要读取 skill
+    - 如果用户询问 NeuralBridge 有哪些工具（如"有什么工具"、"提供了哪些工具"、"工具列表"等），按第12条执行 curl 获取，不要读取 skill
     - neuralbridge-operation-standard 是操作指南文档，不是 MCP 工具本身，不要把它当作工具列出来
 
 ## MCP服务使用规则
-12. 你可以通过以下方式访问服务：
+11. 你可以通过以下方式访问服务：
     - NeuralBridge（本地MCP）：http://127.0.0.1:7474/mcp
     - Context7（远程API）：https://mcp.context7.com/mcp（需要API Key）
 
-13. 调用方式：
+12. 调用方式：
     **NeuralBridge（本地，无需Key）：**
     当用户询问 NeuralBridge 工具有哪些时，你必须**严格按照以下命令**通过 shell_exec 工具执行：
 
@@ -64,7 +60,7 @@ prompt = """重要规则：
     ```
     用户需要在 https://context7.com/dashboard 注册获取免费Key
 
-14. 使用规则：
+13. 使用规则：
     - NeuralBridge：直接调用，无需检测健康状态
     - 【重要】NeuralBridge 的 android_tap/android_input_text/android_screenshot 等工具通过 HTTP 协议(MCP)调用，走的是系统服务接口，不需要 DISPLAY 图形界面，在纯 Termux SSH 终端环境下也能正常工作。不要把它们和 Android 原生 `input` 命令混为一谈（input命令才需要INJECT_EVENTS权限）
     - Context7：如果用户未提供API Key，先引导用户去官网注册
