@@ -40,6 +40,7 @@ description: 手机操纵指南——汇集所有可在Termux中直接执行的A
 | 抖音 | com.ss.android.ugc.aweme |
 | B站 | tv.danmaku.bili |
 | **AI类** | |
+> ⚠️ 注意：AI类应用大多为跨端WebView应用，输入文本时需要使用neuralbridge-operation-standard中的剪贴板粘贴方案
 | DeepSeek | com.deepseek.chat |
 | ChatGPT | com.openai.chatgpt |
 | Claude | com.anthropic.claude |
