@@ -194,14 +194,14 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
         exit_cleanly = True
     except (KeyboardInterrupt, SystemExit):
-        # 直接的键盘中断或系统退出
+        # 直接的键盘中断或系统退出（输入阶段）
         print("\n再见！")
         exit_cleanly = True
     except Exception as e:
         # 检查是否是键盘中断相关的异常（包括嵌套的）
         exc_str = str(type(e)) + str(e)
         if "KeyboardInterrupt" in exc_str or "CancelledError" in exc_str:
-            print("\n再见！")
+            # 处理过程中的中断已经在内层输出了打断提示，不需要再输出再见
             exit_cleanly = True
         else:
             # 只输出真正的异常，不输出完整栈追踪
@@ -217,6 +217,3 @@ if __name__ == "__main__":
             loop.close()
         except:
             pass
-        # 确保输出干净
-        if not exit_cleanly:
-            print("\n再见！")
