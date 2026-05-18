@@ -178,7 +178,6 @@ if __name__ == "__main__":
     sys.path.insert(0, project_root)
 
     # 强制兼容所有事件循环场景，彻底避免冲突
-    import asyncio
     try:
         import nest_asyncio
         nest_asyncio.apply()

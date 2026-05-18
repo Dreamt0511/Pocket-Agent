@@ -8,20 +8,17 @@
 
 import os
 import json
-import re
 import subprocess
 import asyncio
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable
-from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
-from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
+from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, ModelResponse
 from langchain_core.messages.utils import count_tokens_approximately
-from .llm import LLMManager
 from .config import (
     MAX_ITERATIONS,
     RECURSION_LIMIT,
@@ -88,12 +85,6 @@ def load_skills_list() -> str:
     usage_note = f"\n\n使用说明：需要使用某个技能时，用file_read工具读取对应SKILL.md文件即可，例如：file_read(filepath='{SKILLS_DIR}/neuralbridge-operation-standard/SKILL.md')"
 
     return skills_text + usage_note
-
-
-# ── 工具初始化 ──────────────────────────────────────────────
-# 从basic_tools导入的ALL_TOOLS已经是@tool装饰的函数，直接使用即可
-
-
 
 
 # ── 工具调用ID修复中间件 ──────────────────────────────────────────────
@@ -779,23 +770,14 @@ class LangChainPocketAgent:
 
             return (full_response.strip(), True, tool_call_count)
 
-        except asyncio.CancelledError:
-            # 任务被取消，确保进度显示被关闭
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # 任务被取消或键盘中断，确保进度显示被关闭
             if 'progress_display' in locals() and progress_display:
                 try:
                     progress_display.__exit__(None, None, None)
                 except:
                     pass
-            # 重新抛出取消异常，让上层处理
-            raise
-        except KeyboardInterrupt:
-            # 键盘中断，确保进度显示被关闭
-            if 'progress_display' in locals() and progress_display:
-                try:
-                    progress_display.__exit__(None, None, None)
-                except:
-                    pass
-            # 重新抛出，让上层处理中断
+            # 重新抛出，让上层处理
             raise
         except Exception as e:
             # 确保进度显示被关闭
