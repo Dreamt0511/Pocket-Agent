@@ -3,78 +3,88 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
-Pocket-Agent is a lightweight mobile AI agent with a real agent loop, designed for efficient operation on both mobile devices and servers. It supports tool calling, skill integration, long-term memory, and MCP (Model Control Protocol) service integration for extended capabilities like Android device control.
+Pocket-Agent is a lightweight mobile AI agent designed for efficient operation on both mobile devices (Termux/Android) and servers. It uses LangChain + LangGraph for the agent loop, supports tool calling, a skill system, long-term memory, and MCP service integration for Android device control.
 
 ## High-Level Architecture
+
 ```
-├── main.py                 # 主程序入口，包含对话循环和命令处理
-├── core/                   # 核心功能模块
-│   ├── agent.py            # PocketAgent 核心实现，处理对话和工具调用
-│   ├── init.py             # 代理初始化，加载工具和技能
-│   ├── llm.py              # LLM 管理器，支持多提供商（OpenAI兼容、Ollama等）
-│   ├── memory.py           # 长期记忆系统
-│   ├── ui.py               # 终端UI组件（基于rich）
-│   └── superpowers/        # 内置superpowers技能实现
-├── agents/                 # 基础代理实现
-│   └── pocket_base.py      # PocketAgent 基类
-├── skills/                 # 可加载技能目录，遵循superpowers技能规范
-│   ├── brainstorming/      # 头脑风暴技能
-│   ├── code-review/        # 代码审查技能
-│   ├── systematic-debugging/ # 系统调试技能
-│   └── writing-plans/      # 计划编写技能
-├── tools/                  # 可用工具实现
-│   ├── basic_tools.py      # 基础工具（shell执行、文件操作等）
-│   └── mcp_tools.py        # MCP服务集成工具（安卓控制、文档查询等）
-├── memory/                 # 长期记忆数据存储目录
-├── requirements.txt        # 项目依赖
-└── .env                    # 环境变量配置（从.env.example复制）
+├── main.py                          # 入口：加载环境变量 → 创建LangChainPocketAgent → 对话循环
+├── agent/                           # 核心包
+│   ├── agent_langchain.py           # LangChainPocketAgent：基于create_agent的主实现，含中间件链
+│   ├── config.py                    # 全局配置（MAX_ITERATIONS, RECURSION_LIMIT, SKILLS_DIR等）
+│   ├── llm.py                       # LLMManager：多提供商支持（OpenAI兼容/Ollama/Mock）
+│   ├── memory.py                    # LongTermMemory：按日期的Markdown记忆文件 + 用户画像
+│   ├── ui.py                        # PocketUI：基于rich的终端UI（流式输出、进度条、上下文用量条）
+│   ├── prompts/                     # 提示词模块
+│   │   ├── system_base.py           # 基础系统人设
+│   │   └── agent_enhance.py         # 工具规则、技能系统说明、MCP调用规则（动态注入tool_names和skills_list）
+│   ├── tools/
+│   │   ├── basic_tools.py           # 6个内置工具：file_read, file_write, file_search, directory_list, system_info, shell_exec
+│   │   └── mcp_tools.py            # MCP工具动态生成（当前版本未预加载，由模型通过shell_exec调用curl）
+│   └── skills/                      # 技能目录，每个子目录含SKILL.md，自动发现
+├── memory/                          # 记忆数据存储（每日.md文件 + user_profile.md）
+├── .env.example                     # 环境变量模板
+└── requirements.txt                 # 依赖
 ```
 
-### Core Component Flow
-1. **初始化**: `main.py` 加载环境变量 → 初始化LLM管理器 → 创建PocketAgent实例 → 加载所有工具和技能 → 启动对话循环
-2. **对话处理**: 用户输入 → 命令解析（内置命令/技能调用/普通对话）→ Agent 处理 → 工具调用（如需要）→ 生成回复 → 记忆存储
-3. **技能系统**: 技能从 `skills/` 目录自动加载，遵循superpowers技能规范，可通过 `superpowers <command>` 调用
+### Agent Loop Flow
+1. `main.py` 加载 `.env` → 创建 `LangChainPocketAgent`（内部初始化 ChatOpenAI + `create_agent` + 中间件链）→ 启动对话循环
+2. 用户输入 → `agent.run_conversation()` → LangGraph astream 处理 → 工具调用/流式输出 → 返回结果
+3. 对话历史通过 LangGraph MemorySaver 持久化，`/undo` 命令通过更换 thread_id 清空历史
+
+### Middleware Chain (agent_langchain.py)
+Agent 使用 LangChain 官方 `create_agent` 创建，配置了5个中间件按顺序执行：
+- **MCPToolResultMiddleware**: 将MCP返回的图片base64转为文本描述，避免token爆炸
+- **ImageOptimizationMiddleware**: 移除历史消息中的图片base64数据
+- **ToolCallIdMiddleware**: 修复某些LLM（如GLM系列）生成的tool_call缺少id字段
+- **SummarizationMiddleware**: token超过64K时自动压缩历史，保留最近20条
+- **ModelCallLimitMiddleware**: 单次运行最多调用MAX_ITERATIONS次模型，达到后优雅结束
 
 ## Common Development Commands
-### 1. 安装依赖
+
+### 安装依赖
 ```bash
 pip install -r requirements.txt
-# 额外依赖（可选，用于事件循环兼容）
-pip install nest_asyncio prompt_toolkit
+# nest_asyncio和prompt_toolkit在requirements.txt中已包含
 ```
 
-### 2. 运行应用
+### 运行应用
 ```bash
 python main.py
 ```
 
-### 3. 环境配置
-复制 `.env.example` 到 `.env` 并修改配置：
-- `MCP_SERVER_URL`: MCP服务地址（默认：http://127.0.0.1:7474/mcp）
-- `DEFAULT_LLM_BASE_URL`: 默认LLM API地址（兼容OpenAI格式）
-- `OLLAMA_BASE_URL`: 本地Ollama服务地址
-- `LLM_API_KEY`: LLM API密钥（可选）
-- `LLM_MODEL`: 默认使用的LLM模型名称（可选）
+### 环境配置
+复制 `.env.example` 为 `.env` 并修改。关键变量：
+- `DEFAULT_LLM_BASE_URL`: LLM API地址（兼容OpenAI格式，默认 `http://127.0.0.1:8080/v1`）
+- `LLM_API_KEY`: API密钥（本地llama-server用 `dummy`）
+- `LLM_MODEL`: 模型名称（默认 `gelab-zero-4b-preview`）
+- `LLM_TEMPERATURE` / `LLM_MAX_TOKENS`: 生成参数
+- `NEURALBRIDGE_MCP_URL`: NeuralBridge MCP地址（默认 `http://127.0.0.1:7474/mcp`）
 
 ## Key Conventions
-### Tool Calling
-- 工具调用必须严格使用格式：`<|FunctionCallBegin|>[{"name":"工具名","parameters":{"参数名":"值"}}]<|FunctionCallEnd|>`
-- 禁止编造不存在的工具，所有工具从 `tools/` 目录中定义的列表选择
-- MCP工具调用失败时，先执行服务健康检测再提示用户
 
-### Response Rules
-- 普通回复使用纯文本，禁止Markdown格式（包括加粗、标题、代码块等）
-- 回复简洁明了，避免冗余内容
-- 严格按照实际可用功能回答，禁止编造不存在的限制或功能
+### Tool System
+- 内置工具定义在 `agent/tools/basic_tools.py`，使用 `@tool` 装饰器（LangChain），返回 `ALL_TOOLS` 列表
+- MCP工具不预加载，模型通过 `shell_exec` 执行 `curl` 调用MCP服务的 JSON-RPC 接口
+- 工具调用由LangChain/LangGraph原生处理，不需要手动解析格式
 
-### Skill Development
-- 新技能放置在 `skills/` 目录下，遵循superpowers技能规范
-- 技能会被自动加载，无需修改核心代码
+### Skill System
+- 技能目录：`agent/skills/`，每个子目录含 `SKILL.md`
+- 技能自动发现：`load_skills_list()` 扫描目录，将名称和描述注入系统提示词
+- 使用技能时模型通过 `file_read` 读取对应 SKILL.md 的完整内容
+- 现有技能：brainstorming, code-review, neuralbridge-operation-standard, phone-control-guide, systematic-debugging, test-driven-development, verification-before-completion, writing-plans
 
 ### MCP Integration
-- 内置支持两个MCP服务：
-  1. NeuralBridge (127.0.0.1:7474): 安卓设备控制
-  2. Context7 (127.0.0.1:3007): 文档查询服务
-- 服务健康检测命令：
-  - NeuralBridge: `curl -s http://127.0.0.1:7474/health || nc -zv 127.0.0.1 7474`
-  - Context7: `curl -s http://127.0.0.1:3007/health || nc -zv 127.0.0.1 3007`
+- **NeuralBridge** (127.0.0.1:7474): 安卓设备控制，通过MCP JSON-RPC协议调用
+- **Context7** (mcp.context7.com): 远程文档查询，需要API Key
+- 模型通过 `agent/prompts/agent_enhance.py` 中的规则学习如何调用MCP服务
+
+### Memory System
+- 按日期存储：`memory/YYYY-MM-DD.md`，每次对话自动记录用户输入和AI回复
+- 用户画像：`memory/user_profile.md`
+
+### Configuration (agent/config.py)
+- `MAX_ITERATIONS = 100`: 最大工具调用轮数
+- `RECURSION_LIMIT = 200`: LangGraph底层递归限制（兜底）
+- `MAX_CONTEXT_TOKENS = 128000`: 上下文窗口大小
+- `SKILLS_DIR`: 技能目录路径

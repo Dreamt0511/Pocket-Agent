@@ -184,7 +184,13 @@ def system_info(info_type: str = "all") -> str:
 
         if info_type in ["all", "cpu"]:
             result.append("⚡ CPU信息:")
-            result.append(_run_termux_cmd("cat /proc/cpuinfo | head -30"))
+            # 显示CPU核心数和关键信息，而不是前30行
+            cpu_cores = _run_termux_cmd("cat /proc/cpuinfo | grep -c processor")
+            cpu_model = _run_termux_cmd("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2 | sed 's/^ *//'")
+            cpu_info = _run_termux_cmd("cat /proc/cpuinfo | grep 'Hardware' | head -1 | cut -d: -f2 | sed 's/^ *//'")
+            result.append(f"核心数: {cpu_cores.strip() if cpu_cores else '未知'}")
+            result.append(f"型号: {cpu_model.strip() if cpu_model else '未知'}")
+            result.append(f"硬件: {cpu_info.strip() if cpu_info else '未知'}")
             result.append("")
 
         if info_type in ["all", "memory"]:
