@@ -5,6 +5,10 @@ description: 手机操纵指南——汇集所有可在Termux中直接执行的A
 
 # 手机操纵指南
 
+## 🎯 适用场景（100%优先使用本技能）
+✅ 所有不需要UI交互的系统操作：启动应用、查询系统信息、发送通知、读写剪贴板、调节音量/亮度、调用系统功能等
+❌ 不需要UI交互的操作不要用NeuralBridge，避免浪费token
+
 **优先级**：本技能是手机操控的**首选方案**（零 token 消耗）。只有当本技能列出的所有方案都无法完成任务时，才降级到 NeuralBridge。
 
 **环境前提**：以下命令在 Android 16 (Termux) 中通过 SSH 实测验证。部分系统二进制命令受 SELinux 限制不可用，已标注。
@@ -20,7 +24,79 @@ description: 手机操纵指南——汇集所有可在Termux中直接执行的A
 **核心原则**：先查后启，禁止盲目猜测包名。
 
 #### 查找包名
+✅ **重要提示**：应用包名是Android系统的全局唯一标识，所有手机上都是一样的，优先使用下方的常用应用包名对照表，不需要每次都搜索。
 
+### 常用应用包名对照表（直接使用）
+| 应用名称 | 包名 |
+|---------|------|
+| **社交类** | |
+| 微信 | com.tencent.mm |
+| QQ | com.tencent.mobileqq |
+| 企业微信 | com.tencent.wework |
+| 飞书 | com.ss.android.lark |
+| 钉钉 | com.alibaba.android.rimet |
+| 微博 | com.sina.weibo |
+| 小红书 | com.xingin.xhs |
+| 抖音 | com.ss.android.ugc.aweme |
+| B站 | tv.danmaku.bili |
+| **AI类** | |
+| DeepSeek | com.deepseek.chat |
+| ChatGPT | com.openai.chatgpt |
+| Claude | com.anthropic.claude |
+| Gemini | com.google.android.apps.bard |
+| Copilot | com.microsoft.copilot |
+| 豆包 | com.doubao.android |
+| 通义千问 | com.alibaba.android.rimet |
+| 文心一言 | com.baidu.searchbox |
+| 月之暗面 | ai.x.grok |
+| **工具类** | |
+| Chrome | com.android.chrome |
+| Edge | com.microsoft.emmx |
+| 夸克浏览器 | com.quark.browser |
+| 百度地图 | com.baidu.BaiduMap |
+| 高德地图 | com.autonavi.minimap |
+| 支付宝 | com.eg.android.AlipayGphone |
+| 微信支付 | com.tencent.mm |
+| **生活服务** | |
+| 美团 | com.sankuai.meituan |
+| 饿了么 | me.ele |
+| 淘宝 | com.taobao.taobao |
+| 京东 | com.jingdong.app.mall |
+| 拼多多 | com.xunmeng.pinduoduo |
+| 闲鱼 | com.taobao.idlefish |
+| 菜鸟 | com.cainiao.wireless |
+| 美团外卖 | com.sankuai.meituan.takeoutnew |
+| 滴滴出行 | com.sdu.didi.psnger |
+| 12306 | com.MobileTicket |
+| **办公类** | |
+| WPS | cn.wps.moffice_eng |
+| 腾讯会议 | com.tencent.wemeet.app |
+| 钉钉 | com.alibaba.android.rimet |
+| 飞书 | com.ss.android.lark |
+| QQ邮箱 | com.tencent.androidqqmail |
+| 网易邮箱 | com.netease.mobimail |
+| 有道词典 | com.youdao.dict |
+| **系统类** | |
+| 设置 | com.android.settings |
+| 电话 | com.android.dialer |
+| 短信 | com.android.mms |
+| 通讯录 | com.android.contacts |
+| 相机 | com.android.camera |
+| 相册 | com.miui.gallery |
+| 笔记 | com.miui.notes |
+| 计算器 | com.miui.calculator |
+| 时钟 | com.android.deskclock |
+| 天气 | com.miui.weather2 |
+| **其他** | |
+| 网易云音乐 | com.netease.cloudmusic |
+| QQ音乐 | com.tencent.qqmusic |
+| 酷狗音乐 | com.kugou.android |
+| 王者荣耀 | com.tencent.tmgp.sgame |
+| 和平精英 | com.tencent.tmgp.pubgmhd |
+| Termux | com.termux |
+| MT管理器 | bin.mt.plus |
+
+### 搜索包名（对照表找不到时使用）
 ```bash
 # 搜索已安装应用（推荐）
 pm list packages | grep <关键词>
@@ -244,7 +320,7 @@ pm list features                           # 硬件特性（是否有NFC/摄像�
 |------|------|----------|
 | `termux-battery-status` | 电池状态（温度/电量/充电） | ✅ 静默执行 |
 | `termux-brightness <0-255>` | 调节屏幕亮度 | ⚠️ 需在系统设置中手动授权 WRITE_SETTINGS |
-| `termux-volume <stream> <level>` | 调节音量 | ✅ 静默执行 |
+| `termux-volume <stream> <level>` | 调节音量，stream可选值：music(媒体)/ring(铃声)/notification(通知)/alarm(闹钟)/call(通话)，level范围0-15 | ✅ 静默执行 |
 | `termux-wifi-connectioninfo` | WiFi 连接信息（SSID/信号） | ✅ 静默执行 |
 | `termux-wifi-scaninfo` | 扫描附近 WiFi（含BSSID/信号强度/频段） | ✅ 静默执行 |
 | `termux-wifi-enable true/false` | 开关 WiFi | ⚠️ 弹窗需用户点击确认 |
