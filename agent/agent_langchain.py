@@ -534,11 +534,7 @@ class LangChainPocketAgent:
         }
         config = {**default_config, **self.llm_config}
 
-        # 如果API key为空或dummy，使用mock配置避免OpenAI验证错误
-        if not config["api_key"] or config["api_key"] == "dummy":
-            # 使用一个不会实际发起网络请求的配置
-            config["base_url"] = "http://mock.localhost:9999/v1"
-            config["api_key"] = "mock-key"
+        # 移除mock逻辑，直接使用真实配置
 
         # 初始化ChatOpenAI客户端
         self.llm = ChatOpenAI(
