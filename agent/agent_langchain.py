@@ -33,7 +33,8 @@ from .config import (
     ENV_TIMEZONE_CMD,
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
-from .tools.basic_tools import ALL_TOOLS
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance
+from .memory import LongTermMemory
 
 
 # ── 技能加载工具 ──────────────────────────────────────────────
@@ -379,6 +380,13 @@ class LangChainPocketAgent:
         # 暴露工具列表
         self.tools = ALL_TOOLS
 
+        # 初始化记忆系统，用于用户画像更新
+        self.memory = LongTermMemory()
+        # 设置全局记忆实例，供update_user_profile工具使用
+        set_memory_instance(self.memory)
+        # 预加载用户画像，只加载一次，避免破坏缓存
+        self._user_profile = self.memory.get_user_profile()
+
         # 环境感知缓存 — 后台刷新，不阻塞对话
         self._cached_env_tag = None
         self._refresh_env_lock = asyncio.Lock()
@@ -656,9 +664,11 @@ class LangChainPocketAgent:
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：历史消息 + 环境感知（如有） + 当前用户消息
-            # 环境感知作为独立SystemMessage插入，避免破坏用户消息格式和缓存命中
+            # 构建消息列表：用户画像（固定，只加载一次） + 环境感知（动态） + 当前用户消息
+            # 用户画像是固定的，放在最前面不会破坏缓存命中
             messages = []
+            if self._user_profile:
+                messages.append(SystemMessage(content=f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。"))
             if env_tag:
                 messages.append(SystemMessage(content=env_tag))
             messages.append(HumanMessage(content=user_message))
@@ -744,6 +754,8 @@ class LangChainPocketAgent:
             if not full_response:
                 # 构建与stream模式相同的消息结构
                 invoke_messages = []
+                if self._user_profile:
+                    invoke_messages.append(SystemMessage(content=f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。"))
                 if env_tag:
                     invoke_messages.append(SystemMessage(content=env_tag))
                 invoke_messages.append(HumanMessage(content=user_message))

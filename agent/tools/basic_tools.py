@@ -301,7 +301,45 @@ def shell_exec(command: str) -> str:
         return f"执行命令: {truncated_cmd}\n执行命令错误: {str(e)}"
 
 
+# 全局记忆系统实例（用于工具调用）
+_memory_instance = None
+
+def set_memory_instance(memory):
+    """设置全局记忆实例，供工具调用"""
+    global _memory_instance
+    _memory_instance = memory
+
+@tool
+def update_user_profile(section: str, content: str) -> str:
+    """
+    【重要】更新用户画像，仅用于记录用户明确提到的重要个人信息、偏好和特殊要求。
+    禁止随意更新，只有当用户明确提到以下信息时才能使用：
+    - 基本信息：姓名、职业、兴趣爱好等
+    - 偏好设置：喜欢的回答风格、关注的话题领域等
+    - 特殊要求：对回答的特殊要求、需要避免的内容等
+
+    Args:
+        section: 要更新的部分，必须是现有画像中的章节（基本信息/偏好设置/特殊要求）
+        content: 新的内容，完整替换该章节下的所有内容
+    """
+    if not _memory_instance:
+        return "❌ 记忆系统未初始化，无法更新用户画像"
+
+    valid_sections = ["基本信息", "偏好设置", "特殊要求"]
+    if section not in valid_sections:
+        return f"❌ 无效的章节 '{section}'，只能更新: {', '.join(valid_sections)}"
+
+    try:
+        # 异步执行更新，不阻塞主流程
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _memory_instance.update_user_profile, section, content)
+        return f"✅ 已异步更新用户画像 [{section}]"
+    except Exception as e:
+        return f"❌ 更新用户画像失败: {str(e)}"
+
+
 # 所有工具函数
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list,system_info, shell_exec
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile
 ]
