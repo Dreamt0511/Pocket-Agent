@@ -712,6 +712,17 @@ class LangChainPocketAgent:
                                         if self.ui and hasattr(self.ui, 'print_info'):
                                             self.ui.print_info(f"执行命令: {command}")
                                         progress_display.update(f"执行: {display_cmd}")
+                                    # 特殊处理file_read读取skill的情况，显示skill名称
+                                    elif tool_name == "file_read" and "file_path" in tool_args:
+                                        file_path = tool_args["file_path"]
+                                        if SKILLS_DIR in file_path:
+                                            # 提取skill名称：skills/xxx/SKILL.md → xxx
+                                            skill_name = file_path.replace(SKILLS_DIR, "").split("/")[1]
+                                            progress_display.update(f"读取技能: {skill_name}")
+                                        else:
+                                            # 普通文件读取
+                                            display_path = file_path.split("/")[-1] if "/" in file_path else file_path
+                                            progress_display.update(f"读取文件: {display_path}")
                                     else:
                                         # 其他工具显示名称和参数
                                         args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
