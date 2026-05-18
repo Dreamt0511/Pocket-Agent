@@ -668,11 +668,17 @@ class LangChainPocketAgent:
             # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
-            enriched_message = f"{env_tag}\n\n{user_message}" if env_tag else user_message
+
+            # 构建消息列表：历史消息 + 环境感知（如有） + 当前用户消息
+            # 环境感知作为独立SystemMessage插入，避免破坏用户消息格式和缓存命中
+            messages = []
+            if env_tag:
+                messages.append(SystemMessage(content=env_tag))
+            messages.append(HumanMessage(content=user_message))
 
             # 使用多种stream模式同时获取消息流和执行更新
             async for chunk in self.agent.astream(
-                {"messages": [HumanMessage(content=enriched_message)]},
+                {"messages": messages},
                 config=self.config,
                 stream_mode=["messages", "updates"],
                 version="v2"
@@ -738,8 +744,14 @@ class LangChainPocketAgent:
 
             # 如果stream没有返回内容（极端情况），回退到ainvoke
             if not full_response:
+                # 构建与stream模式相同的消息结构
+                invoke_messages = []
+                if env_tag:
+                    invoke_messages.append(SystemMessage(content=env_tag))
+                invoke_messages.append(HumanMessage(content=user_message))
+
                 result = await self.agent.ainvoke(
-                    {"messages": [HumanMessage(content=user_message)]},
+                    {"messages": invoke_messages},
                     config=self.config
                 )
                 last_message = result["messages"][-1]
