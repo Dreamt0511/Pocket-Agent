@@ -664,14 +664,17 @@ class LangChainPocketAgent:
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像（固定，只加载一次） + 环境感知（动态） + 当前用户消息
-            # 用户画像是固定的，放在最前面不会破坏缓存命中
-            messages = []
-            if self._user_profile:
-                messages.append(SystemMessage(content=f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。"))
-            if env_tag:
-                messages.append(SystemMessage(content=env_tag))
-            messages.append(HumanMessage(content=user_message))
+            # 构建消息列表：用户画像 + 环境感知合并到用户消息中（不单独作为SystemMessage）
+            # 原因：某些LLM服务端（如llama.cpp）的Jinja2 chat template只允许一个system消息
+            # create_agent已自带system_prompt，额外传入SystemMessage会导致"System message must be at the beginning"错误
+            profile_text = f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。" if self._user_profile else ""
+            env_text = env_tag if env_tag else ""
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            if combined_context:
+                combined_message = f"{combined_context}\n\n---\n{user_message}"
+            else:
+                combined_message = user_message
+            messages = [HumanMessage(content=combined_message)]
 
             # 使用多种stream模式同时获取消息流和执行更新
             async for chunk in self.agent.astream(
@@ -752,13 +755,12 @@ class LangChainPocketAgent:
 
             # 如果stream没有返回内容（极端情况），回退到ainvoke
             if not full_response:
-                # 构建与stream模式相同的消息结构
-                invoke_messages = []
-                if self._user_profile:
-                    invoke_messages.append(SystemMessage(content=f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。"))
-                if env_tag:
-                    invoke_messages.append(SystemMessage(content=env_tag))
-                invoke_messages.append(HumanMessage(content=user_message))
+                # 构建与stream模式相同的消息结构（同样合并到HumanMessage，避免多个SystemMessage）
+                profile_text = f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。" if self._user_profile else ""
+                env_text = env_tag if env_tag else ""
+                combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+                invoke_message = f"{combined_context}\n\n---\n{user_message}" if combined_context else user_message
+                invoke_messages = [HumanMessage(content=invoke_message)]
 
                 result = await self.agent.ainvoke(
                     {"messages": invoke_messages},
