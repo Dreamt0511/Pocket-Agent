@@ -76,6 +76,6 @@ prompt = """## 一、核心原则
 ## 六、收尾：技能沉淀
 
 - **已有技能** → 直接跳过，不要重复写入
-- **新技能** → 先 `shell_exec mkdir -p` 建目录，再用 `file_write` 写一次
+- **新技能** → 先 `file_read` 读取 `agent/skills/executor-skills/skill-creator/SKILL.md`，严格按其中的格式要求编写，再执行 `shell_exec mkdir -p` 建目录，最后用 `file_write` 写一次
 - 不足3步的任务跳过沉淀
 """

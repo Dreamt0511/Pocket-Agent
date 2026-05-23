@@ -70,4 +70,5 @@ prompt = """重要规则：
 {skills_list}
     - 需要用某个技能时，用file_read读取对应SKILL.md
     - 已经读过的技能不要重复读取
-"""
+
+14. 【技能验证】当收到含此标记的消息时，说明子Agent沉淀了新技能。用 file_read 读取标记中列出的新技能 SKILL.md，再读取 `agent/skills/executor-skills/skill-creator/SKILL.md` 对照标准格式检查，不符合的用 file_write 修正。验证结果简要报告即可，不要阻塞用户当前请求。"""

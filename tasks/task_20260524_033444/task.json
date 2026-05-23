@@ -1,0 +1,23 @@
+{
+  "objective": "打开GitHub应用，获取用户所有仓库名并记录下来",
+  "steps": [
+    {
+      "id": 1,
+      "desc": "打开GitHub应用"
+    },
+    {
+      "id": 2,
+      "desc": "确保已登录用户账号"
+    },
+    {
+      "id": 3,
+      "desc": "进入个人仓库列表页面"
+    },
+    {
+      "id": 4,
+      "desc": "查看并记录所有仓库名称"
+    }
+  ],
+  "status": "failed",
+  "error": "Traceback (most recent call last):\n  File \"/storage/emulated/0/手机agent开发/Pocket-Agent/agent/agent_langchain.py\", line 1206, in _run_executor_foreground\n    self.ui.print_stream_chunk(content)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^\n  File \"/storage/emulated/0/手机agent开发/Pocket-Agent/agent/ui.py\", line 182, in print_stream_chunk\n    self.console.print(chunk, end=\"\", style=\"bold cyan\", no_wrap=True, overflow=\"crop\")\n    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+}

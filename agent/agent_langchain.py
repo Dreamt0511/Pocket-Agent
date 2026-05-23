@@ -39,8 +39,7 @@ from .config import (
     LOGS_DIR,
     EXECUTOR_SKILLS_DIR,
     AUTO_SKILLS_DIR,
-    EXECUTOR_MAX_TOKENS,
-    EXECUTOR_TEMPERATURE,
+    EXECUTOR_LLM_CONFIG,
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
 from .logger import AgentLogger
@@ -514,6 +513,9 @@ class LangChainPocketAgent:
         # 子Agent LLM缓存（复用配置，避免每个任务创建新客户端）
         self._executor_llm = None
 
+        # 子Agent沉淀的新技能列表（待主Agent验证格式）
+        self._pending_skill_verification: list[str] = []
+
     def _run_sensor(self, cmd: str, timeout: int = 5) -> Optional[str]:
         """执行Termux传感器命令，返回stdout或None"""
         try:
@@ -915,6 +917,16 @@ class LangChainPocketAgent:
                         )
                     await self._run_executor_foreground(task_path, task_id)
 
+            # ── 技能验证：通知主Agent检查新沉淀的技能 ──
+            if self._pending_skill_verification:
+                skills_str = ", ".join(self._pending_skill_verification)
+                try:
+                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请对照 skill-creator 格式检查并修正。")
+                    await self.agent.update_state(self.config, {"messages": [msg]})
+                except Exception:
+                    pass
+                self._pending_skill_verification = []
+
             # ── 清理主Agent状态中的 delegate_task 相关消息 ──
             # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
             if pending_tasks:
@@ -1091,12 +1103,26 @@ class LangChainPocketAgent:
             system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
 
             if self._executor_llm is None:
+                # 子Agent LLM 配置：从 .env 读取，未设置的字段继承主Agent
+                _base = EXECUTOR_LLM_CONFIG.get("base_url")
+                _api = EXECUTOR_LLM_CONFIG.get("api_key")
+                _mod = EXECUTOR_LLM_CONFIG.get("model")
+                _tmp = EXECUTOR_LLM_CONFIG.get("temperature")
+                _tok = EXECUTOR_LLM_CONFIG.get("max_tokens")
+                executor_llm_config = {
+                    "base_url": _base if _base else self.llm.openai_api_base,
+                    "api_key": _api if _api else self.llm.openai_api_key,
+                    "model": _mod if _mod else self.llm.model_name,
+                    "temperature": float(_tmp) if _tmp and _tmp.replace(".", "", 1).lstrip("-").isdigit() else 0.5,
+                    "max_tokens": int(_tok) if _tok and _tok.isdigit() else 16000,
+                }
+                # 子Agent任务包含MCP/Shell调用，超时设30s比主Agent的10s更长
                 self._executor_llm = ChatOpenAI(
-                    base_url=self.llm.openai_api_base,
-                    api_key=self.llm.openai_api_key,
-                    model=self.llm.model_name,
-                    temperature=EXECUTOR_TEMPERATURE,
-                    max_tokens=EXECUTOR_MAX_TOKENS,
+                    base_url=executor_llm_config["base_url"],
+                    api_key=executor_llm_config["api_key"],
+                    model=executor_llm_config["model"],
+                    temperature=executor_llm_config["temperature"],
+                    max_tokens=executor_llm_config["max_tokens"],
                     timeout=30,
                     streaming=True,
                     max_retries=1,
@@ -1352,10 +1378,10 @@ class LangChainPocketAgent:
             needs_skill = len(steps) >= 3 and objective and not has_failures
             if needs_skill:
                 # 快速扫描：子Agent是否已自行沉淀技能
-                skill_was_written = False
+                new_skills = []
                 auto_executor_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
                 if os.path.exists(auto_executor_dir):
-                    for _cat in os.listdir(auto_executor_dir):
+                    for _cat in sorted(os.listdir(auto_executor_dir)):
                         _cat_path = os.path.join(auto_executor_dir, _cat)
                         if not os.path.isdir(_cat_path):
                             continue
@@ -1365,15 +1391,15 @@ class LangChainPocketAgent:
                             _fp = os.path.join(_cat_path, _fn)
                             _mtime = os.path.getmtime(_fp)
                             _start_ts = self._executor_step_start.timestamp() if hasattr(self, '_executor_step_start') else 0
-                            if _mtime >= _start_ts - 5 and os.path.getsize(_fp) > 50:
-                                skill_was_written = True
+                            if _start_ts > 0 and _mtime >= _start_ts - 5 and os.path.getsize(_fp) > 50:
+                                new_skills.append(_cat)
                                 break
-                        if skill_was_written:
-                            break
+                skill_was_written = bool(new_skills)
 
                 if skill_was_written:
                     if self.ui:
                         self.ui.console.print(f"\n  [dim]\U0001f4dd 子Agent已沉淀技能[/dim]")
+                    self._pending_skill_verification.extend(new_skills)
                 else:
                     # 检查是否真的执行了操作（executor_step > 2 说明有过实际工具调用）
                     if executor_step <= 2:

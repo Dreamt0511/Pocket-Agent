@@ -38,9 +38,17 @@ LLM_DEFAULT_CONFIG = {
     "max_tokens": 8000,
 }
 
-# 子Agent（Executor）LLM 参数
-EXECUTOR_MAX_TOKENS = 16000
-EXECUTOR_TEMPERATURE = 0.5
+# 子Agent（Executor）LLM 配置
+# 从 .env 中读取 EXECUTOR_LLM_BASE_URL、EXECUTOR_API_KEY、EXECUTOR_MODEL、
+# EXECUTOR_TEMPERATURE、EXECUTOR_MAX_TOKENS
+# 未设置的字段自动继承主Agent的对应值（共用同一模型）
+EXECUTOR_LLM_CONFIG = {
+    "base_url": os.getenv("EXECUTOR_LLM_BASE_URL"),
+    "api_key": os.getenv("EXECUTOR_API_KEY"),
+    "model": os.getenv("EXECUTOR_MODEL"),
+    "temperature": os.getenv("EXECUTOR_TEMPERATURE"),
+    "max_tokens": os.getenv("EXECUTOR_MAX_TOKENS"),
+}
 
 # ==============================
 # 子Agent系统配置
