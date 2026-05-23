@@ -17,7 +17,7 @@ class LongTermMemory:
     每天生成一个 Markdown 记忆文件
     """
     
-    def __init__(self, memory_dir: str = "memory"):
+    def __init__(self, memory_dir: str):
         self.memory_dir = Path(memory_dir)
         self.memory_dir.mkdir(exist_ok=True)
         

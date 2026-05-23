@@ -11,7 +11,6 @@ import os
 from typing import Optional, List, Dict, Any, Callable
 
 NEURALBRIDGE_MCP_URL = os.getenv("NEURALBRIDGE_MCP_URL", "http://127.0.0.1:7474/mcp")
-CONTEXT7_MCP_URL = os.getenv("CONTEXT7_MCP_URL", "http://127.0.0.1:3007/mcp")
 
 def tool(name: str, description: str, parameters: Dict[str, Any]):
     """工具装饰器（保持原有接口不变）"""

@@ -14,7 +14,7 @@ from agent.agent_langchain import LangChainPocketAgent
 from dotenv import load_dotenv
 # 从脚本所在目录加载.env，override=True确保覆盖已有环境变量
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
-from agent.config import MAX_ITERATIONS
+from agent.config import MAX_ITERATIONS, PROJECT_ROOT
 from agent.prompts.system_base import prompt as system_base_prompt
 
 
@@ -62,7 +62,7 @@ async def main():
     )
 
     # 初始化记忆系统
-    memory = LongTermMemory()
+    memory = LongTermMemory(memory_dir=os.path.join(PROJECT_ROOT, "memory"))
 
     # 互动式对话循环
     tool_call_count = 0
@@ -83,6 +83,7 @@ async def main():
                 continue
 
             if user_input.lower() in ['q', 'quit', 'exit', 'bye', '退出']:
+                await agent.cleanup()
                 ui.print_success("再见！")
                 break
 
@@ -170,6 +171,9 @@ async def main():
             # 忽略键盘中断相关的异常栈输出
             if not isinstance(e, KeyboardInterrupt) and "CancelledError" not in str(type(e)):
                 ui.print_error(f"发现错误: {e}")
+        finally:
+            # 退出前关闭HTTP客户端，避免httpx异步生成器报错
+            await agent.cleanup()
 
 
 if __name__ == "__main__":

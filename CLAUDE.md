@@ -61,6 +61,23 @@ python main.py
 - `LLM_TEMPERATURE` / `LLM_MAX_TOKENS`: 生成参数
 - `NEURALBRIDGE_MCP_URL`: NeuralBridge MCP地址（默认 `http://127.0.0.1:7474/mcp`）
 
+### 测试和验证
+- 运行SSH命令测试：`python test_ssh_cmd.py "<command>"`
+- 运行嵌入测试：`python my_test_scripts/test_long_embedding.py`
+- 运行聊天测试：`python my_test_scripts/chat.py`
+- 使用技能进行测试驱动开发：参考 `agent/skills/test-driven-development/` 中的指南
+
+### 代码质量
+- 代码格式化：`black .` （使用pyproject.toml中的配置）
+- 导入排序：`isort .` （使用pyproject.toml中的配置）
+- 运行所有检查：`black . --check && isort . --check`
+
+### 代码变更验证（强制执行）
+**修改代码后必须先运行验证再报告完成，禁止写完不跑。**
+- Python 文件：`python3 -c "import ast; ast.parse(open('文件路径').read())"` 验证语法
+- 能直接运行的代码（如测试、脚本）必须实际执行确认无报错
+- 对于运行环境受限无法完整运行的情况，至少完成语法验证并说明限制
+
 ## Key Conventions
 
 ### Tool System

@@ -8,15 +8,18 @@
 
 import os
 import json
+import re
 import subprocess
 import asyncio
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable
+from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
-from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware
+from .memory import LongTermMemory
+from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
 from langchain.agents.middleware.types import AgentMiddleware, ModelResponse
 from langchain_core.messages.utils import count_tokens_approximately
 from .config import (
@@ -31,67 +34,176 @@ from .config import (
     ENV_ACCEL_SENSOR_CMD,
     ENV_TIME_CMD,
     ENV_TIMEZONE_CMD,
+    PROJECT_ROOT,
+    TASKS_DIR,
+    LOGS_DIR,
+    EXECUTOR_SKILLS_DIR,
+    AUTO_SKILLS_DIR,
+    EXECUTOR_MAX_TOKENS,
+    EXECUTOR_TEMPERATURE,
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
-from .tools.basic_tools import ALL_TOOLS, set_memory_instance
-from .memory import LongTermMemory
+from .logger import AgentLogger
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks
+from .prompts.executor_system import executor_system_prompt
+from .prompts.executor_enhance import prompt as executor_enhance_prompt
 
 
 # ── 技能加载工具 ──────────────────────────────────────────────
-def load_skills_list() -> str:
+def _read_skill_desc(skill_path: str) -> str:
+    """读取SKILL.md前20行中的description字段"""
+    try:
+        with open(skill_path, 'r', encoding='utf-8') as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("description:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _scan_skills(scan_dir: str) -> list:
     """
-    预加载所有可用技能的名称和描述，用于系统提示词
-    返回格式化为列表的技能信息
+    扫描指定目录下的所有技能，支持单层嵌套分类。
+    返回 (category_name, skill_name, desc, skill_path) 元组列表。
+    - 如果子目录直接含 SKILL.md → flat 模式，category_name 为空
+    - 如果子目录含再下一级子目录有 SKILL.md → category 模式
     """
-    skills_dir = SKILLS_DIR
+    results = []
+    for entry in sorted(os.listdir(scan_dir)):
+        entry_path = os.path.join(scan_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        # 检查 entry 是否直接是技能（含 SKILL.md）
+        skill_file = None
+        for fn in SKILL_FILE_NAMES:
+            candidate = os.path.join(entry_path, fn)
+            if os.path.exists(candidate):
+                skill_file = candidate
+                break
+
+        if skill_file:
+            desc = _read_skill_desc(skill_file)
+            results.append(("", entry, desc, skill_file))
+            continue
+
+        # 否则检查 entry 下的子目录是否有技能（category 模式）
+        sub_skills = []
+        for sub_entry in sorted(os.listdir(entry_path)):
+            sub_path = os.path.join(entry_path, sub_entry)
+            if not os.path.isdir(sub_path):
+                continue
+            for fn in SKILL_FILE_NAMES:
+                candidate = os.path.join(sub_path, fn)
+                if os.path.exists(candidate):
+                    desc = _read_skill_desc(candidate)
+                    sub_skills.append((sub_entry, desc, candidate))
+                    break
+
+        if sub_skills:
+            for name, desc, skill_path in sub_skills:
+                results.append((entry, name, desc, skill_path))
+
+    return results
+
+
+def load_skills_list(agent_type: str = "main") -> str:
+    """
+    根据agent类型加载对应技能列表
+    Args:
+        agent_type: "main" → main-skills/ 目录, "executor" → executor-skills/ + auto-skills/executor/
+    """
+    skills_dir = SKILLS_DIR if agent_type == "main" else EXECUTOR_SKILLS_DIR
 
     if not os.path.exists(skills_dir):
         return "暂无可用技能。"
 
-    skills = []
-    for d in os.listdir(skills_dir):
-        skill_dir = os.path.join(skills_dir, d)
-        if not os.path.isdir(skill_dir):
-            continue
+    skills = _scan_skills(skills_dir)
 
-        # 支持配置的技能文件名称（大小写）
-        skill_path = None
-        for filename in SKILL_FILE_NAMES:
-            candidate_path = os.path.join(skill_dir, filename)
-            if os.path.exists(candidate_path):
-                skill_path = candidate_path
-                break
-
-        if os.path.exists(skill_path):
-            # 只读取技能元数据（名称+描述），不读取完整内容
-            try:
-                with open(skill_path, 'r', encoding='utf-8') as f:
-                    desc = ""
-                    # 只读取前20行找description，避免大文件占用token
-                    for _ in range(20):
-                        line = f.readline()
-                        if not line:
-                            break
-                        if line.startswith("description:"):
-                            desc = line.split(":", 1)[1].strip()
-                            break
-                skills.append(f"- {d}: {desc}")
-            except Exception as e:
-                skills.append(f"- {d}: 无描述")
+    # executor 额外加载自动沉淀技能，和主Agent统一写法
+    if agent_type == "executor":
+        auto_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+        if os.path.exists(auto_dir):
+            skills.extend(_scan_skills(auto_dir))
 
     if not skills:
         return "暂无可用技能。"
 
-    skills_text = "\n".join(skills)
-    usage_note = f"\n\n使用说明：需要使用某个技能时，用file_read工具读取对应SKILL.md文件即可，例如：file_read(filepath='{SKILLS_DIR}/neuralbridge-operation-standard/SKILL.md')"
+    # 按分类分组输出
+    categories = {}
+    for cat, name, desc, skill_path in skills:
+        categories.setdefault(cat, []).append((name, desc, skill_path))
+
+    lines = []
+    for cat, skill_list in categories.items():
+        if cat:
+            lines.append(f"\n【{cat}】")
+        for name, desc, skill_path in skill_list:
+            entry = f"- {name}: {desc}（路径：{skill_path}）" if desc else f"- {name}（路径：{skill_path}）"
+            lines.append(entry)
+        if not cat:
+            lines.append("")  # 空行分隔无分类和有分类
+
+    skills_text = "\n".join(lines).strip()
+    # 用第一个技能的实际路径作为示例
+    first_path = skills[0][3] if skills else ""
+    if not first_path:
+        first_path = os.path.join(skills_dir, "example", "SKILL.md")
+    usage_note = f"\n\n使用说明：需要使用某个技能时，用file_read读取对应SKILL.md即可，例如：file_read(filepath='{first_path}')"
 
     return skills_text + usage_note
+
+
+# ── 工具初始化 ──────────────────────────────────────────────
+# 从basic_tools导入的ALL_TOOLS已经是@tool装饰的函数，直接使用即可
+
+
+
+
+# ── DeepSeek reasoning_content 兼容补丁 ──────────────────────────────
+# LangChain 的 ChatOpenAI 不支持非标准 API 字段（文档写明），导致：
+# 1. 流式响应中的 reasoning_content 被 _convert_delta_to_message_chunk 丢弃
+# 2. additional_kwargs 中的字段不被 _convert_message_to_dict 传回 API
+# 两处 monkey-patch 确保 reasoning_content 在请求-响应周期中完整保留。
+import langchain_openai.chat_models.base as _chat_base
+
+# Patch 1: 流式响应中捕获 reasoning_content 存入 additional_kwargs
+_original_convert_delta = _chat_base._convert_delta_to_message_chunk
+
+def _patched_convert_delta(_dict, default_class):
+    chunk = _original_convert_delta(_dict, default_class)
+    if isinstance(chunk, AIMessageChunk):
+        rc = _dict.get("reasoning_content")
+        if rc:
+            chunk.additional_kwargs["reasoning_content"] = rc
+    return chunk
+
+_chat_base._convert_delta_to_message_chunk = _patched_convert_delta
+
+# Patch 2: 发送消息时把 additional_kwargs 中的 reasoning_content 传给 API
+_original_convert = _chat_base._convert_message_to_dict
+
+def _patched_convert_message_to_dict(message, api="chat/completions"):
+    result = _original_convert(message, api)
+    if isinstance(message, AIMessage):
+        for key in ('reasoning_content',):
+            if key in message.additional_kwargs:
+                result[key] = message.additional_kwargs[key]
+    return result
+
+_chat_base._convert_message_to_dict = _patched_convert_message_to_dict
+# ──────────────────────────────────────────────────────────────────────
 
 
 # ── 工具调用ID修复中间件 ──────────────────────────────────────────────
 # 某些LLM（如GLM系列）生成的tool_call缺少id字段，
 # 导致LangGraph的ToolNode创建ToolMessage时tool_call_id为空报错
 import uuid
+
 
 class ToolCallIdMiddleware(AgentMiddleware):
     """确保所有工具调用都有有效的id字段"""
@@ -380,16 +492,27 @@ class LangChainPocketAgent:
         # 暴露工具列表
         self.tools = ALL_TOOLS
 
+        # 环境感知缓存 — 后台刷新，不阻塞对话
+        self._cached_env_tag = None
+        self._refresh_env_lock = asyncio.Lock()
+
         # 初始化记忆系统，用于用户画像更新
-        self.memory = LongTermMemory()
+        self.memory = LongTermMemory(memory_dir=os.path.join(PROJECT_ROOT, "memory"))
         # 设置全局记忆实例，供update_user_profile工具使用
         set_memory_instance(self.memory)
         # 预加载用户画像，只加载一次，避免破坏缓存
         self._user_profile = self.memory.get_user_profile()
 
-        # 环境感知缓存 — 后台刷新，不阻塞对话
-        self._cached_env_tag = None
-        self._refresh_env_lock = asyncio.Lock()
+        # 初始化日志系统
+        self.logger = AgentLogger(log_dir=os.path.join(PROJECT_ROOT, "logs"))
+        # 确保任务目录存在
+        os.makedirs(TASKS_DIR, exist_ok=True)
+
+        # 后台子Agent执行结果缓存（用于下次对话通知用户）
+        self._background_task_results: list[dict] = []
+
+        # 子Agent LLM缓存（复用配置，避免每个任务创建新客户端）
+        self._executor_llm = None
 
     def _run_sensor(self, cmd: str, timeout: int = 5) -> Optional[str]:
         """执行Termux传感器命令，返回stdout或None"""
@@ -515,7 +638,7 @@ class LangChainPocketAgent:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            return "[环境状态感知] " + "；".join(descs) + "。据此调整回复语气。但不要反复重复提醒，避免用户反感。"
+            return "[环境状态感知] " + "；".join(descs) + "。（仅供内部参考，不要在回复中提及此信息）"
         except Exception:
             return None
 
@@ -542,7 +665,11 @@ class LangChainPocketAgent:
         }
         config = {**default_config, **self.llm_config}
 
-        # 移除mock逻辑，直接使用真实配置
+        # 如果API key为空或dummy，使用mock配置避免OpenAI验证错误
+        if not config["api_key"] or config["api_key"] == "dummy":
+            # 使用一个不会实际发起网络请求的配置
+            config["base_url"] = "http://mock.localhost:9999/v1"
+            config["api_key"] = "mock-key"
 
         # 初始化ChatOpenAI客户端
         self.llm = ChatOpenAI(
@@ -560,7 +687,7 @@ class LangChainPocketAgent:
     def _create_agent(self) -> None:
         """使用官方create_agent创建Agent，内置中间件限制工具调用"""
         # 预加载技能列表
-        skills_list = load_skills_list()
+        skills_list = load_skills_list("main")
 
         # 动态注入工具列表和技能列表到增强提示词
         tool_names = ", ".join([tool.name for tool in ALL_TOOLS])
@@ -653,6 +780,21 @@ class LangChainPocketAgent:
             progress_display = None
             tool_call_count = 0  # 统计本次对话的工具调用次数
             start_time = datetime.now()  # 记录开始时间，用于总耗时
+            conv_task_id = f"conv_{datetime.now().strftime('%H%M%S')}"
+
+            # 记录对话开始
+            self.logger.log_conversation_start(conv_task_id, user_message)
+
+            # 通知用户后台任务完成
+            if self._background_task_results and self.ui and hasattr(self.ui, 'console'):
+                for _r in self._background_task_results:
+                    status_icon = "✅" if _r.get("status") == "completed" else "❌"
+                    summary_trunc = _r.get("summary", "")[:120]
+                    self.ui.console.print(
+                        f"[dim]{status_icon} 后台任务 [{_r['task_id']}] "
+                        f"{summary_trunc}[/dim]"
+                    )
+                self._background_task_results.clear()
 
             # 初始化进度显示
             if self.ui and hasattr(self.ui, 'create_progress_display'):
@@ -664,21 +806,20 @@ class LangChainPocketAgent:
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像 + 环境感知合并到用户消息中（不单独作为SystemMessage）
-            # 原因：某些LLM服务端（如llama.cpp）的Jinja2 chat template只允许一个system消息
-            # create_agent已自带system_prompt，额外传入SystemMessage会导致"System message must be at the beginning"错误
-            profile_text = f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。" if self._user_profile else ""
+            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            profile_text = f"{self._user_profile}" if self._user_profile else ""
+            # 语音由系统自动处理，不需要模型干预
+            env_text = env_tag if env_tag else ""
             env_text = env_tag if env_tag else ""
             combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
             if combined_context:
                 combined_message = f"{combined_context}\n\n---\n{user_message}"
             else:
                 combined_message = user_message
-            messages = [HumanMessage(content=combined_message)]
 
             # 使用多种stream模式同时获取消息流和执行更新
             async for chunk in self.agent.astream(
-                {"messages": messages},
+                {"messages": [HumanMessage(content=combined_message)]},
                 config=self.config,
                 stream_mode=["messages", "updates"],
                 version="v2"
@@ -693,6 +834,20 @@ class LangChainPocketAgent:
                     node = metadata.get("langgraph_node", "")
 
                     if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                        # LangGraph stream_mode="messages" 中每个 AIMessageChunk
+                        # 是增量内容，直接追加即可
+                        if type(message_chunk) is AIMessage:
+                            continue
+
+                        content = message_chunk.content
+
+                        # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
+                        # 条件：已积累100+字符，且当前chunk≥15字符，检查是否在重复已有内容
+                        if len(full_response) > 100 and len(content) >= 15:
+                            recent_window = full_response[-400:]
+                            if content[:30] in recent_window:
+                                continue
+
                         # 如果是首次收到内容，先关闭进度显示
                         if progress_display:
                             progress_display.__exit__(None, None, None)
@@ -700,9 +855,9 @@ class LangChainPocketAgent:
 
                         # 实时输出到UI
                         if self.ui and hasattr(self.ui, 'print_stream_chunk'):
-                            self.ui.print_stream_chunk(message_chunk.content)
-                        # 收集完整响应
-                        full_response += message_chunk.content
+                            self.ui.print_stream_chunk(content)
+                        # 收集完整响应（增量chunk，直接追加）
+                        full_response += content
 
                 # 处理更新事件（用于进度显示）
                 elif chunk["type"] == "updates" and progress_display:
@@ -716,6 +871,11 @@ class LangChainPocketAgent:
                                     tool_call_count += 1  # 工具调用计数+1
                                     tool_name = tc["name"]
                                     tool_args = tc["args"]
+                                    # 记录日志
+                                    self.logger.log_tool_call(
+                                        conv_task_id, tool_call_count,
+                                        tool_name, tool_args, "[执行中]"
+                                    )
 
                                     # 特殊处理shell_exec，显示命令内容
                                     if tool_name == "shell_exec" and "command" in tool_args:
@@ -725,17 +885,6 @@ class LangChainPocketAgent:
                                         if self.ui and hasattr(self.ui, 'print_info'):
                                             self.ui.print_info(f"执行命令: {command}")
                                         progress_display.update(f"执行: {display_cmd}")
-                                    # 特殊处理file_read读取skill的情况，显示skill名称
-                                    elif tool_name == "file_read" and "file_path" in tool_args:
-                                        file_path = tool_args["file_path"]
-                                        if SKILLS_DIR in file_path:
-                                            # 提取skill名称：skills/xxx/SKILL.md → xxx
-                                            skill_name = file_path.replace(SKILLS_DIR, "").split("/")[1]
-                                            progress_display.update(f"读取技能: {skill_name}")
-                                        else:
-                                            # 普通文件读取
-                                            display_path = file_path.split("/")[-1] if "/" in file_path else file_path
-                                            progress_display.update(f"读取文件: {display_path}")
                                     else:
                                         # 其他工具显示名称和参数
                                         args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
@@ -746,24 +895,67 @@ class LangChainPocketAgent:
                         elif source == "tools":
                             # 工具执行完成
                             message = update["messages"][-1]
-                            tool_name = message.name if hasattr(message, 'name') else "工具"
-                            progress_display.update(f"处理 {tool_name} 结果")
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            progress_display.update(f"处理 {tool_name_2} 结果")
 
             # 关闭进度显示
             if progress_display:
                 progress_display.__exit__(None, None, None)
 
+            # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
+            pending_tasks = consume_pending_tasks()
+            for pt in pending_tasks:
+                task_path = pt.get("task_path", "")
+                task_id = pt.get("task_id", "unknown")
+                description = pt.get("description", "")
+                if task_path and os.path.exists(task_path):
+                    if self.ui:
+                        self.ui.console.print(
+                            f"\n[bold yellow]▶ 子Agent执行: {description}[/bold yellow]"
+                        )
+                    await self._run_executor_foreground(task_path, task_id)
+
+            # ── 清理主Agent状态中的 delegate_task 相关消息 ──
+            # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
+            if pending_tasks:
+                try:
+                    state = await self.agent.aget_state(self.config)
+                    msgs = state.values.get("messages", [])
+                    # 查找所有 delegate_task 工具调用的ID
+                    delegate_tc_ids = set()
+                    to_remove_ids = set()
+                    for m in msgs:
+                        if hasattr(m, 'tool_calls') and m.tool_calls:
+                            for tc in m.tool_calls:
+                                if tc.get('name') == 'delegate_task':
+                                    if m.id:
+                                        to_remove_ids.add(m.id)
+                                    delegate_tc_ids.add(tc.get('id', ''))
+                    # 查找对应的 ToolMessage
+                    for m in msgs:
+                        if isinstance(m, ToolMessage) and m.tool_call_id in delegate_tc_ids:
+                            if m.id:
+                                to_remove_ids.add(m.id)
+
+                    if to_remove_ids:
+                        removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
+                        await self.agent.update_state(self.config, {"messages": removals})
+                except Exception:
+                    pass
+
+            # ── 后处理去重 ──
+            # 模型在调用工具（如 tts_speak）后可能重新生成一遍内容，导致重复输出
+            if len(full_response) > 200:
+                # 取前80个字符在后文中查找第二次出现
+                prefix = full_response[:80]
+                dup_pos = full_response.find(prefix, 80)
+                if dup_pos > 0:
+                    full_response = full_response[:dup_pos]
+
             # 如果stream没有返回内容（极端情况），回退到ainvoke
             if not full_response:
-                # 构建与stream模式相同的消息结构（同样合并到HumanMessage，避免多个SystemMessage）
-                profile_text = f"【用户画像】\n{self._user_profile}\n\n以上是用户的基本信息和偏好，回答时请参考这些信息。" if self._user_profile else ""
-                env_text = env_tag if env_tag else ""
-                combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
-                invoke_message = f"{combined_context}\n\n---\n{user_message}" if combined_context else user_message
-                invoke_messages = [HumanMessage(content=invoke_message)]
-
                 result = await self.agent.ainvoke(
-                    {"messages": invoke_messages},
+                    {"messages": [HumanMessage(content=user_message)]},
                     config=self.config
                 )
                 last_message = result["messages"][-1]
@@ -786,19 +978,34 @@ class LangChainPocketAgent:
                     f"\n\n✅ [dim cyan]完成 (总耗时 {elapsed} 秒)[/dim cyan] {bar_text}"
                 )
 
+            # 记录日志
+            try:
+                self.logger.log_conversation_end(conv_task_id, full_response.strip()[:200], tool_call_count, elapsed)
+            except Exception:
+                pass
+
             # 后台刷新环境感知缓存，为下一次对话准备（不阻塞本次返回）
             asyncio.create_task(self._refresh_env_cache())
 
             return (full_response.strip(), True, tool_call_count)
 
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            # 任务被取消或键盘中断，确保进度显示被关闭
+        except asyncio.CancelledError:
+            # 任务被取消，确保进度显示被关闭
             if 'progress_display' in locals() and progress_display:
                 try:
                     progress_display.__exit__(None, None, None)
                 except:
                     pass
-            # 重新抛出，让上层处理
+            # 重新抛出取消异常，让上层处理
+            raise
+        except KeyboardInterrupt:
+            # 键盘中断，确保进度显示被关闭
+            if 'progress_display' in locals() and progress_display:
+                try:
+                    progress_display.__exit__(None, None, None)
+                except:
+                    pass
+            # 重新抛出，让上层处理中断
             raise
         except Exception as e:
             # 确保进度显示被关闭
@@ -807,6 +1014,10 @@ class LangChainPocketAgent:
                     progress_display.__exit__(type(e), e, None)
                 except:
                     pass
+
+            # 取消子Agent监控
+            if 'subagent_monitor_task' in locals() and subagent_monitor_task:
+                subagent_monitor_task.cancel()
 
             import traceback
             error_details = traceback.format_exc()
@@ -832,3 +1043,427 @@ class LangChainPocketAgent:
             },
             "recursion_limit": self.max_iterations
         }
+
+    async def cleanup(self) -> None:
+        """关闭所有HTTP客户端，避免退出时 httpx 异步生成器报错"""
+        try:
+            if hasattr(self, 'llm') and self.llm is not None:
+                await self.llm.async_client.aclose()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_executor_llm') and self._executor_llm is not None:
+                await self._executor_llm.async_client.aclose()
+        except Exception:
+            pass
+
+    def _render_task_progress(self, task_data: dict) -> str:
+        """渲染子Agent任务进度"""
+        lines = []
+        for step in task_data.get("steps", []):
+            status = step.get("status", "pending")
+            desc = step.get("desc", "")
+            if status == "completed":
+                lines.append(f"  \u2714 {desc}")
+            elif status == "in_progress":
+                lines.append(f"  \u23f3 {desc}")
+            elif status == "failed":
+                lines.append(f"  \u2718 {desc}")
+            elif status == "skipped":
+                lines.append(f"  \u293e {desc}")
+            else:
+                lines.append(f"  \u25fb {desc}")
+        return "\n".join(lines) if lines else ""
+
+    async def _run_executor_foreground(self, task_path: str, task_id: str) -> None:
+        """前台运行子Agent（executor），实时流式输出到UI，完成后才返回"""
+        try:
+            executor_tool_names = {"shell_exec", "file_read", "file_write", "file_search", "mcp_call", "system_info", "tts_speak"}
+            executor_tools = [t for t in ALL_TOOLS if t.name in executor_tool_names]
+            executor_skills = load_skills_list("executor")
+            executor_tool_names_str = ", ".join(t.name for t in executor_tools)
+
+            from langchain.agents.middleware import ModelCallLimitMiddleware
+            enhanced = executor_enhance_prompt.format(
+                tool_names=executor_tool_names_str,
+                skills_list=executor_skills,
+            )
+            system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
+
+            if self._executor_llm is None:
+                self._executor_llm = ChatOpenAI(
+                    base_url=self.llm.openai_api_base,
+                    api_key=self.llm.openai_api_key,
+                    model=self.llm.model_name,
+                    temperature=EXECUTOR_TEMPERATURE,
+                    max_tokens=EXECUTOR_MAX_TOKENS,
+                    timeout=30,
+                    streaming=True,
+                    max_retries=1,
+                )
+            executor_llm = self._executor_llm
+            executor_middleware = [
+                ToolCallIdMiddleware(),
+                ModelCallLimitMiddleware(
+                    run_limit=self.max_iterations,
+                    exit_behavior="end",
+                ),
+            ]
+            from langgraph.checkpoint.memory import MemorySaver
+            executor_agent = create_agent(
+                model=executor_llm,
+                tools=executor_tools,
+                system_prompt=system_content,
+                checkpointer=MemorySaver(),
+                middleware=executor_middleware,
+            )
+
+            if not os.path.exists(task_path):
+                if self.ui:
+                    self.ui.console.print("  [red]❌ 任务文件不存在[/red]")
+                self._background_task_results.append({
+                    "task_id": task_id,
+                    "status": "failed",
+                    "summary": "❌ 任务文件不存在",
+                })
+                return
+
+            with open(task_path, "r", encoding="utf-8") as f:
+                task_data = json.load(f)
+            objective = task_data.get("objective", "")
+
+            # 记录子Agent开始
+            self.logger.log_executor_start(task_id, objective)
+            self._executor_step_start = datetime.now()
+            executor_step = 0
+            had_intervention = False  # 是否申请了人工介入
+
+            # 用户画像要求语音时，启动时语音通知
+            _profile = getattr(self, '_user_profile', '') or ''
+            if any(kw in _profile for kw in ['语音', '朗读', '播报', 'voice']):
+                try:
+                    _speak = objective[:80].replace('"', ' ').replace("'", " ")
+                    subprocess.run(
+                        f'termux-tts-speak "开始执行任务：{_speak}" &>/dev/null &',
+                        shell=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+
+            # 搜集已有技能列表，让子Agent知道已经沉淀过哪些
+            existing_skills = []
+            auto_executor_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+            if os.path.exists(auto_executor_dir):
+                for _cat in sorted(os.listdir(auto_executor_dir)):
+                    _cat_path = os.path.join(auto_executor_dir, _cat)
+                    if os.path.isdir(_cat_path):
+                        existing_skills.append(_cat)
+            skills_hint = f"\n（已有沉淀技能：{', '.join(existing_skills) or '无'}，执行完毕后需沉淀/更新/跳过）"
+
+            # 流式执行子Agent，实时输出
+            full_response = ""
+            async for chunk in executor_agent.astream(
+                {"messages": [HumanMessage(content="请读取 " + task_path + " 并开始执行。" + skills_hint)]},
+                config={"configurable": {"thread_id": "executor_" + task_id}},
+                stream_mode=["messages", "updates"],
+                version="v2",
+            ):
+                if chunk["type"] == "messages":
+                    message_chunk, metadata = chunk["data"]
+                    node = metadata.get("langgraph_node", "")
+                    if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                        if type(message_chunk) is AIMessage:
+                            continue
+                        content = message_chunk.content
+                        full_response += content
+                        if self.ui:
+                            self.ui.print_stream_chunk(content)
+
+                elif chunk["type"] == "updates":
+                    for source, update in chunk["data"].items():
+                        if source == "model":
+                            message = update["messages"][-1]
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                for tc in message.tool_calls:
+                                    executor_step += 1
+                                    tool_name = tc["name"]
+                                    tool_args = tc["args"]
+                                    # 记录日志
+                                    self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                    # 检测人工介入请求（tts_speak 工具 或 shell_exec 调用 termux-tts-speak）
+                                    if tool_name == "tts_speak" and "text" in tool_args:
+                                        had_intervention = True
+                                        speak_text = tool_args["text"][:80]
+                                        self.logger.log_executor_intervention(task_id, f"TTS语音通知: {speak_text}", "pending")
+                                        if self.ui:
+                                            self.ui.console.print(f"\n  [bold yellow]🆘 子Agent申请人工介入: {speak_text}[/bold yellow]")
+                                    elif tool_name == "shell_exec" and "command" in tool_args:
+                                        cmd = tool_args["command"]
+                                        # 兼容旧的 termux-tts-speak shell 调用
+                                        if "termux-tts-speak" in cmd or "termux-tts" in cmd:
+                                            had_intervention = True
+                                            speak_text = cmd.split('"')[1] if '"' in cmd else cmd[30:80]
+                                            self.logger.log_executor_intervention(task_id, f"TTS语音通知: {speak_text}", "pending")
+                                            if self.ui:
+                                                self.ui.console.print(f"\n  [bold yellow]🆘 子Agent申请人工介入: {speak_text}[/bold yellow]")
+                                        else:
+                                            display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
+                                            if self.ui:
+                                                self.ui.console.print(f"\n  [dim]⚡ {display_cmd}[/dim]")
+                                    elif tool_name == "mcp_call" and "tool_name" in tool_args:
+                                        mcp_tool = tool_args["tool_name"]
+                                        if self.ui:
+                                            self.ui.console.print(f"\n  [dim]📱 MCP: {mcp_tool}[/dim]")
+                                    else:
+                                        args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
+                                        args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
+                                        if self.ui:
+                                            self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+
+            # ── 重试机制：如果子Agent没有执行有效操作（仅读了task.json就停了），强制重试 ──
+            # 注意：重试必须使用全新Agent实例 + 内联任务内容，不能复用原对话线程，
+            # 否则 DashScope 会校验历史中的 tool_call/tool_message 配对导致 400 错误
+            retry_count = 0
+            while executor_step <= 2 and retry_count < 2:
+                retry_count += 1
+                if self.ui:
+                    self.ui.console.print(f"\n  [yellow]🔄 子Agent仅执行了{executor_step}步，强制重试第{retry_count}次...[/yellow]")
+
+                # 读取 task.json 内容以内联到指令中
+                try:
+                    with open(task_path, "r", encoding="utf-8") as f:
+                        task_data_retry = json.load(f)
+                    retry_objective = task_data_retry.get("objective", "")
+                    retry_steps = task_data_retry.get("steps", [])
+                except Exception:
+                    retry_objective = ""
+                    retry_steps = []
+
+                steps_lines = []
+                for s in retry_steps:
+                    desc = s.get("desc", "")
+                    steps_lines.append(f"{s['id']}. {desc}")
+                steps_text = "\n".join(steps_lines)
+
+                retry_instruction = (
+                    f"执行以下任务，必须调用工具完成每个步骤，禁止只输出文字：\n\n"
+                    f"目标：{retry_objective}\n"
+                    f"步骤：\n{steps_text}\n\n"
+                    f"可用工具：shell_exec（启动App/查包名/点击）、mcp_call（手机操控）、"
+                    f"file_read/write、tts_speak\n"
+                    f"立即开始执行步骤1，不用再读task.json了！"
+                )
+
+                # 创建全新的 Agent 实例，避免历史消息中的 tool_call 格式问题
+                fresh_agent = create_agent(
+                    model=executor_llm,
+                    tools=executor_tools,
+                    system_prompt=system_content,
+                    checkpointer=MemorySaver(),
+                    middleware=executor_middleware,
+                )
+                async for chunk in fresh_agent.astream(
+                    {"messages": [HumanMessage(content=retry_instruction)]},
+                    config={"configurable": {"thread_id": "executor_retry_" + task_id + "_" + str(retry_count)}},
+                    stream_mode=["messages", "updates"],
+                    version="v2",
+                ):
+                    if chunk["type"] == "messages":
+                        message_chunk, metadata = chunk["data"]
+                        node = metadata.get("langgraph_node", "")
+                        if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                            if type(message_chunk) is AIMessage:
+                                continue
+                            content = message_chunk.content
+                            full_response += content
+                            if self.ui:
+                                self.ui.print_stream_chunk(content)
+                    elif chunk["type"] == "updates":
+                        for source, update in chunk["data"].items():
+                            if source == "model":
+                                message = update["messages"][-1]
+                                if hasattr(message, 'tool_calls') and message.tool_calls:
+                                    for tc in message.tool_calls:
+                                        executor_step += 1
+                                        tool_name = tc["name"]
+                                        tool_args = tc["args"]
+                                        self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                        if self.ui:
+                                            args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
+                                            args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
+                                            self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+
+            # 执行完成
+            if had_intervention:
+                self.logger.log_executor_intervention(task_id, "子Agent在等待后继续执行", "resolved")
+                if self.ui:
+                    self.ui.console.print("\n  [green]✅ 人工介入后继续执行[/green]")
+
+            # 重新从磁盘读取（executor 可能通过 file_write 修改过 steps）
+            executor_end_time = datetime.now()
+            try:
+                with open(task_path, "r", encoding="utf-8") as f:
+                    task_data = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass  # 文件损坏时用原内存数据
+
+            # 检查是否有失败的步骤
+            failed_steps = [s for s in task_data.get("steps", []) if s.get("status") == "failed"]
+            has_failures = bool(failed_steps)
+
+            # 记录模型思考过程到日志
+            self.logger.log_executor_reasoning(task_id, full_response)
+            summary = full_response.strip()[:300] if full_response.strip() else "执行完毕"
+            executor_elapsed = int((executor_end_time - self._executor_step_start).total_seconds()) if hasattr(self, '_executor_step_start') else 0
+            if has_failures:
+                task_data["status"] = "completed_with_failures"
+                self.logger.log_executor_end(task_id, f"完成（{len(failed_steps)}个步骤失败）")
+                status_text = f"⚠️ 子Agent完成（{len(failed_steps)}个步骤失败）"
+            else:
+                task_data["status"] = "completed"
+                self.logger.log_executor_end(task_id, "完成")
+                status_text = "✅ 子Agent任务完成"
+            task_data["completed_at"] = datetime.now().isoformat()
+            task_data["summary"] = summary
+            with open(task_path, "w", encoding="utf-8") as f:
+                json.dump(task_data, f, ensure_ascii=False, indent=2)
+
+            # ── 统计 token 消耗 ──
+            try:
+                executor_state = await executor_agent.aget_state(
+                    {"configurable": {"thread_id": "executor_" + task_id}}
+                )
+                executor_msgs = executor_state.values.get("messages", []) or []
+                executor_tokens = count_tokens_approximately(
+                    executor_msgs,
+                    tools=list(executor_tools),
+                    chars_per_token=2.0,
+                )
+                token_text = f" | 消耗 ≈{executor_tokens} tokens"
+            except Exception:
+                token_text = ""
+
+            if self.ui:
+                self.ui.console.print(f"\n  [green]{status_text}，⏱️ {executor_elapsed}s{token_text}[/green]")
+
+            # ── 技能沉淀：后台执行，不阻塞汇报 ──
+            steps = task_data.get("steps", [])
+            objective = task_data.get("objective", "")
+            needs_skill = len(steps) >= 3 and objective and not has_failures
+            if needs_skill:
+                # 快速扫描：子Agent是否已自行沉淀技能
+                skill_was_written = False
+                auto_executor_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+                if os.path.exists(auto_executor_dir):
+                    for _cat in os.listdir(auto_executor_dir):
+                        _cat_path = os.path.join(auto_executor_dir, _cat)
+                        if not os.path.isdir(_cat_path):
+                            continue
+                        for _fn in os.listdir(_cat_path):
+                            if not _fn.endswith(".md"):
+                                continue
+                            _fp = os.path.join(_cat_path, _fn)
+                            _mtime = os.path.getmtime(_fp)
+                            _start_ts = self._executor_step_start.timestamp() if hasattr(self, '_executor_step_start') else 0
+                            if _mtime >= _start_ts - 5 and os.path.getsize(_fp) > 50:
+                                skill_was_written = True
+                                break
+                        if skill_was_written:
+                            break
+
+                if skill_was_written:
+                    if self.ui:
+                        self.ui.console.print(f"\n  [dim]\U0001f4dd 子Agent已沉淀技能[/dim]")
+                else:
+                    # 检查是否真的执行了操作（executor_step > 2 说明有过实际工具调用）
+                    if executor_step <= 2:
+                        if self.ui:
+                            self.ui.console.print(f"\n  [dim]\U0001f4dd 子Agent未执行有效操作（仅{executor_step}步），跳过技能沉淀[/dim]")
+                    else:
+                        # 没写 → 后台异步督办，不阻塞主流程
+                        if self.ui:
+                            self.ui.console.print(f"\n  [dim]\U0001f4dd 技能沉淀后台进行中...[/dim]")
+
+                    async def _consolidate_skill():
+                        try:
+                            skill_followup = (
+                                "任务已完成。现在请沉淀技能到 `agent/skills/auto-skills/executor/`：\n\n"
+                                "1. 先用 `directory_list('agent/skills/auto-skills/executor/')` 检查已有技能\n"
+                                "2. 如果找到相关技能 → 用 `file_read` 读取，评估是否需要补充完善\n"
+                                "3. 如果已覆盖 → 用 `file_write` 写一个说明文件说明'已有XX技能覆盖'\n"
+                                "4. 如果需要完善 → 用 `file_write` 更新，补充本次执行的关键发现\n"
+                                "5. 如果没找到 → 用 `file_write` 创建新技能\n\n"
+                                "技能内容需包含：包名、关键坐标、操作步骤、失败经验。"
+                            )
+                            async for _chunk in executor_agent.astream(
+                                {"messages": [HumanMessage(content=skill_followup)]},
+                                config={"configurable": {"thread_id": "executor_skill_" + task_id}},
+                                stream_mode=["messages", "updates"],
+                                version="v2",
+                            ):
+                                pass  # 后台流式处理，不输出到UI
+                        except Exception:
+                            pass
+
+                    asyncio.create_task(_consolidate_skill())
+
+            return
+
+        except asyncio.CancelledError:
+            if 'full_response' in locals():
+                self.logger.log_executor_reasoning(task_id, full_response)
+            self.logger.log_executor_end(task_id, "中断")
+            if self.ui:
+                self.ui.console.print("\n  [yellow]⏹️ 子Agent执行被中断[/yellow]")
+            raise
+        except Exception:
+            import traceback
+            error_detail = traceback.format_exc()
+            if 'full_response' in locals():
+                self.logger.log_executor_reasoning(task_id, full_response)
+            # 如果之前申请过人工介入，记录介入失败
+            if 'had_intervention' in locals() and had_intervention:
+                self.logger.log_executor_intervention(task_id, "子Agent异常退出，人工介入未解决问题", "failed")
+            self.logger.log_executor_end(task_id, f"失败: {error_detail}")
+
+            # 标记 task.json 为失败状态
+            try:
+                if os.path.exists(task_path):
+                    with open(task_path, "r", encoding="utf-8") as _f:
+                        _td = json.load(_f)
+                    _td["status"] = "failed"
+                    _td["error"] = str(error_detail)[:500]
+                    with open(task_path, "w", encoding="utf-8") as _f:
+                        json.dump(_td, _f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # 提取关键错误信息（去掉冗长的调用栈）
+            error_short = str(error_detail)
+            for _line in reversed(error_detail.split("\n")):
+                _line = _line.strip()
+                if _line and not _line.startswith(("File ", "  ", "During", "Traceback")):
+                    error_short = _line
+                    break
+            if self.ui:
+                if 'had_intervention' in locals() and had_intervention:
+                    self.ui.console.print("\n  [red]❌ 人工介入未解决问题，子Agent执行失败[/red]")
+                self.ui.console.print(f"\n  [red]❌ 子Agent执行失败: {error_short}[/red]")
+
+            # 语音通知用户失败原因
+            try:
+                _err_msg = error_short[:120].replace('"', ' ').replace("'", " ")
+                subprocess.run(
+                    f'termux-tts-speak "任务执行失败：{_err_msg}" &>/dev/null &',
+                    shell=True, timeout=5,
+                )
+            except Exception:
+                pass
+
+            # 记录到后台结果，下次对话时主Agent可查看
+            self._background_task_results.append({
+                "task_id": task_id,
+                "status": "failed",
+                "summary": f"❌ 执行失败: {error_short[:200]}",
+            })
+

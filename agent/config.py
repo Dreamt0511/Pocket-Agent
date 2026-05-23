@@ -12,10 +12,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Agent 运行配置
 # ==============================
 # Agent最大迭代次数：最多支持多少轮工具调用
-MAX_ITERATIONS = 100
+MAX_ITERATIONS = 300
 
 # LangGraph底层递归限制（兜底防护，建议设置为MAX_ITERATIONS的2倍）
-RECURSION_LIMIT = 200
+RECURSION_LIMIT = 600
 
 # ==============================
 # 上下文窗口配置
@@ -26,11 +26,39 @@ MAX_CONTEXT_TOKENS = 128000
 # ==============================
 # 技能系统配置
 # ==============================
-# 技能目录路径
-SKILLS_DIR = os.path.join(PROJECT_ROOT, "agent", "skills")
+# 主Agent技能目录
+SKILLS_DIR = os.path.join(PROJECT_ROOT, "agent", "skills", "main-skills")
 
 # 技能文件名称（支持大小写）
 SKILL_FILE_NAMES = ["SKILL.md", "skill.md"]
+
+# 主Agent LLM 默认参数（会被 .env 覆盖）
+LLM_DEFAULT_CONFIG = {
+    "temperature": 0.7,
+    "max_tokens": 8000,
+}
+
+# 子Agent（Executor）LLM 参数
+EXECUTOR_MAX_TOKENS = 16000
+EXECUTOR_TEMPERATURE = 0.5
+
+# ==============================
+# 子Agent系统配置
+# ==============================
+# 子Agent技能目录
+EXECUTOR_SKILLS_DIR = os.path.join(PROJECT_ROOT, "agent", "skills", "executor-skills")
+
+# 自动沉淀技能目录
+AUTO_SKILLS_DIR = os.path.join(PROJECT_ROOT, "agent", "skills", "auto-skills")
+
+# 任务文件存储目录
+TASKS_DIR = os.path.join(PROJECT_ROOT, "tasks")
+
+# ==============================
+# 日志配置
+# ==============================
+# 日志目录
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 # ==============================
 # 提示词配置

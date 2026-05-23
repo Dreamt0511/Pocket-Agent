@@ -9,6 +9,7 @@ import re
 import subprocess
 from typing import Dict, List, Optional
 from langchain_core.tools import tool
+import requests
 
 
 @tool
@@ -276,6 +277,16 @@ def shell_exec(command: str) -> str:
 
     truncated_cmd = truncate_cmd(command)
 
+    # termux-tts-speak 必须后台运行，否则会阻塞或超时被杀死
+    if command.strip().startswith("termux-tts-speak"):
+        subprocess.run(
+            command + " &>/dev/null &",
+            shell=True,
+            capture_output=False,
+            timeout=3,
+        )
+        return "✅ 已执行"
+
     try:
         result = subprocess.run(
             command,
@@ -310,16 +321,17 @@ def set_memory_instance(memory):
     _memory_instance = memory
 
 @tool
-def update_user_profile(section: str, content: str) -> str:
+async def update_user_profile(section: str, content: str) -> str:
     """
-    【重要】更新用户画像，仅用于记录用户明确提到的重要个人信息、偏好和特殊要求。
-    禁止随意更新，只有当用户明确提到以下信息时才能使用：
+    记录用户明确提到的个人偏好、习惯、要求等信息到用户画像中。
+
+    触发条件（用户提到以下信息时务必调用）：
     - 基本信息：姓名、职业、兴趣爱好等
-    - 偏好设置：喜欢的回答风格、关注的话题领域等
-    - 特殊要求：对回答的特殊要求、需要避免的内容等
+    - 偏好设置：喜欢的风格、关注话题、饮食偏好、生活习惯等
+    - 特殊要求：回答要求、需避免的内容等
 
     Args:
-        section: 要更新的部分，必须是现有画像中的章节（基本信息/偏好设置/特殊要求）
+        section: 要更新的部分（基本信息/偏好设置/特殊要求）
         content: 新的内容，完整替换该章节下的所有内容
     """
     if not _memory_instance:
@@ -332,14 +344,199 @@ def update_user_profile(section: str, content: str) -> str:
     try:
         # 异步执行更新，不阻塞主流程
         import asyncio
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _memory_instance.update_user_profile, section, content)
-        return f"✅ 已异步更新用户画像 [{section}]"
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _memory_instance.update_user_profile, section, content)
+        return f"✅ 已更新用户画像 [{section}]"
     except Exception as e:
         return f"❌ 更新用户画像失败: {str(e)}"
 
 
-# 所有工具函数
+@tool
+async def mcp_call(server_url: str, tool_name: str, arguments: Optional[str] = None) -> str:
+    """
+    调用 MCP 服务的工具。支持任何 MCP 协议的 JSON-RPC 服务。
+    注意：NeuralBridge 的 MCP 地址为 http://127.0.0.1:7474/mcp
+
+    Args:
+        server_url: MCP 服务地址（如 http://127.0.0.1:7474/mcp）
+        tool_name: 工具名（如 android_tap、android_screenshot、android_get_ui_tree）
+        arguments: 工具参数的 JSON 字符串，如 '{"x": 315, "y": 1002}'。没有参数时传 "{}" 或不传。
+    """
+    try:
+        # 解析 arguments JSON 字符串 → dict
+        if isinstance(arguments, str):
+            if not arguments.strip():
+                arguments = None
+            else:
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    import ast
+                    try:
+                        arguments = ast.literal_eval(arguments)
+                    except (ValueError, SyntaxError):
+                        return f"❌ mcp_call 参数解析失败: arguments={arguments[:100]}, 应传入 JSON 字符串如 '{{\"x\": 315, \"y\": 1002}}'"
+
+        # tools/list 是 MCP 协议级别的查询方法，不是具体工具，不走 tools/call 包装
+        if tool_name == "tools/list":
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "id": 1
+            }
+        else:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments or {}
+                },
+                "id": 1
+            }
+        import asyncio
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None,
+            lambda: requests.post(server_url, json=payload, timeout=30)
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        if "error" in result:
+            return f"❌ MCP 调用失败: {result['error']}"
+
+        # tools/list 返回 result.tools 数组，不是 result.content
+        if tool_name == "tools/list":
+            tools = result.get("result", {}).get("tools", [])
+            if not tools:
+                return "✅ 服务已连接，但无可用工具"
+            lines = [f"📦 可用工具 ({len(tools)} 个):"]
+            for t in tools:
+                name = t.get("name", "?")
+                desc = t.get("description", "")
+                lines.append(f"  - {name}: {desc[:100]}")
+            return "\n".join(lines)
+
+        # 提取 content 中的文本
+        content = result.get("result", {}).get("content", [])
+        texts = []
+        for item in content:
+            if item.get("type") == "text":
+                texts.append(item["text"])
+            elif item.get("type") == "image":
+                img_data = item.get("data", "")
+                size_kb = len(img_data) * 3 / 4 / 1024
+                texts.append(f"[截图: {item.get('width','?')}x{item.get('height','?')}, {size_kb:.0f}KB]")
+
+        return "\n".join(texts) if texts else "✅ 调用成功，无返回内容"
+    except requests.exceptions.Timeout:
+        return "❌ MCP 请求超时（30秒），请检查服务是否运行"
+    except requests.exceptions.ConnectionError:
+        return f"❌ 无法连接 MCP 服务 {server_url}，请确认服务是否启动"
+    except Exception as e:
+        return f"❌ MCP 调用异常: {str(e)}"
+
+
+@tool
+async def tts_speak(text: str) -> str:
+    """
+    朗读文字，手机会发出声音。自动后台执行，不阻塞当前对话。
+
+    内部调用 termux-tts-speak 并后台运行，你不需要关心具体的 shell 命令。
+    如果朗读失败，静默忽略即可，正常文字回复。
+
+    Args:
+        text: 要朗读的文字
+    """
+    import asyncio, subprocess
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: subprocess.run(
+            f'termux-tts-speak "{text}" &>/dev/null &',
+            shell=True, timeout=5,
+        ))
+        return "✅ 已执行"
+    except Exception:
+        return "⚠️ 执行失败"
+
+
+# ── 后台任务派发 ──────────────────────────────────────────────
+# 当主Agent调用delegate_task时，请求被暂存到此队列
+# agent_langchain.py 的 run_conversation 会在流结束后读取并启动后台执行器
+_pending_background_tasks: list[dict] = []
+
+def consume_pending_tasks() -> list[dict]:
+    """消费并返回所有待处理的后台任务"""
+    global _pending_background_tasks
+    tasks = _pending_background_tasks.copy()
+    _pending_background_tasks.clear()
+    return tasks
+
+
+@tool
+def delegate_task(description: str, tasks_json: str = "") -> str:
+    """
+    派发任务给子Agent在后台异步执行。不影响当前对话 — 调用后立即返回。
+
+    一旦判断需要派发给子Agent，不要自己做任何准备工作（查包名、启动应用等），
+    直接把整个任务全盘委托，子Agent会从头开始自己处理。
+
+    ⚠️ 必须先分解任务再派发：tasks_json 中的 steps 必须按原子粒度分解，
+    每个步骤是单步操作（如"打开拼多多APP"），禁止合并（如"去拼多多买件衣服"）。
+    不分解会导致子Agent无法执行。
+
+    Args:
+        description: 自然语言描述任务目标和内容
+        tasks_json: (必填) 按原子粒度分解后的任务定义。
+                    包含 objective 和 steps（steps 每个元素是单步操作）。
+                    例如：{"objective": "打开拼多多买衣服", "steps": [{"id": 1, "desc": "打开拼多多APP"}, {"id": 2, "desc": "搜索黑色鞋子"}, {"id": 3, "desc": "筛选价格100左右"}]}
+                    不提供时整段描述作为单个步骤，子Agent可能无法正确执行。
+    """
+    from datetime import datetime
+    from agent.config import TASKS_DIR
+
+    if not description or not description.strip():
+        return "❌ delegate_task 调用失败：description 参数不能为空。请提供任务描述后再调用。"
+
+    global _pending_background_tasks
+
+    task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    task_dir = os.path.join(TASKS_DIR, task_id)
+    task_file = os.path.join(task_dir, "task.json")
+
+    os.makedirs(task_dir, exist_ok=True)
+
+    if tasks_json:
+        try:
+            task_data = json.loads(tasks_json)
+        except json.JSONDecodeError:
+            task_data = {}
+    else:
+        task_data = {}
+
+    task_data.setdefault("objective", description)
+    task_data.setdefault("status", "pending")
+    # 主Agent必须传 tasks_json 分解步骤，不传时整段描述作为单个步骤
+    if "steps" not in task_data or not task_data["steps"]:
+        task_data["steps"] = [{"id": 1, "desc": description[:200], "status": "pending"}]
+
+    with open(task_file, "w", encoding="utf-8") as f:
+        json.dump(task_data, f, ensure_ascii=False, indent=2)
+
+    _pending_background_tasks.append({
+        "task_id": task_id,
+        "task_path": task_file,
+        "description": description,
+        "subagent_type": "executor",
+    })
+    return (
+        f"✅ 任务已派发到后台执行 (task_id: {task_id})。"
+        f"子Agent完成后会自动沉淀技能。"
+        f"任务进度可通过 file_read 查看 {task_file}"
+    )
+
+
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak
 ]

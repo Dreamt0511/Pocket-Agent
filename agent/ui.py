@@ -24,7 +24,6 @@ from rich.rule import Rule
 from rich.text import Text
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.patch_stdout import patch_stdout
 import os
 import asyncio
 
@@ -32,43 +31,43 @@ class PocketUI:
     """
     Pocket-Agent 的 Rich UI 管理
     """
-    
+
     def __init__(self):
         self.console = Console()
         # 初始化输入会话，带历史记录
         history_path = os.path.expanduser("~/.pocket_agent_history")
         self.prompt_session = PromptSession(history=FileHistory(history_path))
-        
+
     def print_banner(self, model_name: str = ""):
         """打印首页横幅"""
         model_line = f"\n{model_name}" if model_name else ""
         banner = f"""
-        
+
   █▀█ █▀█ █▀▀ █ █ █▀▀ ▀█▀   █▀█ █▀▀ █▀▀ █▀█ ▀█▀
  █▀▀ █ █ █   █▀▄ █▀▀  █    █▀█ █ █ █▀▀ █ █  █
- ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀  ▀    ▀ ▀ ▀▀▀ ▀▀▀ ▀ ▀  ▀                   
+ ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀  ▀    ▀ ▀ ▀▀▀ ▀▀▀ ▀ ▀  ▀
 
   Pocket-Agent — 移动端AI代理帮手
-        
+
   轻量、快速、智能{model_line}
         """
-        
+
         self.console.print(Panel(
             Text(banner, justify="center", style="bold cyan"),
             border_style="blue",
             padding=(1, 2)
         ))
-    
+
     def print_tool_call(self, tool_name: str, params: dict):
         """打印工具调用"""
         params_text = ", ".join([f"{k}={v}" for k, v in params.items()])
-        
+
         self.console.print(Panel(
             f"✨ 调用 {tool_name}({params_text})",
             border_style="green",
             padding=(0, 1)
         ))
-    
+
     def print_tool_result(self, result: str):
         """打印工具结果"""
         self.console.print(Panel(
@@ -77,7 +76,7 @@ class PocketUI:
             border_style="cyan",
             padding=(0, 1)
         ))
-    
+
     def print_agent_thinking(self):
         """打印代理思考中"""
         self.console.print(
@@ -87,14 +86,14 @@ class PocketUI:
                 padding=(0, 1)
             )
         )
-    
+
     def print_agent_response(self, response: str):
         """打印AI回复 - 纯文本，不渲染Markdown"""
         # 移除首尾空白，保留结构
         response = response.strip()
         # 纯文本直接输出，不处理Markdown
         self.console.print(f"[cyan]{response}[/cyan]\n")
-    
+
     def print_user_input_prompt(self):
         """同步版本用户输入提示 - 捕获所有异常避免报错栈"""
         try:
@@ -124,34 +123,25 @@ class PocketUI:
             return "exit"
 
     async def async_print_user_input_prompt(self):
-        """异步版本的用户输入提示 - 捕获所有异常避免报错栈"""
+        """异步用户输入 — 使用prompt_toolkit支持退格删除和编辑"""
         try:
-            # 非交互模式
             if not sys.stdin.isatty():
                 self.console.print("[bold green]🪀 你:[/bold green] ", end="")
                 loop = asyncio.get_event_loop()
                 input_text = await loop.run_in_executor(None, sys.stdin.readline)
                 return input_text.rstrip('\n')
 
-            # 交互模式：简单分隔线 + 输入提示符
             self.console.print()
             self.console.print(Rule(style="dim cyan"))
 
-            # 异步输入
-            with patch_stdout():
-                user_input = await self.prompt_session.prompt_async(
-                    "🪀 你: ",
-                    enable_history_search=True
-                )
+            # 使用prompt_toolkit的异步输入，支持退格/方向键/历史
+            # 注意：不使用patch_stdout避免CPU高占用
+            user_input = await self.prompt_session.prompt_async("🪀 你: ")
             return user_input
-        except (EOFError, KeyboardInterrupt, SystemExit):
-            # 处理所有退出相关的异常
+        except (EOFError, KeyboardInterrupt):
             self.console.print()
             return "exit"
-        except Exception as e:
-            # 捕获其他任何异常，避免报错栈输出
-            if "KeyboardInterrupt" not in str(type(e)):
-                self.console.print(f"\n⚠️  输入错误: {str(e)}")
+        except Exception:
             self.console.print()
             return "exit"
 
@@ -164,7 +154,7 @@ class PocketUI:
             border_style="magenta",
             padding=(0, 1)
         ))
-    
+
     def print_system_info(self, info: str):
         """打印系统信息"""
         self.console.print(
@@ -175,7 +165,7 @@ class PocketUI:
                 padding=(0, 1)
             )
         )
-    
+
     def show_loading_spinner(self, task_description: str):
         """显示加载中动画"""
         with Progress(
@@ -186,16 +176,16 @@ class PocketUI:
         ) as progress:
             progress.add_task(task_description, total=None)
             time.sleep(1)  # 模拟加载
-    
+
     def print_stream_chunk(self, chunk: str):
         """逐字打印流式输出块，模拟打字机效果（和横幅一样的青蓝色）"""
         self.console.print(chunk, end="", style="bold cyan", no_wrap=True, overflow="crop")
         self.console.file.flush()
-    
+
     def print_streaming(self, text: str):
         """打印流式文本"""
         self.console.print(f"[cyan]正在流式输出: {text}[/cyan]", end="", flush=True)
-    
+
     def print_error(self, error_msg: str):
         """打印错误信息"""
         self.console.print(
@@ -205,7 +195,7 @@ class PocketUI:
                 style="bold red"
             )
         )
-    
+
     def print_conversation_stats(self, tool_calls: int, tools_available: int):
         """打印对话统计信息"""
         self.console.print(
@@ -216,7 +206,7 @@ class PocketUI:
                 padding=(0, 1)
             )
         )
-    
+
     def print_success(self, msg: str):
         """打印成功信息"""
         self.console.print(f"[bold green]{msg}[/bold green]")
@@ -228,7 +218,7 @@ class PocketUI:
     def print_warning(self, msg: str):
         """打印警告信息"""
         self.console.print(f"[bold orange]⚠️  {msg}[/bold orange]")
-    
+
     def create_ascii_art(self, text: str) -> str:
         """生成简单的ASCII艺术"""
         ascii_art = f"""
@@ -284,6 +274,22 @@ class PocketUI:
         return f"[dim]|[/dim] [{color}]{bar}[/{color}] [dim]{pct}% ({fmt(current)}/{fmt(max_tokens)})[/dim]"
 
 
+class _TimerRenderable:
+    """动态渲染器：每次Live刷新时重新计算耗时，无需外部触发"""
+
+    def __init__(self, display: "ProgressDisplay"):
+        self.display = display
+
+    def __rich_console__(self, console, options):
+        if not self.display.step_start_time:
+            yield Text("⏳ 初始化...")
+        else:
+            elapsed = int((datetime.now() - self.display.step_start_time).total_seconds())
+            yield Text.from_markup(
+                f"⏳ {self.display.current_step} [dim][已耗时 {elapsed} 秒][/dim]"
+            )
+
+
 class ProgressDisplay:
     """实时进度显示器，单行更新不累积"""
 
@@ -296,20 +302,16 @@ class ProgressDisplay:
         self.total_seconds = 0  # 总耗时，__exit__时记录
 
     def _update_display(self):
-        """内部方法：更新显示内容"""
-        if not self.live or not self.step_start_time:
-            return
-
-        elapsed_seconds = int((datetime.now() - self.step_start_time).total_seconds())
-        display_text = f"⏳ {self.current_step} [dim][已耗时 {elapsed_seconds} 秒][/dim]"
-        self.live.update(display_text)
+        """强制刷新显示（仅在步骤变化时外部调用，Live会自动以refresh_per_second刷新 _TimerRenderable）"""
+        if self.live:
+            self.live.update(_TimerRenderable(self))
 
     def __enter__(self):
         self.live = Live(
-            "⏳ 初始化...",
+            _TimerRenderable(self),  # 传入动态渲染器，每秒自动重算耗时
             console=self.console,
             refresh_per_second=4,
-            transient=True
+            transient=False
         )
         self.live.__enter__()
         self.total_start_time = datetime.now()
@@ -328,7 +330,7 @@ class ProgressDisplay:
     def update(self, step: str = None):
         """更新当前进度
         Args:
-            step: 进度描述，如果为None则只更新时间
+            step: 进度描述，如果为None则只刷新时间
         """
         if not self.live:
             return
@@ -338,6 +340,6 @@ class ProgressDisplay:
             self.current_step = step
             self.step_start_time = datetime.now()
 
-        # 每次调用都更新显示，刷新时间
+        # Live 以 refresh_per_second 自动重新渲染 _TimerRenderable，无需手动调用 live.update()
+        # step 变化时重新设置 renderable 以触发新组件的创建
         self._update_display()
-
