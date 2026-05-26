@@ -106,23 +106,14 @@ async def chat(request: Request):
             agent = LangChainPocketAgent(llm_config=llm_config)
             result, success, iterations = await agent.run_conversation(message)
             # 按 SSE 格式逐块推送
-            for chunk in result.split("
-"):
+            for chunk in result.split("\n"):
                 if chunk.strip():
-                    yield f"data: {chunk.strip()}
-
-"
-            yield f"data: [DONE]
-
-"
+                    yield f"data: {chunk.strip()}\n\n"
+            yield f"data: [DONE]\n\n"
         except Exception as e:
             logger.exception("Chat execution failed")
-            yield f"data: [ERROR] {str(e)}
-
-"
-            yield f"data: [DONE]
-
-"
+            yield f"data: [ERROR] {str(e)}\n\n"
+            yield f"data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -154,7 +145,7 @@ async def get_config():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip().strip(""'")
+                    config[k.strip()] = v.strip().strip('"')
     return config
 
 
@@ -169,14 +160,12 @@ async def set_config(request: Request):
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    existing[k.strip()] = v.strip()
+                    existing[k.strip()] = v.strip().strip('"')
     existing.update(data)
     with open(env_file, "w") as f:
         for k, v in existing.items():
-            f.write(f"{k}={v}
-")
+            f.write(f"{k}={v}\n")
     return {"status": "ok"}
-
 
 
 # ─── 服务关闭 ─────────────────────────────────
