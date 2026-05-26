@@ -20,6 +20,9 @@ sys.path.insert(0, PROJECT_ROOT)
 
 app = FastAPI(title="Pocket-Agent API")
 
+# ─── 调试：记录最后一次 /chat 请求参数 ──────────
+_chat_debug: dict = {}
+
 # ─── .env 配置加载 ─────────────────────────────
 
 def _load_env_config() -> dict:
@@ -100,6 +103,10 @@ async def chat(request: Request):
     # 合并配置：.env 为基础，请求参数覆盖（优先级最高）
     llm_config = {**_load_env_config(), **req_config}
 
+    # 调试记录最近一次请求
+    _chat_debug.clear()
+    _chat_debug.update({"message": message, "config": req_config})
+
     async def generate():
         try:
             from agent.agent_langchain import LangChainPocketAgent
@@ -116,6 +123,13 @@ async def chat(request: Request):
             yield f"data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# ─── 调试：查看最近一次 /chat 请求参数 ──────────
+
+@app.get("/debug_chat")
+async def debug_chat():
+    return _chat_debug
 
 
 # ─── 代码同步 ─────────────────────────────────
