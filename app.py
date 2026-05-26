@@ -196,6 +196,55 @@ async def set_config(request: Request):
     return {"status": "ok"}
 
 
+# ─── 技能列表 ─────────────────────────────────
+
+@app.get("/skills")
+async def list_skills():
+    """返回所有技能列表"""
+    skills_dir = os.path.join(PROJECT_ROOT, "agent", "skills")
+    result = {"main_skills": [], "executor_skills": [], "auto_skills": []}
+
+    category_map = {
+        "main-skills": "main_skills",
+        "executor-skills": "executor_skills",
+        "auto-skills": "auto_skills",
+    }
+
+    for cat_dir, key in category_map.items():
+        cat_path = os.path.join(skills_dir, cat_dir)
+        if not os.path.exists(cat_path):
+            continue
+        for root, dirs, files in os.walk(cat_path):
+            for f in files:
+                if f.upper() == "SKILL.MD":
+                    rel_path = os.path.relpath(root, skills_dir)
+                    name = os.path.basename(root)
+                    description = ""
+                    content = ""
+                    try:
+                        with open(os.path.join(root, f), encoding="utf-8") as fp:
+                            content = fp.read()
+                            if content.startswith("---"):
+                                end = content.find("---", 3)
+                                if end > 0:
+                                    fm = content[3:end]
+                                    for line in fm.split("\n"):
+                                        line = line.strip()
+                                        if line.startswith("name:"):
+                                            name = line[5:].strip().strip('"')
+                                        elif line.startswith("description:"):
+                                            description = line[12:].strip().strip('"')
+                    except Exception:
+                        pass
+                    result[key].append({
+                        "name": name,
+                        "description": description,
+                        "path": rel_path.replace("\\", "/"),
+                        "content": content
+                    })
+    return result
+
+
 # ─── 服务关闭 ─────────────────────────────────
 
 @app.post("/shutdown")
