@@ -6,7 +6,6 @@ import os
 import sys
 import json
 import subprocess
-import asyncio
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -113,44 +112,16 @@ async def chat(request: Request):
             from agent.agent_langchain import LangChainPocketAgent
             agent = LangChainPocketAgent(llm_config=llm_config)
 
-            # 用 Queue 桥接 on_token callback 和 SSE generator
-            queue: asyncio.Queue = asyncio.Queue()
-
-            async def on_token(text: str):
-                await queue.put(text)
-
-            async def on_tool_event(event: dict):
-                await queue.put(json.dumps(event, ensure_ascii=False))
-
-            async def run_agent():
-                try:
-                    await agent.run_conversation(message, on_token=on_token, on_tool_event=on_tool_event)
-                except Exception as e:
-                    await queue.put(Exception(str(e)))
-                finally:
-                    await queue.put(None)  # 结束信号
-
-            agent_task = asyncio.create_task(run_agent())
-
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                if isinstance(chunk, Exception):
-                    yield f"data: [ERROR] {chunk}\n\n"
-                    break
-                # 检查是否为工具事件（JSON 字符串，以 { 开头）
-                if chunk.startswith("{"):
-                    yield f"data: [TOOL] {chunk}\n\n"
-                else:
-                    yield f"data: {chunk}\n\n"
-
-            yield f"data: [DONE]\n\n"
-            # 确保 agent 任务完成（正常情况下已完成，等待以确保资源释放）
-            try:
-                await agent_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            async for event in agent.stream_conversation(message):
+                if event["type"] == "token":
+                    yield f"data: {event['content']}\n\n"
+                elif event["type"] in ("tool_start", "tool_end", "thinking"):
+                    yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif event["type"] == "done":
+                    yield f"data: [DONE]\n\n"
+                elif event["type"] == "error":
+                    yield f"data: [ERROR] {event['message']}\n\n"
+                    yield f"data: [DONE]\n\n"
 
         except Exception as e:
             logger.exception("Chat execution failed")

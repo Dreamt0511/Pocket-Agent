@@ -12,7 +12,7 @@ import re
 import subprocess
 import asyncio
 from datetime import datetime
-from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable
+from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable, AsyncGenerator
 from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
@@ -1070,6 +1070,212 @@ class LangChainPocketAgent:
                 error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
 
             return (error_msg, False, tool_call_count)
+
+    async def stream_conversation(self, user_message: str) -> AsyncGenerator[dict, None]:
+        """
+        流式对话 - async generator，直接 yield 结构化事件，供 FastAPI SSE 端点使用
+        Yields:
+            {"type": "token", "content": "你好"}                   -- 文本 token
+            {"type": "tool_start", "name": "...", "args": {...}}    -- 工具调用开始
+            {"type": "tool_end", "name": "..."}                     -- 工具调用完成
+            {"type": "thinking"}                                    -- 模型思考中
+            {"type": "done", "response": "...", "success": True, "tool_calls": N}  -- 完成
+            {"type": "error", "message": "..."}                     -- 错误
+        """
+        try:
+            full_response = ""
+            tool_call_count = 0
+            start_time = datetime.now()
+            conv_task_id = f"conv_{datetime.now().strftime('%H%M%S')}"
+
+            # 记录对话开始
+            self.logger.log_conversation_start(conv_task_id, user_message)
+
+            # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
+            env_tag = getattr(self, '_cached_env_tag', None)
+
+            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            profile_text = f"{self._user_profile}" if self._user_profile else ""
+            env_text = env_tag if env_tag else ""
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            if combined_context:
+                combined_message = f"{combined_context}\n\n---\n{user_message}"
+            else:
+                combined_message = user_message
+
+            async for chunk in self.agent.astream(
+                {"messages": [HumanMessage(content=combined_message)]},
+                config=self.config,
+                stream_mode=["messages", "updates"],
+                version="v2"
+            ):
+                # 处理消息流（用于流式输出回复内容）
+                if chunk["type"] == "messages":
+                    message_chunk, metadata = chunk["data"]
+                    node = metadata.get("langgraph_node", "")
+
+                    if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                        # LangGraph stream_mode="messages" 中每个 AIMessageChunk
+                        # 是增量内容，直接追加即可
+                        if type(message_chunk) is AIMessage:
+                            continue
+
+                        content = message_chunk.content
+
+                        # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
+                        # 条件：已积累100+字符，且当前chunk>=15字符，检查是否在重复已有内容
+                        if len(full_response) > 100 and len(content) >= 15:
+                            recent_window = full_response[-400:]
+                            if content[:30] in recent_window:
+                                continue
+
+                        # 收集完整响应（增量chunk，直接追加）
+                        full_response += content
+
+                        # yield 文本 token
+                        yield {"type": "token", "content": content}
+
+                # 处理更新事件（用于进度显示）
+                elif chunk["type"] == "updates":
+                    for source, update in chunk["data"].items():
+                        if source == "model":
+                            message = update["messages"][-1]
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                # 检测到工具调用
+                                for tc in message.tool_calls:
+                                    tool_call_count += 1  # 工具调用计数+1
+                                    tool_name = tc["name"]
+                                    tool_args = tc["args"]
+                                    # 记录日志
+                                    self.logger.log_tool_call(
+                                        conv_task_id, tool_call_count,
+                                        tool_name, tool_args, "[执行中]"
+                                    )
+
+                                    # yield 工具调用开始事件
+                                    yield {
+                                        "type": "tool_start",
+                                        "name": tool_name,
+                                        "args": tool_args
+                                    }
+                            else:
+                                # 模型思考中
+                                yield {"type": "thinking"}
+                        elif source == "tools":
+                            # 工具执行完成
+                            message = update["messages"][-1]
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            yield {
+                                "type": "tool_end",
+                                "name": tool_name_2
+                            }
+
+            # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
+            pending_tasks = consume_pending_tasks()
+            for pt in pending_tasks:
+                task_path = pt.get("task_path", "")
+                task_id = pt.get("task_id", "unknown")
+                description = pt.get("description", "")
+                if task_path and os.path.exists(task_path):
+                    await self._run_executor_foreground(task_path, task_id)
+
+            # ── 技能验证：通知主Agent检查新沉淀的技能 ──
+            if self._pending_skill_verification:
+                skills_str = ", ".join(self._pending_skill_verification)
+                try:
+                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请对照 skill-creator 格式检查并修正。")
+                    await self.agent.update_state(self.config, {"messages": [msg]})
+                except Exception:
+                    pass
+                self._pending_skill_verification = []
+
+            # ── 清理主Agent状态中的 delegate_task 相关消息 ──
+            # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
+            if pending_tasks:
+                try:
+                    state = await self.agent.aget_state(self.config)
+                    msgs = state.values.get("messages", [])
+                    # 查找所有 delegate_task 工具调用的ID
+                    delegate_tc_ids = set()
+                    to_remove_ids = set()
+                    for m in msgs:
+                        if hasattr(m, 'tool_calls') and m.tool_calls:
+                            for tc in m.tool_calls:
+                                if tc.get('name') == 'delegate_task':
+                                    if m.id:
+                                        to_remove_ids.add(m.id)
+                                    delegate_tc_ids.add(tc.get('id', ''))
+                    # 查找对应的 ToolMessage
+                    for m in msgs:
+                        if isinstance(m, ToolMessage) and m.tool_call_id in delegate_tc_ids:
+                            if m.id:
+                                to_remove_ids.add(m.id)
+
+                    if to_remove_ids:
+                        removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
+                        await self.agent.update_state(self.config, {"messages": removals})
+                except Exception:
+                    pass
+
+            # ── 后处理去重 ──
+            # 模型在调用工具（如 tts_speak）后可能重新生成一遍内容，导致重复输出
+            if len(full_response) > 200:
+                # 取前80个字符在后文中查找第二次出现
+                prefix = full_response[:80]
+                dup_pos = full_response.find(prefix, 80)
+                if dup_pos > 0:
+                    full_response = full_response[:dup_pos]
+
+            # 如果stream没有返回内容（极端情况），回退到ainvoke
+            if not full_response:
+                result = await self.agent.ainvoke(
+                    {"messages": [HumanMessage(content=user_message)]},
+                    config=self.config
+                )
+                last_message = result["messages"][-1]
+                full_response = str(last_message.content).strip()
+
+                # 统计ainvoke模式下的工具调用次数
+                for msg in result["messages"]:
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        tool_call_count += len(msg.tool_calls)
+
+                # yield 回退的完整响应
+                yield {"type": "token", "content": full_response}
+
+            # 记录日志
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            try:
+                self.logger.log_conversation_end(conv_task_id, full_response.strip()[:200], tool_call_count, elapsed)
+            except Exception:
+                pass
+
+            # 后台刷新环境感知缓存，为下一次对话准备（不阻塞本次返回）
+            asyncio.create_task(self._refresh_env_cache())
+
+            # yield 完成事件
+            yield {"type": "done", "response": full_response.strip(), "success": True, "tool_calls": tool_call_count}
+
+        except asyncio.CancelledError:
+            # 重新抛出取消异常，让上层处理
+            raise
+        except KeyboardInterrupt:
+            # 重新抛出，让上层处理中断
+            raise
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+
+            # 特殊处理超时错误
+            error_str = str(e).lower()
+            if "timeout" in error_str or "timed out" in error_str or "time out" in error_str:
+                error_msg = "⏱️  请求超时，请检查网络连接或稍后再试。如果问题持续存在，可以尝试降低模型输出长度或切换到更小的模型。"
+            elif "connection" in error_str or "network" in error_str or "refused" in error_str:
+                error_msg = "\U0001f50c  网络连接失败，请检查LLM服务是否正常运行，API地址和密钥是否配置正确。"
+            else:
+                error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
+
+            yield {"type": "error", "message": error_msg}
 
     def clear_history(self) -> None:
         """清空对话历史"""
