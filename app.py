@@ -41,7 +41,7 @@ def _load_env_config() -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip(""'")
+            k, v = k.strip(), v.strip().strip('"')
             config[k] = v
 
     # 映射到 agent 使用的 key 格式
