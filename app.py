@@ -41,7 +41,7 @@ def _load_env_config() -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip("\"'")
+            k, v = k.strip(), v.strip().strip(""'")
             config[k] = v
 
     # 映射到 agent 使用的 key 格式
@@ -106,14 +106,23 @@ async def chat(request: Request):
             agent = LangChainPocketAgent(llm_config=llm_config)
             result, success, iterations = await agent.run_conversation(message)
             # 按 SSE 格式逐块推送
-            for chunk in result.split("\n"):
+            for chunk in result.split("
+"):
                 if chunk.strip():
-                    yield f"data: {chunk.strip()}\n\n"
-            yield f"data: [DONE]\n\n"
+                    yield f"data: {chunk.strip()}
+
+"
+            yield f"data: [DONE]
+
+"
         except Exception as e:
             logger.exception("Chat execution failed")
-            yield f"data: [ERROR] {str(e)}\n\n"
-            yield f"data: [DONE]\n\n"
+            yield f"data: [ERROR] {str(e)}
+
+"
+            yield f"data: [DONE]
+
+"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -145,7 +154,7 @@ async def get_config():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip().strip("\"'")
+                    config[k.strip()] = v.strip().strip(""'")
     return config
 
 
@@ -164,8 +173,23 @@ async def set_config(request: Request):
     existing.update(data)
     with open(env_file, "w") as f:
         for k, v in existing.items():
-            f.write(f"{k}={v}\n")
+            f.write(f"{k}={v}
+")
     return {"status": "ok"}
+
+
+
+# ─── 服务关闭 ─────────────────────────────────
+
+@app.post("/shutdown")
+async def shutdown():
+    """关闭 FastAPI 服务自身"""
+    import os, signal, asyncio
+    async def _die():
+        await asyncio.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+    asyncio.create_task(_die())
+    return {"status": "shutting_down"}
 
 
 if __name__ == "__main__":
