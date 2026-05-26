@@ -12,7 +12,7 @@ import re
 import subprocess
 import asyncio
 from datetime import datetime
-from typing import List, Tuple, Dict, Any, Optional, Callable
+from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable
 from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
@@ -769,11 +769,16 @@ class LangChainPocketAgent:
         except Exception:
             return {"current": 0, "max": MAX_CONTEXT_TOKENS, "percentage": 0.0}
 
-    async def run_conversation(self, user_message: str) -> Tuple[str, bool, int]:
+    async def run_conversation(
+        self,
+        user_message: str,
+        on_token: Optional[Callable[[str], Awaitable[None]]] = None,
+    ) -> Tuple[str, bool, int]:
         """
         运行对话
         Args:
             user_message: 用户输入消息
+            on_token: 可选的异步回调，每收到一个 token chunk 时调用，用于实现真正的流式推送
         Returns:
             (响应内容, 是否使用了流式输出, 本次对话调用工具次数)
         """
@@ -860,6 +865,10 @@ class LangChainPocketAgent:
                             self.ui.print_stream_chunk(content)
                         # 收集完整响应（增量chunk，直接追加）
                         full_response += content
+
+                        # 如果有 on_token 回调，实时推送 token 给调用方
+                        if on_token is not None:
+                            await on_token(content)
 
                 # 处理更新事件（用于进度显示）
                 elif chunk["type"] == "updates" and progress_display:

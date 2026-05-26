@@ -111,12 +111,39 @@ async def chat(request: Request):
         try:
             from agent.agent_langchain import LangChainPocketAgent
             agent = LangChainPocketAgent(llm_config=llm_config)
-            result, success, iterations = await agent.run_conversation(message)
-            # 按 SSE 格式逐块推送
-            for chunk in result.split("\n"):
-                if chunk.strip():
-                    yield f"data: {chunk.strip()}\n\n"
+
+            # 用 Queue 桥接 on_token callback 和 SSE generator
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def on_token(text: str):
+                await queue.put(text)
+
+            async def run_agent():
+                try:
+                    await agent.run_conversation(message, on_token=on_token)
+                except Exception as e:
+                    await queue.put(Exception(str(e)))
+                finally:
+                    await queue.put(None)  # 结束信号
+
+            agent_task = asyncio.create_task(run_agent())
+
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                if isinstance(chunk, Exception):
+                    yield f"data: [ERROR] {chunk}\n\n"
+                    break
+                yield f"data: {chunk}\n\n"
+
             yield f"data: [DONE]\n\n"
+            # 确保 agent 任务完成（正常情况下已完成，等待以确保资源释放）
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         except Exception as e:
             logger.exception("Chat execution failed")
             yield f"data: [ERROR] {str(e)}\n\n"
