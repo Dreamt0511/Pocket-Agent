@@ -115,3 +115,4 @@ Thumbs.db
 CLAUDE.md
 .env.bak
 *.bak
+.startup_progress
