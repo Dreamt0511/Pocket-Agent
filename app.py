@@ -7,6 +7,7 @@ import sys
 import json
 import subprocess
 import asyncio
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import logging
@@ -18,6 +19,45 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 app = FastAPI(title="Pocket-Agent API")
+
+# ─── .env 配置加载 ─────────────────────────────
+
+def _load_env_config() -> dict:
+    """从 .env 文件加载 LLM 配置，转成 agent 所需的 key 格式"""
+    env_file = os.path.join(PROJECT_ROOT, ".env")
+    if not os.path.exists(env_file):
+        # 首次运行从 .env.example 复制
+        example = os.path.join(PROJECT_ROOT, ".env.example")
+        if os.path.exists(example):
+            import shutil
+            shutil.copy2(example, env_file)
+        else:
+            return {}
+
+    config = {}
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("\"'")
+            config[k] = v
+
+    # 映射到 agent 使用的 key 格式
+    mapping = {
+        "DEFAULT_LLM_BASE_URL": "base_url",
+        "LLM_BASE_URL": "base_url",
+        "LLM_API_KEY": "api_key",
+        "LLM_MODEL": "model",
+        "LLM_TEMPERATURE": "temperature",
+        "LLM_MAX_TOKENS": "max_tokens",
+    }
+    result = {}
+    for env_key, agent_key in mapping.items():
+        if env_key in config:
+            result[agent_key] = config[env_key]
+    return result
 
 
 # ─── 健康检查 ─────────────────────────────────
@@ -55,11 +95,15 @@ async def setup():
 async def chat(request: Request):
     data = await request.json()
     message = data.get("message", "")
+    req_config = data.get("config", {})
+
+    # 合并配置：.env 为基础，请求参数覆盖（优先级最高）
+    llm_config = {**_load_env_config(), **req_config}
 
     async def generate():
         try:
             from agent.agent_langchain import LangChainPocketAgent
-            agent = LangChainPocketAgent()
+            agent = LangChainPocketAgent(llm_config=llm_config)
             result, success, iterations = await agent.run_conversation(message)
             # 按 SSE 格式逐块推送
             for chunk in result.split("\n"):
