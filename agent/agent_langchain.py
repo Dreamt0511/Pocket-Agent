@@ -773,12 +773,14 @@ class LangChainPocketAgent:
         self,
         user_message: str,
         on_token: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_tool_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> Tuple[str, bool, int]:
         """
         运行对话
         Args:
             user_message: 用户输入消息
             on_token: 可选的异步回调，每收到一个 token chunk 时调用，用于实现真正的流式推送
+            on_tool_event: 可选的异步回调，工具调用事件（tool_start/tool_end/thinking），用于推送工具执行进度
         Returns:
             (响应内容, 是否使用了流式输出, 本次对话调用工具次数)
         """
@@ -888,6 +890,14 @@ class LangChainPocketAgent:
                                         tool_name, tool_args, "[执行中]"
                                     )
 
+                                    # 通知外部工具调用开始
+                                    if on_tool_event is not None:
+                                        await on_tool_event({
+                                            "type": "tool_start",
+                                            "name": tool_name,
+                                            "args": tool_args
+                                        })
+
                                     # 特殊处理shell_exec，显示命令内容
                                     if tool_name == "shell_exec" and "command" in tool_args:
                                         command = tool_args["command"]
@@ -903,11 +913,18 @@ class LangChainPocketAgent:
                                         progress_display.update(f"调用: {tool_name}({args_text})")
                             else:
                                 progress_display.update("思考中")
+                                if on_tool_event is not None:
+                                    await on_tool_event({"type": "thinking"})
                         elif source == "tools":
                             # 工具执行完成
                             message = update["messages"][-1]
                             tool_name_2 = message.name if hasattr(message, 'name') else "工具"
                             progress_display.update(f"处理 {tool_name_2} 结果")
+                            if on_tool_event is not None:
+                                await on_tool_event({
+                                    "type": "tool_end",
+                                    "name": tool_name_2
+                                })
 
             # 关闭进度显示
             if progress_display:

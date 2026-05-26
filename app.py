@@ -118,9 +118,12 @@ async def chat(request: Request):
             async def on_token(text: str):
                 await queue.put(text)
 
+            async def on_tool_event(event: dict):
+                await queue.put(json.dumps(event, ensure_ascii=False))
+
             async def run_agent():
                 try:
-                    await agent.run_conversation(message, on_token=on_token)
+                    await agent.run_conversation(message, on_token=on_token, on_tool_event=on_tool_event)
                 except Exception as e:
                     await queue.put(Exception(str(e)))
                 finally:
@@ -135,7 +138,11 @@ async def chat(request: Request):
                 if isinstance(chunk, Exception):
                     yield f"data: [ERROR] {chunk}\n\n"
                     break
-                yield f"data: {chunk}\n\n"
+                # 检查是否为工具事件（JSON 字符串，以 { 开头）
+                if chunk.startswith("{"):
+                    yield f"data: [TOOL] {chunk}\n\n"
+                else:
+                    yield f"data: {chunk}\n\n"
 
             yield f"data: [DONE]\n\n"
             # 确保 agent 任务完成（正常情况下已完成，等待以确保资源释放）
