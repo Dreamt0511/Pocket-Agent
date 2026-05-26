@@ -108,6 +108,7 @@ async def chat(request: Request):
     _chat_debug.update({"message": message, "config": req_config})
 
     async def generate():
+        yield "retry: 1000\n\n"  # SSE reconnect interval，同时触发响应头立即发送
         try:
             from agent.agent_langchain import LangChainPocketAgent
             agent = LangChainPocketAgent(llm_config=llm_config)
@@ -156,7 +157,15 @@ async def chat(request: Request):
             yield f"data: [ERROR] {str(e)}\n\n"
             yield f"data: [DONE]\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
 
 
 # ─── 调试：查看最近一次 /chat 请求参数 ──────────
