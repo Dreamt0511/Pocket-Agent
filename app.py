@@ -107,6 +107,7 @@ async def chat(request: Request):
     _chat_debug.update({"message": message, "config": req_config})
 
     async def generate():
+        yield ":ok\n\n"  # SSE comment，强制触发响应头发送
         yield "retry: 1000\n\n"  # SSE reconnect interval，同时触发响应头立即发送
         try:
             from agent.agent_langchain import LangChainPocketAgent
@@ -114,7 +115,7 @@ async def chat(request: Request):
 
             async for event in agent.stream_conversation(message):
                 if event["type"] == "token":
-                    yield f"data: {event['content']}\n\n"
+                    yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
                 elif event["type"] in ("tool_start", "tool_end", "thinking"):
                     yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "done":

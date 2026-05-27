@@ -1114,26 +1114,32 @@ class LangChainPocketAgent:
                     message_chunk, metadata = chunk["data"]
                     node = metadata.get("langgraph_node", "")
 
-                    if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
-                        # LangGraph stream_mode="messages" 中每个 AIMessageChunk
-                        # 是增量内容，直接追加即可
-                        if type(message_chunk) is AIMessage:
-                            continue
+                    if node == "model" and hasattr(message_chunk, "content"):
+                        # 检查是否有推理内容（DeepSeek 等模型的思考过程）
+                        rc = message_chunk.additional_kwargs.get("reasoning_content", "") if hasattr(message_chunk, "additional_kwargs") else ""
+                        if rc:
+                            yield {"type": "thinking"}
 
-                        content = message_chunk.content
-
-                        # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
-                        # 条件：已积累100+字符，且当前chunk>=15字符，检查是否在重复已有内容
-                        if len(full_response) > 100 and len(content) >= 15:
-                            recent_window = full_response[-400:]
-                            if content[:30] in recent_window:
+                        if message_chunk.content:
+                            # LangGraph stream_mode="messages" 中每个 AIMessageChunk
+                            # 是增量内容，直接追加即可
+                            if type(message_chunk) is AIMessage:
                                 continue
 
-                        # 收集完整响应（增量chunk，直接追加）
-                        full_response += content
+                            content = message_chunk.content
 
-                        # yield 文本 token
-                        yield {"type": "token", "content": content}
+                            # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
+                            # 条件：已积累100+字符，且当前chunk>=15字符，检查是否在重复已有内容
+                            if len(full_response) > 100 and len(content) >= 15:
+                                recent_window = full_response[-400:]
+                                if content[:30] in recent_window:
+                                    continue
+
+                            # 收集完整响应（增量chunk，直接追加）
+                            full_response += content
+
+                            # yield 文本 token
+                            yield {"type": "token", "content": content}
 
                 # 处理更新事件（用于进度显示）
                 elif chunk["type"] == "updates":
