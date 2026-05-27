@@ -16,7 +16,7 @@ from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable, AsyncG
 from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_openai import ChatOpenAI
 from .memory import LongTermMemory
 from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
@@ -721,9 +721,8 @@ class LangChainPocketAgent:
         ]
 
         # 持久化存储 — 使用 SQLite，重启后对话历史不丢失
-        import sqlite3
-        self.checkpointer = SqliteSaver(
-            sqlite3.connect(os.path.join(PROJECT_ROOT, "pocket_agent.db"), check_same_thread=False)
+        self.checkpointer = AsyncSqliteSaver.from_conn_string(
+            os.path.join(PROJECT_ROOT, "pocket_agent.db")
         )
 
         # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
