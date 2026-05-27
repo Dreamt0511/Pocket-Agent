@@ -1132,6 +1132,9 @@ class LangChainPocketAgent:
                 stream_mode=["messages", "updates"],
                 version="v2"
             ):
+                if self._check_cancel():
+                    break
+
                 # 处理消息流（用于流式输出回复内容）
                 if chunk["type"] == "messages":
                     message_chunk, metadata = chunk["data"]
@@ -1321,6 +1324,17 @@ class LangChainPocketAgent:
                 },
                 "recursion_limit": self.max_iterations
             }
+
+    def cancel(self) -> None:
+        """请求取消当前正在执行的推理"""
+        self._cancel_requested = True
+
+    def _check_cancel(self) -> bool:
+        """检查是否请求了取消，如果是则重置标志并返回 True"""
+        if getattr(self, '_cancel_requested', False):
+            self._cancel_requested = False
+            return True
+        return False
 
     async def cleanup(self) -> None:
         """关闭所有HTTP客户端，避免退出时 httpx 异步生成器报错"""

@@ -198,6 +198,8 @@ async def chat(request: Request):
         await db.commit()
 
     async def generate():
+        global _cancel_requested
+        _cancel_requested = False  # 新请求开始，重置取消标志
         yield ":ok\n\n"  # SSE comment，强制触发响应头发送
         yield "retry: 1000\n\n"  # SSE reconnect interval，同时触发响应头立即发送
         full_response = ""
@@ -219,6 +221,10 @@ async def chat(request: Request):
                 pass
 
             async for event in agent.stream_conversation(message, thread_id=conversation_id, history=history):
+                if _cancel_requested:
+                    yield f"data: [已中断]\n\n"
+                    yield f"data: [DONE]\n\n"
+                    break
                 if event["type"] == "token":
                     full_response += event["content"]
                     yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
@@ -558,6 +564,25 @@ async def delete_skill(path: str):
         return JSONResponse({"error": "不能删除系统预装技能"}, status_code=403)
 
     shutil.rmtree(target)
+    return {"ok": True}
+
+
+# ─── 打断当前执行 ─────────────────────────────
+
+_cancel_requested = False
+
+@app.post("/cancel")
+async def cancel_execution():
+    """取消当前正在执行的推理"""
+    global _cancel_requested
+    _cancel_requested = True
+    # 尝试中断 agent 的 LLM 调用
+    if _agent_instance is not None:
+        try:
+            if hasattr(_agent_instance, 'cancel'):
+                _agent_instance.cancel()
+        except Exception:
+            pass
     return {"ok": True}
 
 
