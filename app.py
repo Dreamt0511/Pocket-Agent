@@ -536,9 +536,11 @@ async def delete_skill(path: str):
     if not os.path.isdir(target):
         return JSONResponse({"error": "技能不存在"}, status_code=404)
 
-    # 不允许删除系统技能（非 user/ 目录下的）
+    # 不允许删除系统预装技能（main-skills/xxx 或 executor-skills/xxx 直接子目录）
+    # 允许删除: user/ 下的、auto-skills/ 下的、executor/ 下的
     parts = path.split("/")
-    if "user" not in parts:
+    is_system = (parts[0] in ("main-skills", "executor-skills") and "user" not in parts and "executor" not in parts)
+    if is_system:
         return JSONResponse({"error": "不能删除系统预装技能"}, status_code=403)
 
     shutil.rmtree(target)
