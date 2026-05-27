@@ -1071,12 +1071,13 @@ class LangChainPocketAgent:
 
             return (error_msg, False, tool_call_count)
 
-    async def stream_conversation(self, user_message: str, thread_id: str = None) -> AsyncGenerator[dict, None]:
+    async def stream_conversation(self, user_message: str, thread_id: str = None, history: list = None) -> AsyncGenerator[dict, None]:
         """
         流式对话 - async generator，直接 yield 结构化事件，供 FastAPI SSE 端点使用
         Args:
             user_message: 用户输入消息
             thread_id: 可选的会话ID，用于隔离不同会话的对话历史。为None时使用默认session
+            history: 可选的历史消息列表 [{"role": "user"/"assistant", "content": "..."}]
         Yields:
             {"type": "token", "content": "你好"}                   -- 文本 token
             {"type": "tool_start", "name": "...", "args": {...}}    -- 工具调用开始
@@ -1115,8 +1116,18 @@ class LangChainPocketAgent:
             else:
                 combined_message = user_message
 
+            # 构建输入消息：历史消息 + 当前消息
+            input_messages = []
+            if history:
+                for msg in history:
+                    if msg["role"] == "user":
+                        input_messages.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        input_messages.append(AIMessage(content=msg["content"]))
+            input_messages.append(HumanMessage(content=combined_message))
+
             async for chunk in self.agent.astream(
-                {"messages": [HumanMessage(content=combined_message)]},
+                {"messages": input_messages},
                 config=config,
                 stream_mode=["messages", "updates"],
                 version="v2"

@@ -204,7 +204,21 @@ async def chat(request: Request):
         try:
             agent = _get_or_create_agent(llm_config)
 
-            async for event in agent.stream_conversation(message, thread_id=conversation_id):
+            # 从 SQLite 加载历史消息，恢复会话上下文（MemorySaver 重启后丢失）
+            history = []
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    rows = await db.execute_fetchall(
+                        "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
+                        (conversation_id,)
+                    )
+                    # 排除最后一条（当前用户消息，已保存）
+                    for row in rows[:-1]:
+                        history.append({"role": row[0], "content": row[1]})
+            except Exception:
+                pass
+
+            async for event in agent.stream_conversation(message, thread_id=conversation_id, history=history):
                 if event["type"] == "token":
                     full_response += event["content"]
                     yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
