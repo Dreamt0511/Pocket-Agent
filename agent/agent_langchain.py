@@ -16,7 +16,7 @@ from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable, AsyncG
 from langchain_core.tools import StructuredTool
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_openai import ChatOpenAI
 from .memory import LongTermMemory
 from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
@@ -720,8 +720,11 @@ class LangChainPocketAgent:
             )
         ]
 
-        # 持久化存储
-        self.checkpointer = MemorySaver()
+        # 持久化存储 — 使用 SQLite，重启后对话历史不丢失
+        import sqlite3
+        self.checkpointer = SqliteSaver(
+            sqlite3.connect(os.path.join(PROJECT_ROOT, "pocket_agent.db"), check_same_thread=False)
+        )
 
         # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
         self._system_prompt = enhanced_system_prompt
@@ -1071,9 +1074,12 @@ class LangChainPocketAgent:
 
             return (error_msg, False, tool_call_count)
 
-    async def stream_conversation(self, user_message: str) -> AsyncGenerator[dict, None]:
+    async def stream_conversation(self, user_message: str, thread_id: str = None) -> AsyncGenerator[dict, None]:
         """
         流式对话 - async generator，直接 yield 结构化事件，供 FastAPI SSE 端点使用
+        Args:
+            user_message: 用户输入消息
+            thread_id: 可选的会话ID，用于隔离不同会话的对话历史。为None时使用默认session
         Yields:
             {"type": "token", "content": "你好"}                   -- 文本 token
             {"type": "tool_start", "name": "...", "args": {...}}    -- 工具调用开始
@@ -1082,6 +1088,15 @@ class LangChainPocketAgent:
             {"type": "done", "response": "...", "success": True, "tool_calls": N}  -- 完成
             {"type": "error", "message": "..."}                     -- 错误
         """
+        # 使用传入的 thread_id 或默认配置，实现会话隔离
+        # 支持 _thread_id_map 映射（clear_history 后旧 thread_id 会映射到新 UUID）
+        actual_thread_id = thread_id or self.config["configurable"]["thread_id"]
+        if hasattr(self, '_thread_id_map') and actual_thread_id in self._thread_id_map:
+            actual_thread_id = self._thread_id_map[actual_thread_id]
+        config = {
+            "configurable": {"thread_id": actual_thread_id},
+            "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+        }
         try:
             full_response = ""
             tool_call_count = 0
@@ -1105,7 +1120,7 @@ class LangChainPocketAgent:
 
             async for chunk in self.agent.astream(
                 {"messages": [HumanMessage(content=combined_message)]},
-                config=self.config,
+                config=config,
                 stream_mode=["messages", "updates"],
                 version="v2"
             ):
@@ -1190,7 +1205,7 @@ class LangChainPocketAgent:
                 skills_str = ", ".join(self._pending_skill_verification)
                 try:
                     msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请对照 skill-creator 格式检查并修正。")
-                    await self.agent.update_state(self.config, {"messages": [msg]})
+                    await self.agent.update_state(config, {"messages": [msg]})
                 except Exception:
                     pass
                 self._pending_skill_verification = []
@@ -1199,7 +1214,7 @@ class LangChainPocketAgent:
             # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
             if pending_tasks:
                 try:
-                    state = await self.agent.aget_state(self.config)
+                    state = await self.agent.aget_state(config)
                     msgs = state.values.get("messages", [])
                     # 查找所有 delegate_task 工具调用的ID
                     delegate_tc_ids = set()
@@ -1219,7 +1234,7 @@ class LangChainPocketAgent:
 
                     if to_remove_ids:
                         removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
-                        await self.agent.update_state(self.config, {"messages": removals})
+                        await self.agent.update_state(config, {"messages": removals})
                 except Exception:
                     pass
 
@@ -1236,7 +1251,7 @@ class LangChainPocketAgent:
             if not full_response:
                 result = await self.agent.ainvoke(
                     {"messages": [HumanMessage(content=user_message)]},
-                    config=self.config
+                    config=config
                 )
                 last_message = result["messages"][-1]
                 full_response = str(last_message.content).strip()
@@ -1283,16 +1298,21 @@ class LangChainPocketAgent:
 
             yield {"type": "error", "message": error_msg}
 
-    def clear_history(self) -> None:
-        """清空对话历史"""
-        # 生成新的thread_id，重置会话
+    def clear_history(self, thread_id: str = None) -> None:
+        """清空指定会话的对话历史"""
         import uuid
-        self.config = {
-            "configurable": {
-                "thread_id": str(uuid.uuid4())
-            },
-            "recursion_limit": self.max_iterations
-        }
+        if thread_id:
+            # 为该会话生成新的内部 thread_id，旧历史自动失效
+            self._thread_id_map = getattr(self, '_thread_id_map', {})
+            self._thread_id_map[thread_id] = str(uuid.uuid4())
+        else:
+            # 清空默认会话
+            self.config = {
+                "configurable": {
+                    "thread_id": str(uuid.uuid4())
+                },
+                "recursion_limit": self.max_iterations
+            }
 
     async def cleanup(self) -> None:
         """关闭所有HTTP客户端，避免退出时 httpx 异步生成器报错"""

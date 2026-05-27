@@ -5,11 +5,14 @@ Pocket-Agent FastAPI 服务 — 运行在 Termux 中，为 Android App 提供 AI
 import os
 import sys
 import json
+import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import logging
+import aiosqlite
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pocket-agent-api")
@@ -17,7 +20,70 @@ logger = logging.getLogger("pocket-agent-api")
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+DB_PATH = os.path.join(PROJECT_ROOT, "pocket_agent.db")
+
 app = FastAPI(title="Pocket-Agent API")
+
+
+# ─── SQLite 初始化（会话 + 消息表）──────────────
+
+async def _init_db():
+    """创建会话和消息表（如果不存在）"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '新会话',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+        await db.commit()
+
+
+@app.on_event("startup")
+async def startup():
+    await _init_db()
+
+# ─── Agent 单例缓存 ──────────────────────────────
+# 共享同一个 agent 实例（含 MemorySaver），通过不同 thread_id 隔离各会话历史
+# 仅当 LLM 配置变化时才重建 agent
+_agent_instance = None
+_agent_llm_config_key = None
+
+
+def _get_or_create_agent(llm_config: dict):
+    """获取或创建 Agent 单例，配置变化时自动重建"""
+    global _agent_instance, _agent_llm_config_key
+    config_key = json.dumps(llm_config, sort_keys=True)
+    if _agent_instance is not None and _agent_llm_config_key == config_key:
+        return _agent_instance
+    if _agent_instance is not None:
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_agent_instance.cleanup())
+            else:
+                loop.run_until_complete(_agent_instance.cleanup())
+        except Exception:
+            pass
+    from agent.agent_langchain import LangChainPocketAgent
+    _agent_instance = LangChainPocketAgent(llm_config=llm_config)
+    _agent_llm_config_key = config_key
+    return _agent_instance
+
 
 # ─── 调试：记录最后一次 /chat 请求参数 ──────────
 _chat_debug: dict = {}
@@ -98,6 +164,7 @@ async def chat(request: Request):
     data = await request.json()
     message = data.get("message", "")
     req_config = data.get("config", {})
+    conversation_id = data.get("conversation_id", "default-session")
 
     # 合并配置：.env 为基础，请求参数覆盖（优先级最高）
     llm_config = {**_load_env_config(), **req_config}
@@ -106,28 +173,68 @@ async def chat(request: Request):
     _chat_debug.clear()
     _chat_debug.update({"message": message, "config": req_config})
 
+    # 确保会话存在
+    now = int(time.time() * 1000)
+    async with aiosqlite.connect(DB_PATH) as db:
+        existing = await db.execute_fetchall(
+            "SELECT id FROM conversations WHERE id = ?", (conversation_id,)
+        )
+        if not existing:
+            title = message[:30] if message else "新会话"
+            await db.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, title, now, now)
+            )
+        else:
+            await db.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id)
+            )
+        # 保存用户消息
+        await db.execute(
+            "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (conversation_id, "user", message, now)
+        )
+        await db.commit()
+
     async def generate():
         yield ":ok\n\n"  # SSE comment，强制触发响应头发送
         yield "retry: 1000\n\n"  # SSE reconnect interval，同时触发响应头立即发送
+        full_response = ""
         try:
-            from agent.agent_langchain import LangChainPocketAgent
-            agent = LangChainPocketAgent(llm_config=llm_config)
+            agent = _get_or_create_agent(llm_config)
 
-            async for event in agent.stream_conversation(message):
+            async for event in agent.stream_conversation(message, thread_id=conversation_id):
                 if event["type"] == "token":
+                    full_response += event["content"]
                     yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
                 elif event["type"] in ("tool_start", "tool_end", "thinking"):
                     yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "done":
+                    full_response = event.get("response", full_response)
                     yield f"data: [DONE]\n\n"
                 elif event["type"] == "error":
+                    full_response = event.get("message", "")
                     yield f"data: [ERROR] {event['message']}\n\n"
                     yield f"data: [DONE]\n\n"
 
         except Exception as e:
             logger.exception("Chat execution failed")
+            full_response = str(e)
             yield f"data: [ERROR] {str(e)}\n\n"
             yield f"data: [DONE]\n\n"
+
+        # 保存 AI 回复
+        if full_response:
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                        (conversation_id, "assistant", full_response, int(time.time() * 1000))
+                    )
+                    await db.commit()
+            except Exception:
+                logger.exception("Failed to save assistant message")
 
     return StreamingResponse(
         generate(),
@@ -197,6 +304,72 @@ async def set_config(request: Request):
     return {"status": "ok"}
 
 
+# ─── 清除对话历史 ───────────────────────────────
+
+@app.post("/clear_history")
+async def clear_history(request: Request):
+    """清除指定会话的对话历史（重置 MemorySaver 中的 thread）"""
+    data = await request.json()
+    conversation_id = data.get("conversation_id", "default-session")
+    if _agent_instance is not None:
+        _agent_instance.clear_history(thread_id=conversation_id)
+        return {"status": "ok", "message": f"会话 {conversation_id} 的对话历史已清除"}
+    return {"status": "ok", "message": "Agent 未初始化，无需清除"}
+
+
+# ─── 会话管理 API ───────────────────────────────
+
+@app.get("/conversations")
+async def list_conversations():
+    """返回所有会话列表"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        rows = await db.execute_fetchall(
+            "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC"
+        )
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+    """返回指定会话的消息列表"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        rows = await db.execute_fetchall(
+            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
+            (conversation_id,)
+        )
+        return [
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "timestamp": row["timestamp"],
+            }
+            for row in rows
+        ]
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """删除指定会话及其所有消息"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        await db.commit()
+    # 同时清除 LangGraph checkpoint 中的历史
+    if _agent_instance is not None:
+        _agent_instance.clear_history(thread_id=conversation_id)
+    return {"status": "ok"}
+
+
 # ─── 技能列表 ─────────────────────────────────
 
 @app.get("/skills")
@@ -252,6 +425,12 @@ async def list_skills():
 async def shutdown():
     """关闭 FastAPI 服务自身"""
     import os, signal, asyncio
+    # 清理 agent 实例，关闭 HTTP 客户端
+    if _agent_instance is not None:
+        try:
+            await _agent_instance.cleanup()
+        except Exception:
+            pass
     async def _die():
         await asyncio.sleep(0.3)
         os.kill(os.getpid(), signal.SIGTERM)

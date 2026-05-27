@@ -21,6 +21,7 @@ langchain>=0.2.0
 langgraph>=0.2.0
 langchain-openai>=0.1.0
 langchain-core>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0
 python-multipart>=0.0.9
 packaging>=21.0               # 包版本管理（langchain 间接依赖，需显式安装）
 # FastAPI 服务依赖（Termux HTTP API）
