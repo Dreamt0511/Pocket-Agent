@@ -116,3 +116,8 @@ CLAUDE.md
 .env.bak
 *.bak
 .startup_progress
+
+# SSH 相关（非核心功能，仅开发调试用）
+test_ssh_cmd.py
+同步代码到手动端-ssh机制.py
+docs/经验/08-ssh连接手机终端说明.md
