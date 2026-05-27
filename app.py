@@ -257,16 +257,45 @@ async def debug_chat():
 # ─── 代码同步 ─────────────────────────────────
 
 @app.post("/sync")
-async def sync():
+async def sync(request: Request):
+    # 拉取前记录 requirements.txt 的内容
+    req_file = os.path.join(PROJECT_ROOT, "requirements.txt")
+    old_req = ""
+    if os.path.isfile(req_file):
+        with open(req_file) as f:
+            old_req = f.read()
+
     result = subprocess.run(
         ["git", "pull", "origin", "main"],
         capture_output=True, text=True, cwd=PROJECT_ROOT
     )
-    return {
+    resp = {
         "status": "ok" if result.returncode == 0 else "error",
         "output": result.stdout,
         "error": result.stderr,
     }
+
+    # 拉取成功后检查 requirements.txt 是否有变化
+    if result.returncode == 0 and os.path.isfile(req_file):
+        with open(req_file) as f:
+            new_req = f.read()
+        if new_req != old_req:
+            # 有新依赖，执行 pip install
+            body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+            mirror = body.get("mirror", "")
+            env = os.environ.copy()
+            if mirror:
+                env["PIP_INDEX_URL"] = mirror
+            pip_result = subprocess.run(
+                ["pip", "install", "-q", "-r", "requirements.txt"],
+                capture_output=True, text=True, cwd=PROJECT_ROOT, env=env,
+                timeout=300
+            )
+            resp["pip_updated"] = True
+            resp["pip_output"] = pip_result.stdout[-500:] if pip_result.stdout else ""
+            resp["pip_error"] = pip_result.stderr[-500:] if pip_result.stderr else ""
+
+    return resp
 
 
 # ─── 配置读写 ─────────────────────────────────
@@ -417,6 +446,103 @@ async def list_skills():
                         "content": content
                     })
     return result
+
+
+def _validate_skill_path(rel_path: str) -> str | None:
+    """校验技能相对路径，防止路径穿越。返回规范化路径或 None（非法）"""
+    import os
+    skills_dir = os.path.join(PROJECT_ROOT, "agent", "skills")
+    target = os.path.normpath(os.path.join(skills_dir, rel_path))
+    if not target.startswith(os.path.normpath(skills_dir) + os.sep) and target != os.path.normpath(skills_dir):
+        return None
+    # 禁止 .. 组件
+    if ".." in rel_path.split("/"):
+        return None
+    return target
+
+
+@app.post("/skills")
+async def create_skill(request: Request):
+    """创建新技能"""
+    import os
+    body = await request.json()
+    name = body.get("name", "").strip()
+    description = body.get("description", "").strip()
+    content = body.get("content", "").strip()
+    category = body.get("category", "auto-skills").strip()
+
+    if not name or not content:
+        return JSONResponse({"error": "name 和 content 不能为空"}, status_code=400)
+
+    skills_dir = os.path.join(PROJECT_ROOT, "agent", "skills")
+    cat_dir = os.path.join(skills_dir, category)
+    if not os.path.exists(cat_dir):
+        return JSONResponse({"error": f"分类 {category} 不存在"}, status_code=400)
+
+    # 用户技能放在分类下的 user/ 子目录
+    skill_dir = os.path.join(cat_dir, "user", name)
+    if os.path.exists(skill_dir):
+        return JSONResponse({"error": f"技能 {name} 已存在"}, status_code=409)
+
+    os.makedirs(skill_dir, exist_ok=True)
+    frontmatter = f"---\nname: {name}\ndescription: {description}\n---\n\n{content}\n"
+    with open(os.path.join(skill_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write(frontmatter)
+
+    rel_path = os.path.relpath(skill_dir, skills_dir).replace("\\", "/")
+    return {"path": rel_path, "name": name}
+
+
+@app.put("/skills/{path:path}")
+async def update_skill(path: str, request: Request):
+    """更新技能内容"""
+    import os
+    target = _validate_skill_path(path)
+    if target is None:
+        return JSONResponse({"error": "非法路径"}, status_code=400)
+
+    skill_file = None
+    for fname in ("SKILL.md", "skill.md", "Skill.md"):
+        fp = os.path.join(target, fname)
+        if os.path.isfile(fp):
+            skill_file = fp
+            break
+    if skill_file is None:
+        return JSONResponse({"error": "技能不存在"}, status_code=404)
+
+    body = await request.json()
+    name = body.get("name", "").strip()
+    description = body.get("description", "").strip()
+    content = body.get("content", "").strip()
+
+    if not name or not content:
+        return JSONResponse({"error": "name 和 content 不能为空"}, status_code=400)
+
+    frontmatter = f"---\nname: {name}\ndescription: {description}\n---\n\n{content}\n"
+    with open(skill_file, "w", encoding="utf-8") as f:
+        f.write(frontmatter)
+
+    return {"ok": True}
+
+
+@app.delete("/skills/{path:path}")
+async def delete_skill(path: str):
+    """删除技能"""
+    import os, shutil
+    target = _validate_skill_path(path)
+    if target is None:
+        return JSONResponse({"error": "非法路径"}, status_code=400)
+
+    if not os.path.isdir(target):
+        return JSONResponse({"error": "技能不存在"}, status_code=404)
+
+    # 不允许删除系统技能（非 user/ 目录下的）
+    parts = path.split("/")
+    if "user" not in parts:
+        return JSONResponse({"error": "不能删除系统预装技能"}, status_code=403)
+
+    shutil.rmtree(target)
+    return {"ok": True}
 
 
 # ─── 服务关闭 ─────────────────────────────────
