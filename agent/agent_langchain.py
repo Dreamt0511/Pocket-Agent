@@ -467,6 +467,7 @@ class LangChainPocketAgent:
         llm_config: Dict[str, Any] = None,
         ui=None,
         max_iterations: int = 50,
+        checkpointer=None,
     ):
         self.ui = ui
         self.base_system_prompt = system_prompt
@@ -720,8 +721,8 @@ class LangChainPocketAgent:
             )
         ]
 
-        # 持久化存储 — 对话历史通过 app.py 的 SQLite 持久化，此处用 MemorySaver 处理 LangGraph 状态
-        self.checkpointer = MemorySaver()
+        # 持久化存储 — 使用外部传入的 AsyncSqliteSaver（app.py 初始化）
+        self.checkpointer = checkpointer or MemorySaver()
 
         # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
         self._system_prompt = enhanced_system_prompt

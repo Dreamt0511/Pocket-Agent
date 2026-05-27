@@ -54,13 +54,23 @@ async def _init_db():
 
 @app.on_event("startup")
 async def startup():
+    global _checkpoint_conn, _checkpoint_saver
     await _init_db()
+    # 初始化持久化 checkpointer（AsyncSqliteSaver）
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    _checkpoint_conn = await aiosqlite.connect(DB_PATH)
+    _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
+    await _checkpoint_saver.setup()
+    logger.info("AsyncSqliteSaver checkpoint 已初始化")
 
 # ─── Agent 单例缓存 ──────────────────────────────
-# 共享同一个 agent 实例（含 MemorySaver），通过不同 thread_id 隔离各会话历史
+# 共享同一个 agent 实例，通过不同 thread_id 隔离各会话历史
 # 仅当 LLM 配置变化时才重建 agent
 _agent_instance = None
 _agent_llm_config_key = None
+_checkpoint_conn = None  # AsyncSqliteSaver 的底层连接
+_checkpoint_saver = None  # 持久化 checkpointer
 
 
 def _get_or_create_agent(llm_config: dict):
@@ -80,7 +90,7 @@ def _get_or_create_agent(llm_config: dict):
         except Exception:
             pass
     from agent.agent_langchain import LangChainPocketAgent
-    _agent_instance = LangChainPocketAgent(llm_config=llm_config)
+    _agent_instance = LangChainPocketAgent(llm_config=llm_config, checkpointer=_checkpoint_saver)
     _agent_llm_config_key = config_key
     return _agent_instance
 
