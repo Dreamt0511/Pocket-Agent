@@ -585,7 +585,7 @@ async def save_memory_endpoint(request: Request):
         return {"ok": True, "type": "fact"}
 
     elif mem_type == "episodic":
-        # 存入 SQLite messages 表，role="memory" 标记为记忆条目
+        # 存入 SQLite messages 表（FTS5 关键词搜索）
         if not conversation_id:
             return {"error": "conversation_id required for episodic"}
         async with aiosqlite.connect(DB_PATH) as db:
@@ -594,6 +594,14 @@ async def save_memory_endpoint(request: Request):
                 (conversation_id, "memory", content, int(time.time() * 1000), max(importance, 2))
             )
             await db.commit()
+        # 同时存入 ChromaDB（向量语义搜索）
+        if _vector_store:
+            metadata = {"tags": ",".join(tags), "importance": importance, "type": "episodic", "conversation_id": conversation_id}
+            _vector_store.add(
+                message_id=hash(content) % (2**31),
+                content=content,
+                metadata=metadata
+            )
         return {"ok": True, "type": "episodic"}
 
     return {"error": f"unknown type: {mem_type}"}

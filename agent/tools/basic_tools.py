@@ -606,23 +606,30 @@ def search_memory(query: str, scope: str = "all") -> str:
     Args:
         query: 搜索关键词或短语
         scope: "fact" 搜索 ChromaDB 中的事实记忆（语义搜索），
-               "episodic" 搜索 SQLite 中的事件记忆（FTS5 关键词搜索），
+               "episodic" 搜索 SQLite + ChromaDB 中的事件记忆（FTS5 + 向量），
                "all" 两者都搜，RRF 混合排序
     """
     try:
-        current_only = scope == "current"
-        conv_id = _current_conversation_id if current_only else None
+        fts_results = []
+        vec_results = []
 
-        # 1. FTS5 搜索
-        fts_results = _fts_search(query, conv_id)
+        if scope == "fact":
+            # 只搜 ChromaDB（事实记忆）
+            vec_results = _vector_search(query)
+        elif scope == "episodic":
+            # 搜 SQLite FTS5 + ChromaDB（事件记忆）
+            fts_results = _fts_search(query)
+            vec_results = _vector_search(query)
+        else:
+            # "all" — 全部搜索
+            fts_results = _fts_search(query)
+            vec_results = _vector_search(query)
 
-        # 2. 向量搜索（仅跨会话时使用，如果 embedding 可用）
-        if not current_only:
-            vec_results = _vector_search(query, conv_id)
-            if vec_results:
-                results = _rrf_merge(fts_results, vec_results)
-            else:
-                results = fts_results
+        # RRF 混合排序
+        if fts_results and vec_results:
+            results = _rrf_merge(fts_results, vec_results)
+        elif vec_results:
+            results = vec_results
         else:
             results = fts_results
 
@@ -631,9 +638,9 @@ def search_memory(query: str, scope: str = "all") -> str:
 
         lines = []
         for msg in results[:20]:
-            role = "用户" if msg["role"] == "user" else "AI"
-            session_tag = f" [会话:{msg.get('conversation_id','')[:8]}]" if not current_only else ""
-            lines.append(f"[{role}]{session_tag} {msg['content']}")
+            role_label = {"user": "用户", "assistant": "AI", "memory": "记忆"}.get(msg.get("role", ""), msg.get("role", ""))
+            session_tag = f" [会话:{msg.get('conversation_id','')[:8]}]" if msg.get("conversation_id") else ""
+            lines.append(f"[{role_label}]{session_tag} {msg['content']}")
         return "\n---\n".join(lines)
     except Exception as e:
         return f"搜索出错: {e}"
