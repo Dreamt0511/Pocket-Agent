@@ -69,6 +69,7 @@ EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
 EMBEDDING_SERVER_URL = os.getenv("EMBEDDING_SERVER_URL", "http://127.0.0.1:8080/v1")
+EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "")
 
 # ==============================
 # 日志配置
