@@ -686,6 +686,15 @@ async def vector_search(q: str, conversation_id: str = None, limit: int = 20):
     return results
 
 
+@app.delete("/memory/{memory_id}")
+async def delete_memory(memory_id: str):
+    """删除指定 ID 的向量记忆"""
+    if not _vector_store:
+        return {"error": "vector store not available"}
+    _vector_store.delete(int(memory_id))
+    return {"ok": True, "deleted": memory_id}
+
+
 @app.post("/memory/save")
 async def save_memory_endpoint(request: Request):
     """保存记忆到对应存储"""
