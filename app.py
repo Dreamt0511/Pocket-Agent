@@ -124,24 +124,20 @@ async def startup():
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")
 
-    # 初始化 ChromaDB 向量存储（可选，未安装则跳过）
-    from agent.embedding import EmbeddingClient, is_chromadb_available
-    if is_chromadb_available():
-        from agent.embedding import VectorStore
-        from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL
-        env_config = _load_env_config()
-        _embedding_client = EmbeddingClient(
-            EMBEDDING_BASE_URL or env_config.get("base_url", ""),
-            EMBEDDING_API_KEY or env_config.get("api_key", ""),
-            EMBEDDING_MODEL
-        )
-        _vector_store = VectorStore(
-            persist_dir=os.path.join(PROJECT_ROOT, "chroma_db"),
-            embedding_client=_embedding_client
-        )
-        logger.info("ChromaDB 向量存储已初始化")
-    else:
-        logger.warning("chromadb 未安装，向量搜索不可用（FTS5 全文搜索正常）")
+    # 初始化 SQLite 向量存储（BGE-M3 本地 embedding）
+    from agent.embedding import EmbeddingClient, VectorStore
+    from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL, EMBEDDING_SERVER_URL
+    env_config = _load_env_config()
+    _embedding_client = EmbeddingClient(
+        EMBEDDING_SERVER_URL or EMBEDDING_BASE_URL or env_config.get("base_url", ""),
+        EMBEDDING_API_KEY or env_config.get("api_key", ""),
+        EMBEDDING_MODEL
+    )
+    _vector_store = VectorStore(
+        db_path=DB_PATH,
+        embedding_client=_embedding_client
+    )
+    logger.info("SQLite 向量存储已初始化")
 
     # 清理低重要性旧消息的 embedding（遗忘机制）
     await _cleanup_old_messages()
@@ -152,7 +148,12 @@ async def startup():
         while True:
             time.sleep(30)
             if time.time() - _last_heartbeat > _HEARTBEAT_TIMEOUT:
-                logger.info(f"心跳超时 {_HEARTBEAT_TIMEOUT}s，自动关闭 uvicorn")
+                logger.info(f"心跳超时 {_HEARTBEAT_TIMEOUT}s，自动关闭服务")
+                # 停止 llama-server embedding 服务
+                try:
+                    subprocess.run(["sh", "-c", "pkill -f 'llama-server.*8080' 2>/dev/null || kill $(pgrep -f 'llama-server.*8080') 2>/dev/null"], timeout=3)
+                except Exception:
+                    pass
                 os.kill(os.getpid(), signal.SIGTERM)
                 break
     threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
@@ -165,7 +166,7 @@ _agent_instance = None
 _agent_llm_config_key = None
 _checkpoint_conn = None  # AsyncSqliteSaver 的底层连接
 _checkpoint_saver = None  # 持久化 checkpointer
-_vector_store = None  # ChromaDB 向量存储
+_vector_store = None  # SQLite 向量存储
 
 
 def _get_or_create_agent(llm_config: dict):
@@ -864,14 +865,19 @@ async def cancel_execution():
 
 @app.post("/shutdown")
 async def shutdown():
-    """关闭 FastAPI 服务自身"""
+    """关闭 FastAPI 服务和 embedding 服务"""
     import os, signal, asyncio
-    # 清理 agent 实例，关闭 HTTP 客户端
+    # 清理 agent 实例
     if _agent_instance is not None:
         try:
             await _agent_instance.cleanup()
         except Exception:
             pass
+    # 停止 llama-server embedding 服务
+    try:
+        subprocess.run(["pkill", "-f", "llama-server.*8080"], timeout=3)
+    except Exception:
+        pass
     async def _die():
         await asyncio.sleep(0.3)
         os.kill(os.getpid(), signal.SIGTERM)

@@ -67,7 +67,8 @@ TASKS_DIR = os.path.join(PROJECT_ROOT, "tasks")
 # ==============================
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
+EMBEDDING_SERVER_URL = os.getenv("EMBEDDING_SERVER_URL", "http://127.0.0.1:8080/v1")
 
 # ==============================
 # 日志配置

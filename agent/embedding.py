@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
-Embedding 客户端 — 通过用户配置的 LLM API 生成向量嵌入
-支持 OpenAI 兼容的 /embeddings 端点
+Embedding 模块 — 通过本地 llama-server 或远程 API 生成向量嵌入
+
+存储方案: SQLite + numpy（替代 ChromaDB，无需编译 Rust 依赖）
 """
 
 import struct
 import math
+import json
+import sqlite3
 import requests
+import numpy as np
 from typing import List, Optional
 
 
 class EmbeddingClient:
-    """通过 LLM API 的 /embeddings 端点生成向量"""
+    """通过 OpenAI 兼容的 /embeddings 端点生成向量"""
 
-    def __init__(self, base_url: str, api_key: str, model: str = "text-embedding-3-small"):
-        """
-        Args:
-            base_url: LLM API 地址（如 https://api.openai.com/v1）
-            api_key: API 密钥
-            model: embedding 模型名称
-        """
+    def __init__(self, base_url: str, api_key: str, model: str = "bge-m3"):
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.model = model
-        self._available: Optional[bool] = None  # 缓存可用性
+        self._available: Optional[bool] = None
 
     def is_available(self) -> bool:
         """检测 API 是否支持 embeddings（结果缓存）"""
@@ -72,7 +70,6 @@ class EmbeddingClient:
             )
             if resp.status_code == 200:
                 data = resp.json()
-                # 按 index 排序，确保顺序一致
                 results = [None] * len(texts)
                 for item in data["data"]:
                     results[item["index"]] = item["embedding"]
@@ -103,50 +100,51 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-try:
-    import chromadb
-    _HAS_CHROMADB = True
-except ImportError:
-    _HAS_CHROMADB = False
-
-
-def is_chromadb_available() -> bool:
-    """chromadb 是否可用"""
-    return _HAS_CHROMADB
-
-
 class VectorStore:
-    """基于 ChromaDB 的向量存储（HNSW 索引）"""
+    """基于 SQLite + numpy 的向量存储（替代 ChromaDB）"""
 
-    def __init__(self, persist_dir: str, embedding_client: EmbeddingClient = None):
+    def __init__(self, db_path: str, embedding_client: EmbeddingClient = None):
         """
         Args:
-            persist_dir: ChromaDB 持久化目录
+            db_path: SQLite 数据库路径（与主数据库共用）
             embedding_client: 用于生成 embedding 的客户端
         """
-        if not _HAS_CHROMADB:
-            raise ImportError("chromadb 未安装，向量搜索不可用。如需使用请安装: pip install chromadb")
-        self.client = chromadb.PersistentClient(path=persist_dir)
-        self.collection = self.client.get_or_create_collection(
-            name="messages",
-            metadata={"hnsw:space": "cosine"}
-        )
+        self.db_path = db_path
         self.embedding_client = embedding_client
+        self._init_table()
 
-    def add(self, message_id: int, content: str, metadata: dict = None):
+    def _init_table(self):
+        """创建 embeddings 表"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS embeddings (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                metadata TEXT,
+                embedding BLOB
+            )""")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def add(self, message_id: int, content: str, metadata: dict = None) -> bool:
         """添加消息到向量索引"""
         if not self.embedding_client or not self.embedding_client.is_available():
             return False
         embedding = self.embedding_client.embed(content)
         if not embedding:
             return False
-        self.collection.add(
-            ids=[str(message_id)],
-            embeddings=[embedding],
-            documents=[content],
-            metadatas=[metadata or {}]
-        )
-        return True
+        blob = EmbeddingClient.embedding_to_blob(embedding)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (id, content, metadata, embedding) VALUES (?, ?, ?, ?)",
+                (str(message_id), content, json.dumps(metadata or {}), blob)
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
     def query(self, text: str, n_results: int = 20, where: dict = None) -> list:
         """语义搜索
@@ -160,29 +158,64 @@ class VectorStore:
         """
         if not self.embedding_client or not self.embedding_client.is_available():
             return []
-        embedding = self.embedding_client.embed(text)
-        if not embedding:
+        query_embedding = self.embedding_client.embed(text)
+        if not query_embedding:
             return []
-        kwargs = {
-            "query_embeddings": [embedding],
-            "n_results": n_results,
-        }
-        if where:
-            kwargs["where"] = where
-        results = self.collection.query(**kwargs)
-        items = []
-        for i in range(len(results["ids"][0])):
-            items.append({
-                "id": results["ids"][0][i],
-                "document": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                "distance": results["distances"][0][i] if results["distances"] else 0,
-            })
-        return items
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute("SELECT id, content, metadata, embedding FROM embeddings").fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return []
+
+        # 过滤（按 metadata 中的 conversation_id）
+        if where and "conversation_id" in where:
+            cid = where["conversation_id"]
+            rows = [r for r in rows if json.loads(r[2]).get("conversation_id") == cid]
+
+        # numpy 批量计算余弦相似度
+        query_vec = np.array(query_embedding, dtype=np.float32)
+        query_norm = np.linalg.norm(query_vec)
+        if query_norm == 0:
+            return []
+
+        ids, documents, metadatas, distances = [], [], [], []
+        for row_id, content, meta_json, blob in rows:
+            try:
+                vec = np.frombuffer(blob, dtype=np.float32)
+            except Exception:
+                continue
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm == 0:
+                sim = 0.0
+            else:
+                sim = float(np.dot(query_vec, vec) / (query_norm * vec_norm))
+            ids.append(row_id)
+            documents.append(content)
+            metadatas.append(json.loads(meta_json))
+            # distance = 1 - similarity（与 ChromaDB 语义一致）
+            distances.append(1.0 - sim)
+
+        # 按 distance 升序排序，取 top-n
+        indices = sorted(range(len(distances)), key=lambda i: distances[i])[:n_results]
+        return [
+            {
+                "id": ids[i],
+                "document": documents[i],
+                "metadata": metadatas[i],
+                "distance": distances[i],
+            }
+            for i in indices
+        ]
 
     def delete(self, message_id: int):
         """删除消息"""
+        conn = sqlite3.connect(self.db_path)
         try:
-            self.collection.delete(ids=[str(message_id)])
-        except Exception:
-            pass
+            conn.execute("DELETE FROM embeddings WHERE id = ?", (str(message_id),))
+            conn.commit()
+        finally:
+            conn.close()

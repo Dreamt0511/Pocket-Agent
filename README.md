@@ -6,7 +6,7 @@
 
 - **LangChain Agent**：使用官方 `create_agent` 创建，支持中间件链
 - **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆 + 程序记忆
-- **混合检索**：FTS5 全文搜索 + ChromaDB 向量搜索，RRF 融合排序
+- **混合检索**：FTS5 全文搜索 + BGE-M3 向量搜索，RRF 融合排序
 - **技能系统**：自动发现 SKILL.md，支持主 Agent 和子 Agent 技能
 - **MCP 集成**：通过 NeuralBridge 控制安卓设备
 - **持久化对话**：AsyncSqliteSaver 保存 LangGraph 状态，重启后恢复
@@ -48,6 +48,37 @@ python main.py
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
+### 嵌入模型（语义检索）
+
+语义检索需要本地 embedding 模型服务。
+
+**前提条件：** 需要编译带 embedding 后端支持的 llama.cpp。
+
+**模型下载：**
+```bash
+# BGE-M3 GGUF（推荐，支持中英文，最大 8192 token）
+# 下载后放到项目根目录下
+wget -O bge-m3-Q4_K_M.gguf \
+  https://hf-mirror.com/gpustack/bge-m3-GGUF/blob/main/bge-m3-Q4_K_M.gguf
+```
+
+**手动启动参数：**
+```bash
+cd ~/llama.cpp
+./build/bin/llama-server \
+  -m "$(find ~/Pocket-Agent -name 'bge-m3*.gguf' -type f | head -1)" \
+  --embedding \
+  -c 8192 \
+  --port 8080 \
+  --host 0.0.0.0 \
+  -np 4 \
+  -b 1024 \
+  -ub 1024 \
+  -t 4
+```
+
+> App 启动时会自动在项目目录下查找 `bge-m3*.gguf` 模型文件并拉起 embedding 服务。不安装模型时，全文搜索（FTS5）仍可用，语义搜索自动跳过。
+
 ## 架构
 
 ```
@@ -56,7 +87,7 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ├── agent/
 │   ├── agent_langchain.py    # LangChainPocketAgent 核心实现
 │   ├── config.py             # 全局配置
-│   ├── embedding.py          # EmbeddingClient + VectorStore（ChromaDB）
+│   ├── embedding.py          # EmbeddingClient + VectorStore（SQLite + numpy）
 │   ├── memory.py             # 用户画像管理
 │   ├── tools/
 │   │   └── basic_tools.py    # 内置工具集
@@ -66,7 +97,7 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 │   │   └── auto-skills/      # 自动沉淀的技能
 │   └── prompts/              # 系统提示词
 ├── memory/                   # 用户画像存储
-├── chroma_db/                # ChromaDB 向量数据库
+├── bge-m3-Q4_K_M.gguf       # BGE-M3 嵌入模型（可选）
 └── pocket_agent.db           # SQLite 数据库
 ```
 
@@ -77,8 +108,8 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 | 层级 | 存储 | 用途 | 工具 |
 |------|------|------|------|
 | 用户画像 | `memory/user_profile.md` | 永久性个人信息 | `update_user_profile` |
-| 事实记忆 | ChromaDB (HNSW) | 项目决定、技术选型 | `save_memory(type="fact")` |
-| 事件记忆 | SQLite FTS5 + ChromaDB | 重要事件结果 | `save_memory(type="episodic")` |
+| 事实记忆 | SQLite 向量索引 | 项目决定、技术选型 | `save_memory(type="fact")` |
+| 事件记忆 | SQLite FTS5 + 向量索引 | 重要事件结果 | `save_memory(type="episodic")` |
 | 程序记忆 | `auto-skills/main/` SKILL.md | 操作流程 | `file_write` |
 
 ### 记忆工具
@@ -179,7 +210,8 @@ curl -X POST http://localhost:8000/memory/save \
 | `MAX_ITERATIONS` | 100 | 最大工具调用轮数 |
 | `RECURSION_LIMIT` | 200 | LangGraph 递归限制 |
 | `MAX_CONTEXT_TOKENS` | 128000 | 上下文窗口大小 |
-| `EMBEDDING_MODEL` | text-embedding-3-small | Embedding 模型 |
+| `EMBEDDING_MODEL` | bge-m3 | Embedding 模型 |
+| `EMBEDDING_SERVER_URL` | http://127.0.0.1:8080/v1 | 本地 embedding 服务地址 |
 
 ### 环境变量
 
@@ -191,12 +223,13 @@ curl -X POST http://localhost:8000/memory/save \
 | `EMBEDDING_BASE_URL` | Embedding API 地址（留空复用 LLM） |
 | `EMBEDDING_API_KEY` | Embedding API 密钥 |
 | `EMBEDDING_MODEL` | Embedding 模型名称 |
+| `EMBEDDING_SERVER_URL` | 本地 embedding 服务地址（默认 localhost:8080） |
 
 ## 依赖
 
 - Python 3.10+
 - LangChain / LangGraph
-- ChromaDB（向量存储）
+- numpy（向量计算）
 - FastAPI / Uvicorn（HTTP 服务）
 - aiosqlite（异步 SQLite）
 - rich（终端 UI）
