@@ -26,7 +26,7 @@ app = FastAPI(title="Pocket-Agent API")
 
 # ─── 心跳机制 ──────────────────────────────────
 _last_heartbeat = time.time()
-_HEARTBEAT_TIMEOUT = 90  # 秒，超过此时间未收到心跳则自动关闭
+_HEARTBEAT_TIMEOUT = 60  # 秒，超过此时间未收到心跳则自动关闭
 
 
 async def _add_to_vector_store(message_id: int, content: str, conversation_id: str, importance: int):
