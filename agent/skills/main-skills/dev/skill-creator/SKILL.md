@@ -21,14 +21,7 @@ description: 主Agent沉淀技能——判断流程是否值得沉淀，将解�
 - 一次性的临时操作
 - 已有相同功能的技能存在
 
-## 第二步：读取已有技能格式
-
-**必须先读取技能创建规范**，用 file_read 读取：
-`agent/skills/executor-skills/skill-creator/SKILL.md`
-
-对照其中的格式要求编写，确保格式一致。
-
-## 第三步：编写技能
+## 第二步：编写技能
 
 技能写入 `agent/skills/auto-skills/main/<技能名称>/SKILL.md`
 
@@ -69,7 +62,7 @@ description: <一句话描述，100字以内>
 - 相关命令
 ```
 
-## 第四步：沉淀为程序记忆
+## 第三步：沉淀为程序记忆
 
 如果流程不适合写成独立技能（比如只是一个小技巧），用 save_memory 存为事件记忆即可：
 `save_memory(content="学到的技巧: ...", type="episodic", tags=["技巧"])`
