@@ -96,7 +96,7 @@ async def _cleanup_old_messages():
             # 查询需要清理的消息 ID
             old_message_ids = await db.execute_fetchall(
                 """SELECT id FROM messages
-                   WHERE importance = 1 AND timestamp < ?""",
+                   WHERE importance <= 2 AND timestamp < ?""",
                 (thirty_days_ago,)
             )
             # 同时清理向量索引
@@ -614,8 +614,7 @@ async def save_memory_endpoint(request: Request):
     body = await request.json()
     content = body.get("content", "")
     mem_type = body.get("type", "fact")
-    tags = body.get("tags", [])
-    importance = body.get("importance", 1)
+    importance = max(1, min(10, body.get("importance", 3)))
     conversation_id = body.get("conversation_id")
 
     if not content:
@@ -624,7 +623,7 @@ async def save_memory_endpoint(request: Request):
     if mem_type == "fact":
         # 存入 ChromaDB
         if _vector_store:
-            metadata = {"tags": ",".join(tags), "importance": importance, "type": "fact"}
+            metadata = {"importance": importance, "type": "fact"}
             _vector_store.add(
                 message_id=hash(content) % (2**31),  # 用内容 hash 作为 ID
                 content=content,
@@ -639,12 +638,12 @@ async def save_memory_endpoint(request: Request):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, "memory", content, int(time.time() * 1000), max(importance, 2))
+                (conversation_id, "memory", content, int(time.time() * 1000), importance)
             )
             await db.commit()
         # 同时存入 ChromaDB（向量语义搜索）
         if _vector_store:
-            metadata = {"tags": ",".join(tags), "importance": importance, "type": "episodic", "conversation_id": conversation_id}
+            metadata = {"importance": importance, "type": "episodic", "conversation_id": conversation_id}
             _vector_store.add(
                 message_id=hash(content) % (2**31),
                 content=content,
