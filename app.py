@@ -157,6 +157,9 @@ async def startup():
         db_path=DB_PATH,
         embedding_client=_embedding_client
     )
+    # 注入引用到工具模块，避免 HTTP 自调用死锁
+    from agent.tools.basic_tools import set_memory_refs
+    set_memory_refs(_vector_store, DB_PATH)
     logger.info("SQLite 向量存储已初始化")
 
     # 清理低重要性旧消息的 embedding（遗忘机制）

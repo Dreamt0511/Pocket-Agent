@@ -7,10 +7,20 @@ import json
 import os
 import re
 import subprocess
+import sqlite3
 import time
 from typing import Dict, List, Optional
 from langchain_core.tools import tool
 import requests
+
+# 由 app.py startup 注入，避免 HTTP 自调用死锁
+_vector_store_ref = None
+_db_path_ref = None
+
+def set_memory_refs(vector_store, db_path):
+    global _vector_store_ref, _db_path_ref
+    _vector_store_ref = vector_store
+    _db_path_ref = db_path
 
 
 @tool
@@ -333,36 +343,49 @@ def set_current_conversation_id(conversation_id: str):
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
 def _fts_search(query: str, conversation_id: str = None) -> list:
-    """FTS5 全文搜索"""
-    params = {"q": query}
-    if conversation_id:
-        url = f"http://127.0.0.1:8000/conversations/{conversation_id}/search"
-    else:
-        # 跨会话：用任意 conversation_id 但 cross_session=True
-        url = "http://127.0.0.1:8000/conversations/_/search"
-        params["cross_session"] = "true"
-    resp = requests.get(url, params=params, timeout=5)
-    if resp.status_code == 200:
-        return resp.json()
-    return []
+    """FTS5 全文搜索（直接查询，避免 HTTP 自调用死锁）"""
+    if not _db_path_ref:
+        return []
+    try:
+        conn = sqlite3.connect(_db_path_ref, timeout=10)
+        conn.execute("PRAGMA busy_timeout=5000")
+        if conversation_id:
+            rows = conn.execute(
+                """SELECT m.id, m.conversation_id, m.role, m.content, m.importance
+                   FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
+                   WHERE messages_fts MATCH ? AND m.conversation_id = ?
+                   ORDER BY rank LIMIT 20""",
+                (query, conversation_id)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT m.id, m.conversation_id, m.role, m.content, m.importance
+                   FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
+                   WHERE messages_fts MATCH ?
+                   ORDER BY rank LIMIT 20""",
+                (query,)
+            ).fetchall()
+        conn.close()
+        return [{"conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4]} for r in rows]
+    except Exception:
+        return []
 
 def _vector_search(query: str, conversation_id: str = None) -> list:
-    """向量语义搜索"""
-    params = {"q": query, "limit": 20}
-    if conversation_id:
-        params["conversation_id"] = conversation_id
-    resp = requests.get("http://127.0.0.1:8000/messages/vector_search", params=params, timeout=10)
-    if resp.status_code == 200:
-        results = resp.json()
-        # 转换格式以匹配 FTS5 结果格式
+    """向量语义搜索（直接查询，避免 HTTP 自调用死锁）"""
+    if not _vector_store_ref:
+        return []
+    try:
+        where = {"conversation_id": conversation_id} if conversation_id else None
+        results = _vector_store_ref.query(query, n_results=20, where=where)
         return [{
             "role": r.get("metadata", {}).get("role", ""),
             "content": r.get("document", ""),
             "conversation_id": r.get("metadata", {}).get("conversation_id", ""),
             "importance": r.get("metadata", {}).get("importance", 1),
-            "similarity": 1 - r.get("distance", 0),  # cosine distance → similarity
+            "similarity": 1 - r.get("distance", 0),
         } for r in results]
-    return []
+    except Exception:
+        return []
 
 def _rrf_merge(fts_results: list, vec_results: list, k: int = 60) -> list:
     """Reciprocal Rank Fusion 混合排序（参考 EchoMind 设计）"""
@@ -559,26 +582,36 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
     try:
         t0 = time.monotonic()
         if type == "fact":
-            resp = requests.post(
-                "http://127.0.0.1:8000/memory/save",
-                json={"content": content, "type": "fact", "importance": importance},
-                timeout=30
-            )
+            if _vector_store_ref:
+                _vector_store_ref.add(
+                    message_id=hash(content) % (2**31),
+                    content=content,
+                    metadata={"importance": importance, "type": "fact"}
+                )
             elapsed = round(time.monotonic() - t0, 2)
-            if resp.status_code == 200:
-                return f"已保存事实记忆: {content[:50]}... (耗时 {elapsed}s)"
-            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]} (耗时 {elapsed}s)"
+            return f"已保存事实记忆: {content[:50]}... (耗时 {elapsed}s)"
 
         elif type == "episodic":
-            resp = requests.post(
-                "http://127.0.0.1:8000/memory/save",
-                json={"content": content, "type": "episodic", "importance": importance, "conversation_id": _current_conversation_id},
-                timeout=30
-            )
+            if not _current_conversation_id:
+                return "保存失败: episodic 类型需要 conversation_id"
+            if _db_path_ref:
+                conn = sqlite3.connect(_db_path_ref, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                    (_current_conversation_id, "memory", content, int(time.time() * 1000), importance)
+                )
+                conn.commit()
+                conn.close()
+            if _vector_store_ref:
+                _vector_store_ref.add(
+                    message_id=hash(content) % (2**31),
+                    content=content,
+                    metadata={"importance": importance, "type": "episodic", "conversation_id": _current_conversation_id}
+                )
             elapsed = round(time.monotonic() - t0, 2)
-            if resp.status_code == 200:
-                return f"已保存事件记忆: {content[:50]}... (耗时 {elapsed}s)"
-            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]} (耗时 {elapsed}s)"
+            return f"已保存事件记忆: {content[:50]}... (耗时 {elapsed}s)"
 
         else:
             return "type 必须是 'fact' 或 'episodic'"
