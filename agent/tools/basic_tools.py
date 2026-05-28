@@ -527,7 +527,7 @@ async def tts_speak(text: str) -> str:
 
 
 @tool
-def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
+def save_memory(content: str, type: str = "fact", tags: str = "", importance: int = 1) -> str:
     """保存重要信息到记忆系统。只在值得记的内容时调用，不要每条对话都存。
 
     何时调用：
@@ -544,23 +544,17 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
     Args:
         content: 要记忆的内容，简洁明确
         type: "fact" 存入向量数据库（语义搜索），"episodic" 存入消息表（关键词搜索）
-        importance: 重要性 1-10，自行判断打分。大多数记忆应在 3-5 分，只有真正影响后续决策的才值得 7 分以上。
-
-        打分参考（仅供大致参考，不必死板遵守）：
-        - 1-2: 临时性信息，很快就会过时
-        - 3-4: 一般有用，比如用户的某个偏好、一次普通操作的结果
-        - 5-6: 比较重要，比如项目架构决定、关键技术选型
-        - 7-8: 很重要，比如影响后续多次决策的结论、重大问题的根因
-        - 9-10: 极其重要，比如用户明确强调的关键需求、不可逆的重大决定
-
-        注意：不要每条都打高分，大部分记忆 3-5 分即可。高分要留给真正值得反复回忆的内容。
+        tags: 逗号分隔的标签，如 "项目,SQLite,决定"
+        importance: 重要性 1-3，3 最重要
     """
     try:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+
         if type == "fact":
             # 存入 ChromaDB（语义搜索）
             resp = requests.post(
                 "http://127.0.0.1:8000/memory/save",
-                json={"content": content, "type": "fact", "importance": importance},
+                json={"content": content, "type": "fact", "tags": tag_list, "importance": importance},
                 timeout=5
             )
             if resp.status_code == 200:
@@ -571,7 +565,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             # 存入 SQLite messages 表（关键词搜索），用特殊 role 标记
             resp = requests.post(
                 "http://127.0.0.1:8000/memory/save",
-                json={"content": content, "type": "episodic", "importance": importance, "conversation_id": _current_conversation_id},
+                json={"content": content, "type": "episodic", "tags": tag_list, "importance": importance, "conversation_id": _current_conversation_id},
                 timeout=5
             )
             if resp.status_code == 200:
@@ -586,27 +580,23 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
 
 @tool
 def search_memory(query: str, scope: str = "all") -> str:
-    """搜索历史消息和记忆找回遗忘的细节。
+    """搜索历史消息和跨会话记忆，找回遗忘的细节。当你不确定某个信息、需要回忆之前的对话内容、或想查找用户之前提到过的决定/偏好时，应该调用此工具。
 
     Args:
-        query: 搜索关键词或短语
-        scope: "fact" 搜索 ChromaDB 中的事实记忆（语义搜索），
-               "episodic" 搜索 SQLite + ChromaDB 中的事件记忆（FTS5 + 向量），
-               "all" 两者都搜，RRF 混合排序
+        query: 搜索关键词或短语，尽量具体（比如 "SQLite 配置" 而不是 "数据库"）
+        scope: 搜索范围
+               - "all"（默认）: 搜索全部——当前会话记录 + 跨会话的事实记忆和事件记忆，混合排序返回最相关的结果
+               - "session": 只搜索当前会话的对话记录，适合回溯本轮对话中提到过的细节
     """
     try:
         fts_results = []
         vec_results = []
 
-        if scope == "fact":
-            # 只搜 ChromaDB（事实记忆）
-            vec_results = _vector_search(query)
-        elif scope == "episodic":
-            # 搜 SQLite FTS5 + ChromaDB（事件记忆）
-            fts_results = _fts_search(query)
-            vec_results = _vector_search(query)
+        if scope == "session":
+            # 只搜当前会话
+            fts_results = _fts_search(query, conversation_id=_current_conversation_id)
         else:
-            # "all" — 全部搜索
+            # "all" — 当前会话 + 跨会话记忆
             fts_results = _fts_search(query)
             vec_results = _vector_search(query)
 
