@@ -320,6 +320,14 @@ def set_memory_instance(memory):
     global _memory_instance
     _memory_instance = memory
 
+# 当前会话ID（用于会话历史搜索）
+_current_conversation_id = None
+
+def set_current_conversation_id(conversation_id: str):
+    """设置当前会话ID，供 read_conversation_history 工具使用"""
+    global _current_conversation_id
+    _current_conversation_id = conversation_id
+
 @tool
 async def update_user_profile(section: str, content: str) -> str:
     """
@@ -461,6 +469,35 @@ async def tts_speak(text: str) -> str:
         return "⚠️ 执行失败"
 
 
+@tool
+def read_conversation_history(query: str) -> str:
+    """搜索当前会话的历史消息，找回被压缩遗忘的细节。当用户提到之前说过的内容但你不记得时使用。
+
+    Args:
+        query: 搜索关键词或短语
+    """
+    try:
+        if not _current_conversation_id:
+            return "❌ 无法获取当前会话ID，请确保会话已初始化"
+        resp = requests.get(
+            f"http://127.0.0.1:8000/conversations/{_current_conversation_id}/search",
+            params={"q": query},
+            timeout=5
+        )
+        if resp.status_code != 200:
+            return f"搜索失败: HTTP {resp.status_code}"
+        results = resp.json()
+        if not results:
+            return "未找到相关消息"
+        lines = []
+        for msg in results:
+            role = "用户" if msg["role"] == "user" else "AI"
+            lines.append(f"[{role}] {msg['content']}")
+        return "\n---\n".join(lines)
+    except Exception as e:
+        return f"搜索出错: {e}"
+
+
 # ── 后台任务派发 ──────────────────────────────────────────────
 # 当主Agent调用delegate_task时，请求被暂存到此队列
 # agent_langchain.py 的 run_conversation 会在流结束后读取并启动后台执行器
@@ -538,5 +575,5 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
 
 
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, read_conversation_history
 ]

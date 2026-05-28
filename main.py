@@ -8,7 +8,6 @@ import asyncio
 import sys
 import os
 from datetime import datetime
-from agent.memory import LongTermMemory
 from agent.ui import PocketUI
 from agent.agent_langchain import LangChainPocketAgent
 from dotenv import load_dotenv
@@ -61,9 +60,6 @@ async def main():
         ui=ui
     )
 
-    # 初始化记忆系统
-    memory = LongTermMemory(memory_dir=os.path.join(PROJECT_ROOT, "memory"))
-
     # 互动式对话循环
     tool_call_count = 0
     current_task = None  # 记录当前正在执行的任务
@@ -107,17 +103,6 @@ async def main():
             if not user_input.strip():
                 continue
 
-            # 记录用户输入到记忆
-            try:
-                memory.add_memory(
-                    content=f"用户问：{user_input}",
-                    category="对话",
-                    importance=2,
-                    tags=["用户输入"]
-                )
-            except Exception:
-                pass
-
             # ── 真正的 agent loop ──
             # ui.print_info("Agent 思考中...")  # 减少冗余提示
 
@@ -147,17 +132,6 @@ async def main():
                 # 如果使用了流式输出，内容已实时显示，不需要再用Panel显示
                 if not used_streaming:
                     ui.print_agent_response(response)
-
-                # 记录AI回复到记忆
-                try:
-                    memory.add_memory(
-                        content=f"AI回答：{response}",
-                        category="对话",
-                        importance=1,
-                        tags=["AI回复"]
-                    )
-                except Exception:
-                    pass
 
                 tool_call_count += call_count
                 if tool_call_count % 10 == 0 and call_count > 0:

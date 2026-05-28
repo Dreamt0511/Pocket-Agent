@@ -49,6 +49,24 @@ async def _init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+
+        # FTS5 虚拟表 —— 会话历史全文搜索
+        await db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id)
+        """)
+        # INSERT 同步触发器
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
+        # DELETE 同步触发器
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END
+        """)
+
         await db.commit()
 
 
@@ -175,6 +193,10 @@ async def chat(request: Request):
     message = data.get("message", "")
     req_config = data.get("config", {})
     conversation_id = data.get("conversation_id", "default-session")
+
+    # 设置当前会话ID，供 read_conversation_history 工具使用
+    from agent.tools.basic_tools import set_current_conversation_id
+    set_current_conversation_id(conversation_id)
 
     # 合并配置：.env 为基础，请求参数覆盖（优先级最高）
     llm_config = {**_load_env_config(), **req_config}
@@ -414,6 +436,25 @@ async def get_messages(conversation_id: str):
             }
             for row in rows
         ]
+
+
+@app.get("/conversations/{conversation_id}/search")
+async def search_messages(conversation_id: str, q: str):
+    """FTS5 全文搜索指定会话的消息"""
+    if not q.strip():
+        return []
+    # 转义 FTS5 特殊字符，用双引号包裹整个 query
+    safe_q = f'"{q}"'
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await db.execute_fetchall(
+            """SELECT m.role, m.content, m.timestamp
+               FROM messages_fts fts
+               JOIN messages m ON fts.rowid = m.id
+               WHERE messages_fts MATCH ? AND m.conversation_id = ?
+               ORDER BY rank LIMIT 20""",
+            (safe_q, conversation_id)
+        )
+        return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
 
 
 @app.delete("/conversations/{conversation_id}")

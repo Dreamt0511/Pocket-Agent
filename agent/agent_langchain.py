@@ -43,7 +43,7 @@ from .config import (
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
 from .logger import AgentLogger
-from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id
 from .prompts.executor_system import executor_system_prompt
 from .prompts.executor_enhance import prompt as executor_enhance_prompt
 
@@ -473,6 +473,7 @@ class LangChainPocketAgent:
         self.base_system_prompt = system_prompt
         self.max_iterations = max_iterations
         self.llm_config = llm_config or {}
+        self.checkpointer = checkpointer
 
         # 初始化LLM
         self._init_llm()
@@ -722,7 +723,8 @@ class LangChainPocketAgent:
         ]
 
         # 持久化存储 — 使用外部传入的 AsyncSqliteSaver（app.py 初始化）
-        self.checkpointer = checkpointer or MemorySaver()
+        if self.checkpointer is None:
+            self.checkpointer = MemorySaver()
 
         # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
         self._system_prompt = enhanced_system_prompt
