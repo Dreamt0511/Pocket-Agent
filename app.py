@@ -25,9 +25,10 @@ DB_PATH = os.path.join(PROJECT_ROOT, "pocket_agent.db")
 
 @contextlib.asynccontextmanager
 async def get_db():
-    """获取带 busy_timeout 的数据库连接"""
+    """获取带 WAL + busy_timeout 的数据库连接"""
     db = await aiosqlite.connect(DB_PATH)
-    await db.execute("PRAGMA busy_timeout=5000")
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=30000")
     try:
         yield db
     finally:
@@ -57,8 +58,6 @@ async def _add_to_vector_store(message_id: int, content: str, conversation_id: s
 async def _init_db():
     """创建会话和消息表（如果不存在）"""
     async with get_db() as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA busy_timeout=5000")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
@@ -128,12 +127,19 @@ async def _cleanup_old_messages():
 @app.on_event("startup")
 async def startup():
     global _checkpoint_conn, _checkpoint_saver, _vector_store
+    # 同步强制设置 WAL 模式（确保在任何异步连接之前生效）
+    _sync_conn = sqlite3.connect(DB_PATH, timeout=30)
+    _sync_conn.execute("PRAGMA journal_mode=WAL")
+    _sync_conn.execute("PRAGMA busy_timeout=30000")
+    _sync_conn.close()
+    logger.info("数据库 WAL 模式已强制设置")
     await _init_db()
     # 初始化持久化 checkpointer（AsyncSqliteSaver）
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     _checkpoint_conn = await aiosqlite.connect(DB_PATH)
-    await _checkpoint_conn.execute("PRAGMA busy_timeout=5000")
+    await _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+    await _checkpoint_conn.execute("PRAGMA busy_timeout=30000")
     _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")

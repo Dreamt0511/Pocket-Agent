@@ -115,9 +115,9 @@ class VectorStore:
 
     def _get_conn(self):
         """获取带 WAL 模式和 busy_timeout 的连接"""
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_table(self):
