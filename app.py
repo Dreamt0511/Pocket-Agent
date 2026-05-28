@@ -122,11 +122,11 @@ async def startup():
 
     # 初始化 ChromaDB 向量存储
     from agent.embedding import EmbeddingClient, VectorStore
-    from agent.config import EMBEDDING_MODEL
+    from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL
     env_config = _load_env_config()
     _embedding_client = EmbeddingClient(
-        env_config.get("base_url", ""),
-        env_config.get("api_key", ""),
+        EMBEDDING_BASE_URL or env_config.get("base_url", ""),
+        EMBEDDING_API_KEY or env_config.get("api_key", ""),
         EMBEDDING_MODEL
     )
     _vector_store = VectorStore(

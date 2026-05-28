@@ -65,6 +65,8 @@ TASKS_DIR = os.path.join(PROJECT_ROOT, "tasks")
 # ==============================
 # Embedding 配置
 # ==============================
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 # ==============================
