@@ -266,28 +266,57 @@ async def version():
     return {"version": sha}
 
 
-@app.get("/version/history")
-async def version_history(limit: int = 10):
-    """返回最近的 git commit 历史"""
+VERSION_HISTORY_FILE = os.path.expanduser("~/.pocket-agent-versions")
+MAX_VERSION_HISTORY = 5
+
+
+def _get_current_commit_info():
+    """获取当前 commit 的 sha、message、timestamp"""
     try:
         result = subprocess.run(
-            ["git", "log", f"--oneline", f"-{limit}", "--format=%H|%h|%s|%at"],
+            ["git", "log", "-1", "--format=%h|%s|%at"],
             capture_output=True, text=True, cwd=PROJECT_ROOT
         )
-        if result.returncode != 0:
-            return {"history": []}
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|", 2)
+            if len(parts) == 3:
+                return {"sha": parts[0], "message": parts[1], "timestamp": int(parts[2]) * 1000}
+    except Exception:
+        pass
+    return None
+
+
+def _record_installed_version():
+    """将当前版本记录到安装历史文件（最多保留 MAX_VERSION_HISTORY 条）"""
+    info = _get_current_commit_info()
+    if not info:
+        return
+    try:
         history = []
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            parts = line.split("|", 3)
-            if len(parts) == 4:
-                history.append({
-                    "sha": parts[1],
-                    "message": parts[2],
-                    "timestamp": int(parts[3]) * 1000
-                })
-        return {"history": history}
+        if os.path.isfile(VERSION_HISTORY_FILE):
+            with open(VERSION_HISTORY_FILE) as f:
+                history = json.load(f)
+        # 去重：如果当前 SHA 已在列表中，先移除
+        history = [h for h in history if h["sha"] != info["sha"]]
+        history.insert(0, info)
+        history = history[:MAX_VERSION_HISTORY]
+        with open(VERSION_HISTORY_FILE, "w") as f:
+            json.dump(history, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+@app.get("/version/history")
+async def version_history():
+    """返回用户安装过的版本历史（最多 5 个）"""
+    try:
+        if os.path.isfile(VERSION_HISTORY_FILE):
+            with open(VERSION_HISTORY_FILE) as f:
+                history = json.load(f)
+            return {"history": history}
+        # 文件不存在时，返回当前版本作为唯一记录
+        info = _get_current_commit_info()
+        return {"history": [info] if info else []}
     except Exception as e:
         return {"history": [], "error": str(e)}
 
@@ -306,6 +335,7 @@ async def version_rollback(request: Request):
         )
         if result.returncode != 0:
             return {"status": "error", "message": result.stderr.strip()}
+        _record_installed_version()
         return {"status": "ok", "version": sha}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -479,6 +509,10 @@ async def sync(request: Request):
         "output": result.stdout,
         "error": result.stderr,
     }
+
+    # 拉取成功后记录版本
+    if result.returncode == 0:
+        _record_installed_version()
 
     # 拉取成功后检查 requirements.txt 是否有变化
     if result.returncode == 0 and os.path.isfile(req_file):
