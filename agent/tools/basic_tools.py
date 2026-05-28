@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from typing import Dict, List, Optional
 from langchain_core.tools import tool
 import requests
@@ -556,15 +557,17 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
         注意：不要每条都打高分，大部分记忆 3-5 分即可。高分要留给真正值得反复回忆的内容。
     """
     try:
+        t0 = time.monotonic()
         if type == "fact":
             resp = requests.post(
                 "http://127.0.0.1:8000/memory/save",
                 json={"content": content, "type": "fact", "importance": importance},
                 timeout=30
             )
+            elapsed = round(time.monotonic() - t0, 2)
             if resp.status_code == 200:
-                return f"已保存事实记忆: {content[:50]}..."
-            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]}"
+                return f"已保存事实记忆: {content[:50]}... (耗时 {elapsed}s)"
+            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]} (耗时 {elapsed}s)"
 
         elif type == "episodic":
             resp = requests.post(
@@ -572,14 +575,16 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
                 json={"content": content, "type": "episodic", "importance": importance, "conversation_id": _current_conversation_id},
                 timeout=30
             )
+            elapsed = round(time.monotonic() - t0, 2)
             if resp.status_code == 200:
-                return f"已保存事件记忆: {content[:50]}..."
-            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]}"
+                return f"已保存事件记忆: {content[:50]}... (耗时 {elapsed}s)"
+            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]} (耗时 {elapsed}s)"
 
         else:
             return "type 必须是 'fact' 或 'episodic'"
     except Exception as e:
-        return f"保存出错: {e}"
+        elapsed = round(time.monotonic() - t0, 2)
+        return f"保存出错: {e} (耗时 {elapsed}s)"
 
 
 @tool
