@@ -113,9 +113,16 @@ class VectorStore:
         self.embedding_client = embedding_client
         self._init_table()
 
+    def _get_conn(self):
+        """获取带 WAL 模式和 busy_timeout 的连接"""
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
     def _init_table(self):
         """创建 embeddings 表"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         try:
             conn.execute("""CREATE TABLE IF NOT EXISTS embeddings (
                 id TEXT PRIMARY KEY,
@@ -135,7 +142,7 @@ class VectorStore:
         if not embedding:
             return False
         blob = EmbeddingClient.embedding_to_blob(embedding)
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings (id, content, metadata, embedding) VALUES (?, ?, ?, ?)",
@@ -162,7 +169,7 @@ class VectorStore:
         if not query_embedding:
             return []
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         try:
             rows = conn.execute("SELECT id, content, metadata, embedding FROM embeddings").fetchall()
         finally:
@@ -213,7 +220,7 @@ class VectorStore:
 
     def delete(self, message_id: int):
         """删除消息"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_conn()
         try:
             conn.execute("DELETE FROM embeddings WHERE id = ?", (str(message_id),))
             conn.commit()
