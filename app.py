@@ -242,6 +242,51 @@ async def version():
     return {"version": sha}
 
 
+@app.get("/version/history")
+async def version_history(limit: int = 10):
+    """返回最近的 git commit 历史"""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--oneline", f"-{limit}", "--format=%H|%h|%s|%at"],
+            capture_output=True, text=True, cwd=PROJECT_ROOT
+        )
+        if result.returncode != 0:
+            return {"history": []}
+        history = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("|", 3)
+            if len(parts) == 4:
+                history.append({
+                    "sha": parts[1],
+                    "message": parts[2],
+                    "timestamp": int(parts[3]) * 1000
+                })
+        return {"history": history}
+    except Exception as e:
+        return {"history": [], "error": str(e)}
+
+
+@app.post("/version/rollback")
+async def version_rollback(request: Request):
+    """回退到指定 commit"""
+    body = await request.json()
+    sha = body.get("sha", "").strip()
+    if not sha:
+        return {"status": "error", "message": "缺少 sha 参数"}
+    try:
+        result = subprocess.run(
+            ["git", "checkout", sha],
+            capture_output=True, text=True, cwd=PROJECT_ROOT
+        )
+        if result.returncode != 0:
+            return {"status": "error", "message": result.stderr.strip()}
+        return {"status": "ok", "version": sha}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 # ─── 安装依赖 ─────────────────────────────────
 
 @app.post("/setup")
