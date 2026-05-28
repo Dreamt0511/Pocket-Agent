@@ -101,3 +101,77 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+import chromadb
+
+
+class VectorStore:
+    """基于 ChromaDB 的向量存储（HNSW 索引）"""
+
+    def __init__(self, persist_dir: str, embedding_client: EmbeddingClient = None):
+        """
+        Args:
+            persist_dir: ChromaDB 持久化目录
+            embedding_client: 用于生成 embedding 的客户端
+        """
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self.client.get_or_create_collection(
+            name="messages",
+            metadata={"hnsw:space": "cosine"}
+        )
+        self.embedding_client = embedding_client
+
+    def add(self, message_id: int, content: str, metadata: dict = None):
+        """添加消息到向量索引"""
+        if not self.embedding_client or not self.embedding_client.is_available():
+            return False
+        embedding = self.embedding_client.embed(content)
+        if not embedding:
+            return False
+        self.collection.add(
+            ids=[str(message_id)],
+            embeddings=[embedding],
+            documents=[content],
+            metadatas=[metadata or {}]
+        )
+        return True
+
+    def query(self, text: str, n_results: int = 20, where: dict = None) -> list:
+        """语义搜索
+
+        Args:
+            text: 查询文本
+            n_results: 返回结果数
+            where: 过滤条件（如 {"conversation_id": "xxx"}）
+        Returns:
+            [{"id": str, "document": str, "metadata": dict, "distance": float}, ...]
+        """
+        if not self.embedding_client or not self.embedding_client.is_available():
+            return []
+        embedding = self.embedding_client.embed(text)
+        if not embedding:
+            return []
+        kwargs = {
+            "query_embeddings": [embedding],
+            "n_results": n_results,
+        }
+        if where:
+            kwargs["where"] = where
+        results = self.collection.query(**kwargs)
+        items = []
+        for i in range(len(results["ids"][0])):
+            items.append({
+                "id": results["ids"][0][i],
+                "document": results["documents"][0][i],
+                "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+                "distance": results["distances"][0][i] if results["distances"] else 0,
+            })
+        return items
+
+    def delete(self, message_id: int):
+        """删除消息"""
+        try:
+            self.collection.delete(ids=[str(message_id)])
+        except Exception:
+            pass

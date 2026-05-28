@@ -25,6 +25,18 @@ DB_PATH = os.path.join(PROJECT_ROOT, "pocket_agent.db")
 app = FastAPI(title="Pocket-Agent API")
 
 
+async def _add_to_vector_store(message_id: int, content: str, conversation_id: str, importance: int):
+    """异步添加消息到向量索引"""
+    try:
+        if _vector_store:
+            _vector_store.add(message_id, content, {
+                "conversation_id": conversation_id,
+                "importance": importance
+            })
+    except Exception:
+        logger.warning(f"向量索引添加失败: message_id={message_id}")
+
+
 # ─── SQLite 初始化（会话 + 消息表）──────────────
 
 async def _init_db():
@@ -56,15 +68,6 @@ async def _init_db():
         except Exception:
             pass  # duplicate column — 已存在
 
-        # 向量嵌入表
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS message_embeddings (
-                message_id INTEGER PRIMARY KEY,
-                embedding BLOB NOT NULL,
-                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-            )
-        """)
-
         # FTS5 虚拟表 —— 会话历史全文搜索
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id)
@@ -86,27 +89,28 @@ async def _init_db():
 
 
 async def _cleanup_old_messages():
-    """清理低重要性旧消息的 embedding（保留策略：30天+importance=1 的释放embedding）"""
+    """清理低重要性旧消息的向量索引（保留策略：30天+importance=1 的释放embedding）"""
     thirty_days_ago = int((time.time() - 30 * 24 * 3600) * 1000)
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """DELETE FROM message_embeddings
-                   WHERE message_id IN (
-                       SELECT id FROM messages
-                       WHERE importance = 1 AND timestamp < ?
-                   )""",
+            # 查询需要清理的消息 ID
+            old_message_ids = await db.execute_fetchall(
+                """SELECT id FROM messages
+                   WHERE importance = 1 AND timestamp < ?""",
                 (thirty_days_ago,)
             )
-            await db.commit()
-            logger.info("已清理低重要性旧消息的 embedding")
+            # 同时清理向量索引
+            if _vector_store:
+                for row in old_message_ids:
+                    _vector_store.delete(row[0])
+            logger.info(f"已清理 {len(old_message_ids)} 条低重要性旧消息的向量索引")
     except Exception:
-        logger.warning("清理旧消息 embedding 失败（表可能不存在）", exc_info=True)
+        logger.warning("清理旧消息向量索引失败", exc_info=True)
 
 
 @app.on_event("startup")
 async def startup():
-    global _checkpoint_conn, _checkpoint_saver
+    global _checkpoint_conn, _checkpoint_saver, _vector_store
     await _init_db()
     # 初始化持久化 checkpointer（AsyncSqliteSaver）
     import aiosqlite
@@ -115,6 +119,22 @@ async def startup():
     _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")
+
+    # 初始化 ChromaDB 向量存储
+    from agent.embedding import EmbeddingClient, VectorStore
+    from agent.config import EMBEDDING_MODEL
+    env_config = _load_env_config()
+    _embedding_client = EmbeddingClient(
+        env_config.get("base_url", ""),
+        env_config.get("api_key", ""),
+        EMBEDDING_MODEL
+    )
+    _vector_store = VectorStore(
+        persist_dir=os.path.join(PROJECT_ROOT, "chroma_db"),
+        embedding_client=_embedding_client
+    )
+    logger.info("ChromaDB 向量存储已初始化")
+
     # 清理低重要性旧消息的 embedding（遗忘机制）
     await _cleanup_old_messages()
 
@@ -125,6 +145,7 @@ _agent_instance = None
 _agent_llm_config_key = None
 _checkpoint_conn = None  # AsyncSqliteSaver 的底层连接
 _checkpoint_saver = None  # 持久化 checkpointer
+_vector_store = None  # ChromaDB 向量存储
 
 
 def _get_or_create_agent(llm_config: dict):
@@ -260,11 +281,16 @@ async def chat(request: Request):
                 (now, conversation_id)
             )
         # 保存用户消息
-        await db.execute(
+        cursor = await db.execute(
             "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
             (conversation_id, "user", message, now, importance)
         )
         await db.commit()
+        user_message_id = cursor.lastrowid
+
+    # 异步添加到向量索引（不阻塞响应）
+    import asyncio
+    asyncio.create_task(_add_to_vector_store(user_message_id, message, conversation_id, importance))
 
     async def generate():
         global _cancel_requested
@@ -317,11 +343,14 @@ async def chat(request: Request):
         if full_response:
             try:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
+                    cursor = await db.execute(
                         "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
                         (conversation_id, "assistant", full_response, int(time.time() * 1000), importance)
                     )
                     await db.commit()
+                    ai_message_id = cursor.lastrowid
+                # 异步添加到向量索引
+                asyncio.create_task(_add_to_vector_store(ai_message_id, full_response, conversation_id, importance))
             except Exception:
                 logger.exception("Failed to save assistant message")
 
@@ -521,75 +550,14 @@ async def mark_important(request: Request):
         return {"count": cursor.rowcount}
 
 
-@app.post("/messages/{message_id}/embedding")
-async def save_embedding(message_id: int, request: Request):
-    """保存消息的向量嵌入"""
-    import struct
-    embedding = await request.json()
-    blob = struct.pack(f'{len(embedding)}f', *embedding)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO message_embeddings (message_id, embedding) VALUES (?, ?)",
-            (message_id, blob)
-        )
-        await db.commit()
-    return {"ok": True}
-
-
-@app.post("/messages/search_by_embedding")
-async def search_by_embedding(request: Request):
-    """向量相似度搜索（余弦相似度）"""
-    import struct
-    import math
-
-    body = await request.json()
-    query_embedding = body.get("embedding", [])
-    conversation_id = body.get("conversation_id")
-    limit = body.get("limit", 20)
-
-    if not query_embedding:
+@app.get("/messages/vector_search")
+async def vector_search(q: str, conversation_id: str = None, limit: int = 20):
+    """向量语义搜索"""
+    if not _vector_store:
         return []
-
-    q_norm = math.sqrt(sum(x * x for x in query_embedding))
-    if q_norm == 0:
-        return []
-
-    results = []
-    async with aiosqlite.connect(DB_PATH) as db:
-        if conversation_id:
-            rows = await db.execute_fetchall(
-                """SELECT me.message_id, me.embedding, m.role, m.content, m.timestamp, m.conversation_id, m.importance
-                   FROM message_embeddings me
-                   JOIN messages m ON me.message_id = m.id
-                   WHERE m.conversation_id = ?""",
-                (conversation_id,)
-            )
-        else:
-            rows = await db.execute_fetchall(
-                """SELECT me.message_id, me.embedding, m.role, m.content, m.timestamp, m.conversation_id, m.importance
-                   FROM message_embeddings me
-                   JOIN messages m ON me.message_id = m.id"""
-            )
-
-        for row in rows:
-            mid, blob, role, content, ts, conv_id, importance = row
-            emb = list(struct.unpack(f'{len(blob) // 4}f', blob))
-            e_norm = math.sqrt(sum(x * x for x in emb))
-            if e_norm == 0:
-                continue
-            sim = sum(a * b for a, b in zip(query_embedding, emb)) / (q_norm * e_norm)
-            results.append({
-                "message_id": mid,
-                "similarity": sim,
-                "role": role,
-                "content": content,
-                "timestamp": ts,
-                "conversation_id": conv_id,
-                "importance": importance,
-            })
-
-    results.sort(key=lambda x: (-x["importance"], -x["similarity"]))
-    return results[:limit]
+    where = {"conversation_id": conversation_id} if conversation_id else None
+    results = _vector_store.query(q, n_results=limit, where=where)
+    return results
 
 
 @app.delete("/conversations/{conversation_id}")

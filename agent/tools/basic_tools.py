@@ -330,20 +330,6 @@ def set_current_conversation_id(conversation_id: str):
 
 
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
-_embedding_client = None
-
-def _get_embedding_client():
-    """获取或创建 EmbeddingClient 单例"""
-    global _embedding_client
-    if _embedding_client is None:
-        from agent.embedding import EmbeddingClient
-        from agent.config import EMBEDDING_MODEL
-        # 复用 LLM 的 base_url 和 api_key
-        base_url = os.getenv("DEFAULT_LLM_BASE_URL", "")
-        api_key = os.getenv("LLM_API_KEY", "")
-        if base_url and api_key:
-            _embedding_client = EmbeddingClient(base_url, api_key, EMBEDDING_MODEL)
-    return _embedding_client
 
 def _fts_search(query: str, conversation_id: str = None) -> list:
     """FTS5 全文搜索"""
@@ -360,19 +346,21 @@ def _fts_search(query: str, conversation_id: str = None) -> list:
     return []
 
 def _vector_search(query: str, conversation_id: str = None) -> list:
-    """向量相似度搜索"""
-    client = _get_embedding_client()
-    if not client or not client.is_available():
-        return []
-    embedding = client.embed(query)
-    if not embedding:
-        return []
-    body = {"embedding": embedding, "limit": 20}
+    """向量语义搜索"""
+    params = {"q": query, "limit": 20}
     if conversation_id:
-        body["conversation_id"] = conversation_id
-    resp = requests.post("http://127.0.0.1:8000/messages/search_by_embedding", json=body, timeout=10)
+        params["conversation_id"] = conversation_id
+    resp = requests.get("http://127.0.0.1:8000/messages/vector_search", params=params, timeout=10)
     if resp.status_code == 200:
-        return resp.json()
+        results = resp.json()
+        # 转换格式以匹配 FTS5 结果格式
+        return [{
+            "role": r.get("metadata", {}).get("role", ""),
+            "content": r.get("document", ""),
+            "conversation_id": r.get("metadata", {}).get("conversation_id", ""),
+            "importance": r.get("metadata", {}).get("importance", 1),
+            "similarity": 1 - r.get("distance", 0),  # cosine distance → similarity
+        } for r in results]
     return []
 
 def _rrf_merge(fts_results: list, vec_results: list, k: int = 60) -> list:

@@ -29,3 +29,4 @@ packaging>=21.0               # 包版本管理（langchain 间接依赖，需�
 fastapi>=0.115.0
 uvicorn>=0.34.0
 sse-starlette>=2.0.0
+chromadb>=0.4.0
