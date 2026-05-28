@@ -560,7 +560,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             resp = requests.post(
                 "http://127.0.0.1:8000/memory/save",
                 json={"content": content, "type": "fact", "importance": importance},
-                timeout=5
+                timeout=30
             )
             if resp.status_code == 200:
                 return f"已保存事实记忆: {content[:50]}..."
@@ -570,7 +570,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             resp = requests.post(
                 "http://127.0.0.1:8000/memory/save",
                 json={"content": content, "type": "episodic", "importance": importance, "conversation_id": _current_conversation_id},
-                timeout=5
+                timeout=30
             )
             if resp.status_code == 200:
                 return f"已保存事件记忆: {content[:50]}..."
