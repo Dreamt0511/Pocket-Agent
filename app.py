@@ -8,6 +8,7 @@ import json
 import sqlite3
 import subprocess
 import time
+import contextlib
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -21,6 +22,16 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 DB_PATH = os.path.join(PROJECT_ROOT, "pocket_agent.db")
+
+@contextlib.asynccontextmanager
+async def get_db():
+    """获取带 busy_timeout 的数据库连接"""
+    db = await aiosqlite.connect(DB_PATH)
+    await db.execute("PRAGMA busy_timeout=5000")
+    try:
+        yield db
+    finally:
+        await db.close()
 
 app = FastAPI(title="Pocket-Agent API")
 
@@ -45,7 +56,7 @@ async def _add_to_vector_store(message_id: int, content: str, conversation_id: s
 
 async def _init_db():
     """创建会话和消息表（如果不存在）"""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA busy_timeout=5000")
         await db.execute("""
@@ -98,7 +109,7 @@ async def _cleanup_old_messages():
     """清理低重要性旧消息的向量索引（保留策略：30天+importance=1 的释放embedding）"""
     thirty_days_ago = int((time.time() - 30 * 24 * 3600) * 1000)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with get_db() as db:
             # 查询需要清理的消息 ID
             old_message_ids = await db.execute_fetchall(
                 """SELECT id FROM messages
@@ -122,6 +133,7 @@ async def startup():
     import aiosqlite
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     _checkpoint_conn = await aiosqlite.connect(DB_PATH)
+    await _checkpoint_conn.execute("PRAGMA busy_timeout=5000")
     _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")
@@ -384,7 +396,7 @@ async def chat(request: Request):
 
     # 确保会话存在
     now = int(time.time() * 1000)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         existing = await db.execute_fetchall(
             "SELECT id FROM conversations WHERE id = ?", (conversation_id,)
         )
@@ -423,7 +435,7 @@ async def chat(request: Request):
             # 从 SQLite 加载历史消息，恢复会话上下文（MemorySaver 重启后丢失）
             history = []
             try:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with get_db() as db:
                     rows = await db.execute_fetchall(
                         "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
                         (conversation_id,)
@@ -461,7 +473,7 @@ async def chat(request: Request):
         # 保存 AI 回复
         if full_response:
             try:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with get_db() as db:
                     cursor = await db.execute(
                         "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
                         (conversation_id, "assistant", full_response, int(time.time() * 1000), importance)
@@ -592,7 +604,7 @@ async def clear_history(request: Request):
 @app.get("/conversations")
 async def list_conversations():
     """返回所有会话列表"""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         db.row_factory = sqlite3.Row
         rows = await db.execute_fetchall(
             "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC"
@@ -611,7 +623,7 @@ async def list_conversations():
 @app.get("/conversations/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
     """返回指定会话的消息列表"""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         db.row_factory = sqlite3.Row
         rows = await db.execute_fetchall(
             "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
@@ -634,7 +646,7 @@ async def search_messages(conversation_id: str, q: str, cross_session: bool = Fa
         return []
     # 转义 FTS5 特殊字符，用双引号包裹整个 query
     safe_q = f'"{q}"'
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         if cross_session:
             rows = await db.execute_fetchall(
                 """SELECT m.role, m.content, m.timestamp, m.conversation_id, m.importance
@@ -694,7 +706,7 @@ async def save_memory_endpoint(request: Request):
         elif mem_type == "episodic":
             if not conversation_id:
                 return {"error": "conversation_id required for episodic"}
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with get_db() as db:
                 await db.execute(
                     "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
                     (conversation_id, "memory", content, int(time.time() * 1000), importance)
@@ -718,7 +730,7 @@ async def save_memory_endpoint(request: Request):
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
     """删除指定会话及其所有消息"""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         await db.commit()
