@@ -103,7 +103,16 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-import chromadb
+try:
+    import chromadb
+    _HAS_CHROMADB = True
+except ImportError:
+    _HAS_CHROMADB = False
+
+
+def is_chromadb_available() -> bool:
+    """chromadb 是否可用"""
+    return _HAS_CHROMADB
 
 
 class VectorStore:
@@ -115,6 +124,8 @@ class VectorStore:
             persist_dir: ChromaDB 持久化目录
             embedding_client: 用于生成 embedding 的客户端
         """
+        if not _HAS_CHROMADB:
+            raise ImportError("chromadb 未安装，向量搜索不可用。如需使用请安装: pip install chromadb")
         self.client = chromadb.PersistentClient(path=persist_dir)
         self.collection = self.client.get_or_create_collection(
             name="messages",

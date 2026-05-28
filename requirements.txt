@@ -29,4 +29,5 @@ packaging>=21.0               # 包版本管理（langchain 间接依赖，需�
 fastapi>=0.115.0
 uvicorn>=0.34.0
 sse-starlette>=2.0.0
-chromadb>=0.4.0
+# chromadb>=0.4.0    # 可选：向量搜索（需编译Rust，Android arm64 上可能安装失败）
+                       # 不安装时 FTS5 全文搜索仍可用，向量搜索自动跳过

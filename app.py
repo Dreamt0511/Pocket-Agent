@@ -120,20 +120,24 @@ async def startup():
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")
 
-    # 初始化 ChromaDB 向量存储
-    from agent.embedding import EmbeddingClient, VectorStore
-    from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL
-    env_config = _load_env_config()
-    _embedding_client = EmbeddingClient(
-        EMBEDDING_BASE_URL or env_config.get("base_url", ""),
-        EMBEDDING_API_KEY or env_config.get("api_key", ""),
-        EMBEDDING_MODEL
-    )
-    _vector_store = VectorStore(
-        persist_dir=os.path.join(PROJECT_ROOT, "chroma_db"),
-        embedding_client=_embedding_client
-    )
-    logger.info("ChromaDB 向量存储已初始化")
+    # 初始化 ChromaDB 向量存储（可选，未安装则跳过）
+    from agent.embedding import EmbeddingClient, is_chromadb_available
+    if is_chromadb_available():
+        from agent.embedding import VectorStore
+        from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL
+        env_config = _load_env_config()
+        _embedding_client = EmbeddingClient(
+            EMBEDDING_BASE_URL or env_config.get("base_url", ""),
+            EMBEDDING_API_KEY or env_config.get("api_key", ""),
+            EMBEDDING_MODEL
+        )
+        _vector_store = VectorStore(
+            persist_dir=os.path.join(PROJECT_ROOT, "chroma_db"),
+            embedding_client=_embedding_client
+        )
+        logger.info("ChromaDB 向量存储已初始化")
+    else:
+        logger.warning("chromadb 未安装，向量搜索不可用（FTS5 全文搜索正常）")
 
     # 清理低重要性旧消息的 embedding（遗忘机制）
     await _cleanup_old_messages()
