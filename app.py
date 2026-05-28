@@ -552,21 +552,6 @@ async def search_messages(conversation_id: str, q: str, cross_session: bool = Fa
             return [{"role": r[0], "content": r[1], "timestamp": r[2], "importance": r[3]} for r in rows]
 
 
-@app.post("/messages/mark_important")
-async def mark_important(request: Request):
-    """将包含指定前缀的消息标记为高重要性"""
-    body = await request.json()
-    prefix = body.get("content_prefix", "")
-    if not prefix:
-        return {"count": 0}
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "UPDATE messages SET importance = 3 WHERE content LIKE ?",
-            (f"{prefix}%",)
-        )
-        await db.commit()
-        return {"count": cursor.rowcount}
-
 
 @app.get("/messages/vector_search")
 async def vector_search(q: str, conversation_id: str = None, limit: int = 20):

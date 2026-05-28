@@ -527,27 +527,6 @@ async def tts_speak(text: str) -> str:
 
 
 @tool
-def mark_message_important(message_content_prefix: str) -> str:
-    """将包含指定前缀的消息标记为重要（importance=3），防止被遗忘。用于标记用户的关键决定或偏好。
-
-    Args:
-        message_content_prefix: 消息内容的前缀文本（用于匹配）
-    """
-    try:
-        resp = requests.post(
-            "http://127.0.0.1:8000/messages/mark_important",
-            json={"content_prefix": message_content_prefix},
-            timeout=5
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return f"已标记 {data.get('count', 0)} 条消息为重要"
-        return "标记失败"
-    except Exception as e:
-        return f"标记出错: {e}"
-
-
-@tool
 def save_memory(content: str, type: str = "fact", tags: str = "", importance: int = 1) -> str:
     """保存重要信息到记忆系统。只在值得记的内容时调用，不要每条对话都存。
 
@@ -723,5 +702,5 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
 
 
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, save_memory, search_memory, mark_message_important
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, save_memory, search_memory
 ]

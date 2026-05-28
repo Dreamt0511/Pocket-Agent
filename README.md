@@ -114,7 +114,6 @@ update_user_profile(section="偏好设置", content="喜欢简洁的回答风格
 | `update_user_profile` | 更新用户画像 |
 | `save_memory` | 保存记忆 |
 | `search_memory` | 检索记忆 |
-| `mark_message_important` | 标记消息为重要 |
 | `mcp_call` | 调用 MCP 服务 |
 | `delegate_task` | 委托子 Agent 任务 |
 | `tts_speak` | 语音播报 |
