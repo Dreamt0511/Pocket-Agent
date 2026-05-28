@@ -228,6 +228,20 @@ async def health():
     }
 
 
+@app.get("/version")
+async def version():
+    """返回当前代码版本（git commit SHA 前 7 位）"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=PROJECT_ROOT
+        )
+        sha = result.stdout.strip()[:7] if result.returncode == 0 else "unknown"
+    except Exception:
+        sha = "unknown"
+    return {"version": sha}
+
+
 # ─── 安装依赖 ─────────────────────────────────
 
 @app.post("/setup")
