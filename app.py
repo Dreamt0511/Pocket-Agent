@@ -409,7 +409,7 @@ async def chat(request: Request):
                 if event["type"] == "token":
                     full_response += event["content"]
                     yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
-                elif event["type"] in ("tool_start", "tool_end", "thinking"):
+                elif event["type"] in ("tool_start", "tool_end", "thinking", "executor_start", "executor_done"):
                     yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "done":
                     full_response = event.get("response", full_response)
@@ -844,7 +844,7 @@ _cancel_requested = False
 
 @app.post("/cancel")
 async def cancel_execution():
-    """取消当前正在执行的推理"""
+    """取消当前正在执行的推理（包括子Agent）"""
     global _cancel_requested
     _cancel_requested = True
     # 尝试中断 agent 的 LLM 调用
@@ -852,6 +852,9 @@ async def cancel_execution():
         try:
             if hasattr(_agent_instance, 'cancel'):
                 _agent_instance.cancel()
+            # 取消子Agent任务
+            if hasattr(_agent_instance, '_executor_task') and _agent_instance._executor_task:
+                _agent_instance._executor_task.cancel()
         except Exception:
             pass
     return {"ok": True}

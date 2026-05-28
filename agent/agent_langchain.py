@@ -1212,7 +1212,15 @@ class LangChainPocketAgent:
                 task_id = pt.get("task_id", "unknown")
                 description = pt.get("description", "")
                 if task_path and os.path.exists(task_path):
-                    await self._run_executor_foreground(task_path, task_id)
+                    # 存储子Agent任务引用，供 /cancel 终止
+                    self._executor_task = asyncio.current_task()
+                    try:
+                        async for event in self._run_executor_foreground(task_path, task_id):
+                            if self._check_cancel():
+                                break
+                            yield event
+                    finally:
+                        self._executor_task = None
 
             # ── 技能验证：通知主Agent检查新沉淀的技能 ──
             if self._pending_skill_verification:
@@ -1370,8 +1378,8 @@ class LangChainPocketAgent:
                 lines.append(f"  \u25fb {desc}")
         return "\n".join(lines) if lines else ""
 
-    async def _run_executor_foreground(self, task_path: str, task_id: str) -> None:
-        """前台运行子Agent（executor），实时流式输出到UI，完成后才返回"""
+    async def _run_executor_foreground(self, task_path: str, task_id: str):
+        """前台运行子Agent（executor），yield 结构化事件供 SSE 流式推送"""
         try:
             executor_tool_names = {"shell_exec", "file_read", "file_write", "file_search", "mcp_call", "system_info", "tts_speak"}
             executor_tools = [t for t in ALL_TOOLS if t.name in executor_tool_names]
@@ -1435,6 +1443,7 @@ class LangChainPocketAgent:
                     "status": "failed",
                     "summary": "❌ 任务文件不存在",
                 })
+                yield {"type": "executor_done", "task_id": task_id, "status": "failed"}
                 return
 
             with open(task_path, "r", encoding="utf-8") as f:
@@ -1446,6 +1455,9 @@ class LangChainPocketAgent:
             self._executor_step_start = datetime.now()
             executor_step = 0
             had_intervention = False  # 是否申请了人工介入
+
+            # yield 子Agent启动标识
+            yield {"type": "executor_start", "task_id": task_id, "objective": objective}
 
             # 用户画像要求语音时，启动时语音通知
             _profile = getattr(self, '_user_profile', '') or ''
@@ -1477,16 +1489,26 @@ class LangChainPocketAgent:
                 stream_mode=["messages", "updates"],
                 version="v2",
             ):
+                if self._check_cancel():
+                    break
+
                 if chunk["type"] == "messages":
                     message_chunk, metadata = chunk["data"]
                     node = metadata.get("langgraph_node", "")
-                    if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
-                        if type(message_chunk) is AIMessage:
-                            continue
-                        content = message_chunk.content
-                        full_response += content
-                        if self.ui:
-                            self.ui.print_stream_chunk(content)
+                    if node == "model" and hasattr(message_chunk, "content"):
+                        # 检查推理内容（DeepSeek 等模型的思考过程）
+                        rc = message_chunk.additional_kwargs.get("reasoning_content", "") if hasattr(message_chunk, "additional_kwargs") else ""
+                        if rc:
+                            yield {"type": "thinking"}
+
+                        if message_chunk.content:
+                            if type(message_chunk) is AIMessage:
+                                continue
+                            content = message_chunk.content
+                            full_response += content
+                            if self.ui:
+                                self.ui.print_stream_chunk(content)
+                            yield {"type": "token", "content": content}
 
                 elif chunk["type"] == "updates":
                     for source, update in chunk["data"].items():
@@ -1499,6 +1521,8 @@ class LangChainPocketAgent:
                                     tool_args = tc["args"]
                                     # 记录日志
                                     self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                    # yield 工具调用开始
+                                    yield {"type": "tool_start", "name": tool_name, "args": tool_args}
                                     # 检测人工介入请求（tts_speak 工具 或 shell_exec 调用 termux-tts-speak）
                                     if tool_name == "tts_speak" and "text" in tool_args:
                                         had_intervention = True
@@ -1528,6 +1552,12 @@ class LangChainPocketAgent:
                                         args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
                                         if self.ui:
                                             self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+                            else:
+                                yield {"type": "thinking"}
+                        elif source == "tools":
+                            message = update["messages"][-1]
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            yield {"type": "tool_end", "name": tool_name_2}
 
             # ── 重试机制：如果子Agent没有执行有效操作（仅读了task.json就停了），强制重试 ──
             # 注意：重试必须使用全新Agent实例 + 内联任务内容，不能复用原对话线程，
@@ -1577,6 +1607,9 @@ class LangChainPocketAgent:
                     stream_mode=["messages", "updates"],
                     version="v2",
                 ):
+                    if self._check_cancel():
+                        break
+
                     if chunk["type"] == "messages":
                         message_chunk, metadata = chunk["data"]
                         node = metadata.get("langgraph_node", "")
@@ -1587,6 +1620,7 @@ class LangChainPocketAgent:
                             full_response += content
                             if self.ui:
                                 self.ui.print_stream_chunk(content)
+                            yield {"type": "token", "content": content}
                     elif chunk["type"] == "updates":
                         for source, update in chunk["data"].items():
                             if source == "model":
@@ -1597,10 +1631,19 @@ class LangChainPocketAgent:
                                         tool_name = tc["name"]
                                         tool_args = tc["args"]
                                         self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                        yield {"type": "tool_start", "name": tool_name, "args": tool_args}
                                         if self.ui:
                                             args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
                                             args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
                                             self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+                                else:
+                                    yield {"type": "thinking"}
+                            elif source == "tools":
+                                message = update["messages"][-1]
+                                tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                                yield {"type": "tool_end", "name": tool_name_2}
+                    if self._check_cancel():
+                        break
 
             # 执行完成
             if had_intervention:
@@ -1654,6 +1697,9 @@ class LangChainPocketAgent:
 
             if self.ui:
                 self.ui.console.print(f"\n  [green]{status_text}，⏱️ {executor_elapsed}s{token_text}[/green]")
+
+            # yield 完成事件
+            yield {"type": "executor_done", "task_id": task_id, "status": "completed" if not has_failures else "completed_with_failures"}
 
             # ── 技能沉淀：后台执行，不阻塞汇报 ──
             steps = task_data.get("steps", [])
@@ -1724,6 +1770,7 @@ class LangChainPocketAgent:
             self.logger.log_executor_end(task_id, "中断")
             if self.ui:
                 self.ui.console.print("\n  [yellow]⏹️ 子Agent执行被中断[/yellow]")
+            yield {"type": "executor_done", "task_id": task_id, "status": "cancelled"}
             raise
         except Exception:
             import traceback
@@ -1775,4 +1822,6 @@ class LangChainPocketAgent:
                 "status": "failed",
                 "summary": f"❌ 执行失败: {error_short[:200]}",
             })
+
+            yield {"type": "executor_done", "task_id": task_id, "status": "failed"}
 
