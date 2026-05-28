@@ -288,9 +288,9 @@ async def chat(request: Request):
         await db.commit()
         user_message_id = cursor.lastrowid
 
-    # 异步添加到向量索引（不阻塞响应）
-    import asyncio
-    asyncio.create_task(_add_to_vector_store(user_message_id, message, conversation_id, importance))
+    # 已禁用自动嵌入：改为 Agent 主动调用 save_memory 工具
+    # import asyncio
+    # asyncio.create_task(_add_to_vector_store(user_message_id, message, conversation_id, importance))
 
     async def generate():
         global _cancel_requested
@@ -349,8 +349,8 @@ async def chat(request: Request):
                     )
                     await db.commit()
                     ai_message_id = cursor.lastrowid
-                # 异步添加到向量索引
-                asyncio.create_task(_add_to_vector_store(ai_message_id, full_response, conversation_id, importance))
+                # 已禁用自动嵌入：改为 Agent 主动调用 save_memory 工具
+                # asyncio.create_task(_add_to_vector_store(ai_message_id, full_response, conversation_id, importance))
             except Exception:
                 logger.exception("Failed to save assistant message")
 
@@ -558,6 +558,45 @@ async def vector_search(q: str, conversation_id: str = None, limit: int = 20):
     where = {"conversation_id": conversation_id} if conversation_id else None
     results = _vector_store.query(q, n_results=limit, where=where)
     return results
+
+
+@app.post("/memory/save")
+async def save_memory_endpoint(request: Request):
+    """保存记忆到对应存储"""
+    body = await request.json()
+    content = body.get("content", "")
+    mem_type = body.get("type", "fact")
+    tags = body.get("tags", [])
+    importance = body.get("importance", 1)
+    conversation_id = body.get("conversation_id")
+
+    if not content:
+        return {"error": "content is required"}
+
+    if mem_type == "fact":
+        # 存入 ChromaDB
+        if _vector_store:
+            metadata = {"tags": ",".join(tags), "importance": importance, "type": "fact"}
+            _vector_store.add(
+                message_id=hash(content) % (2**31),  # 用内容 hash 作为 ID
+                content=content,
+                metadata=metadata
+            )
+        return {"ok": True, "type": "fact"}
+
+    elif mem_type == "episodic":
+        # 存入 SQLite messages 表，role="memory" 标记为记忆条目
+        if not conversation_id:
+            return {"error": "conversation_id required for episodic"}
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, "memory", content, int(time.time() * 1000), max(importance, 2))
+            )
+            await db.commit()
+        return {"ok": True, "type": "episodic"}
+
+    return {"error": f"unknown type: {mem_type}"}
 
 
 @app.delete("/conversations/{conversation_id}")

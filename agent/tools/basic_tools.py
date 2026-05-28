@@ -548,12 +548,66 @@ def mark_message_important(message_content_prefix: str) -> str:
 
 
 @tool
+def save_memory(content: str, type: str = "fact", tags: str = "", importance: int = 1) -> str:
+    """保存重要信息到记忆系统。只在值得记的内容时调用，不要每条对话都存。
+
+    何时调用：
+    - 用户提到的项目决定、技术选型
+    - 重要的事件结果（部署成功/失败、问题解决方案）
+    - 用户的工作上下文（在做什么项目、当前目标）
+    - 值得以后回忆的关键信息
+
+    何时不调用：
+    - 普通闲聊、问候
+    - 工具执行的技术细节（shell 输出、文件内容）
+    - 已经在用户画像中的信息（姓名、永久偏好）
+
+    Args:
+        content: 要记忆的内容，简洁明确
+        type: "fact" 存入向量数据库（语义搜索），"episodic" 存入消息表（关键词搜索）
+        tags: 逗号分隔的标签，如 "项目,SQLite,决定"
+        importance: 重要性 1-3，3 最重要
+    """
+    try:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+
+        if type == "fact":
+            # 存入 ChromaDB（语义搜索）
+            resp = requests.post(
+                "http://127.0.0.1:8000/memory/save",
+                json={"content": content, "type": "fact", "tags": tag_list, "importance": importance},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                return f"已保存事实记忆: {content[:50]}..."
+            return f"保存失败: HTTP {resp.status_code}"
+
+        elif type == "episodic":
+            # 存入 SQLite messages 表（关键词搜索），用特殊 role 标记
+            resp = requests.post(
+                "http://127.0.0.1:8000/memory/save",
+                json={"content": content, "type": "episodic", "tags": tag_list, "importance": importance, "conversation_id": _current_conversation_id},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                return f"已保存事件记忆: {content[:50]}..."
+            return f"保存失败: HTTP {resp.status_code}"
+
+        else:
+            return "type 必须是 'fact' 或 'episodic'"
+    except Exception as e:
+        return f"保存出错: {e}"
+
+
+@tool
 def search_memory(query: str, scope: str = "all") -> str:
-    """搜索历史消息找回遗忘的细节。
+    """搜索历史消息和记忆找回遗忘的细节。
 
     Args:
         query: 搜索关键词或短语
-        scope: "current" 仅当前会话（FTS5 关键词搜索），"all" 跨会话（FTS5 + 向量混合检索）
+        scope: "fact" 搜索 ChromaDB 中的事实记忆（语义搜索），
+               "episodic" 搜索 SQLite 中的事件记忆（FTS5 关键词搜索），
+               "all" 两者都搜，RRF 混合排序
     """
     try:
         current_only = scope == "current"
@@ -662,5 +716,5 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
 
 
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, search_memory, mark_message_important
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, save_memory, search_memory, mark_message_important
 ]

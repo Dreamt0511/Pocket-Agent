@@ -71,4 +71,11 @@ prompt = """重要规则：
     - 需要用某个技能时，用file_read读取对应SKILL.md
     - 已经读过的技能不要重复读取
 
-14. 【技能验证】当收到含此标记的消息时，说明子Agent沉淀了新技能。用 file_read 读取标记中列出的新技能 SKILL.md，再读取 `agent/skills/executor-skills/skill-creator/SKILL.md` 对照标准格式检查，不符合的用 file_write 修正。验证结果简要报告即可，不要阻塞用户当前请求。"""
+14. 【技能验证】当收到含此标记的消息时，说明子Agent沉淀了新技能。用 file_read 读取标记中列出的新技能 SKILL.md，再读取 `agent/skills/executor-skills/skill-creator/SKILL.md` 对照标准格式检查，不符合的用 file_write 修正。验证结果简要报告即可，不要阻塞用户当前请求。
+
+15. 【记忆分层】信息存储遵循以下规则：
+    - 用户画像(update_user_profile)：永久性的个人信息（姓名、职业、永久偏好如"回答简短"、饮食习惯）
+    - 事实记忆(save_memory type=fact)：项目决定、技术选型、工作上下文（"项目用SQLite"、"我在做Android AI应用"）
+    - 事件记忆(save_memory type=episodic)：重要事件结果（"部署成功"、"解决了端口冲突"）
+    - 不记忆：普通闲聊、工具执行细节、已在画像中的信息
+    判断标准：换了项目/场景仍然成立 → 画像；跟具体项目/任务相关 → 事实记忆"""
