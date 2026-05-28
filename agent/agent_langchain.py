@@ -503,6 +503,8 @@ class LangChainPocketAgent:
         set_memory_instance(self.memory)
         # 预加载用户画像，只加载一次，避免破坏缓存
         self._user_profile = self.memory.get_user_profile()
+        # 加载上次对话摘要，用于记忆注入
+        self._last_session_summary = self._load_last_session_summary()
 
         # 初始化日志系统
         self.logger = AgentLogger(log_dir=os.path.join(PROJECT_ROOT, "logs"))
@@ -517,6 +519,22 @@ class LangChainPocketAgent:
 
         # 子Agent沉淀的新技能列表（待主Agent验证格式）
         self._pending_skill_verification: list[str] = []
+
+    def _load_last_session_summary(self) -> str:
+        """加载最近会话的最后一条 AI 消息作为摘要（同步 sqlite3，避免异步开销）"""
+        try:
+            import sqlite3
+            db_path = os.path.join(PROJECT_ROOT, "pocket_agent.db")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT content FROM messages WHERE role = 'assistant' ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row:
+                return row[0][:200]
+        except Exception:
+            pass
+        return ""
 
     def _run_sensor(self, cmd: str, timeout: int = 5) -> Optional[str]:
         """执行Termux传感器命令，返回stdout或None"""
@@ -818,12 +836,13 @@ class LangChainPocketAgent:
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            # 构建消息列表：用户画像 + 上次对话摘要 + 环境感知合并到用户消息中
             profile_text = f"{self._user_profile}" if self._user_profile else ""
+            summary_text = f"【上次对话末尾】\n{self._last_session_summary}" if self._last_session_summary else ""
             # 语音由系统自动处理，不需要模型干预
             env_text = env_tag if env_tag else ""
             env_text = env_tag if env_tag else ""
-            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            combined_context = "\n\n".join(filter(None, [profile_text, summary_text, env_text]))
             if combined_context:
                 combined_message = f"{combined_context}\n\n---\n{user_message}"
             else:
@@ -1110,10 +1129,11 @@ class LangChainPocketAgent:
             # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            # 构建消息列表：用户画像 + 上次对话摘要 + 环境感知合并到用户消息中
             profile_text = f"{self._user_profile}" if self._user_profile else ""
+            summary_text = f"【上次对话末尾】\n{self._last_session_summary}" if self._last_session_summary else ""
             env_text = env_tag if env_tag else ""
-            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            combined_context = "\n\n".join(filter(None, [profile_text, summary_text, env_text]))
             if combined_context:
                 combined_message = f"{combined_context}\n\n---\n{user_message}"
             else:

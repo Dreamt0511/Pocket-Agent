@@ -50,6 +50,21 @@ async def _init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
 
+        # 兼容旧数据库：添加 importance 字段
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN importance INTEGER DEFAULT 1")
+        except Exception:
+            pass  # duplicate column — 已存在
+
+        # 向量嵌入表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS message_embeddings (
+                message_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            )
+        """)
+
         # FTS5 虚拟表 —— 会话历史全文搜索
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id)
@@ -70,6 +85,25 @@ async def _init_db():
         await db.commit()
 
 
+async def _cleanup_old_messages():
+    """清理低重要性旧消息的 embedding（保留策略：30天+importance=1 的释放embedding）"""
+    thirty_days_ago = int((time.time() - 30 * 24 * 3600) * 1000)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """DELETE FROM message_embeddings
+                   WHERE message_id IN (
+                       SELECT id FROM messages
+                       WHERE importance = 1 AND timestamp < ?
+                   )""",
+                (thirty_days_ago,)
+            )
+            await db.commit()
+            logger.info("已清理低重要性旧消息的 embedding")
+    except Exception:
+        logger.warning("清理旧消息 embedding 失败（表可能不存在）", exc_info=True)
+
+
 @app.on_event("startup")
 async def startup():
     global _checkpoint_conn, _checkpoint_saver
@@ -81,6 +115,8 @@ async def startup():
     _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
     await _checkpoint_saver.setup()
     logger.info("AsyncSqliteSaver checkpoint 已初始化")
+    # 清理低重要性旧消息的 embedding（遗忘机制）
+    await _cleanup_old_messages()
 
 # ─── Agent 单例缓存 ──────────────────────────────
 # 共享同一个 agent 实例，通过不同 thread_id 隔离各会话历史
@@ -193,6 +229,7 @@ async def chat(request: Request):
     message = data.get("message", "")
     req_config = data.get("config", {})
     conversation_id = data.get("conversation_id", "default-session")
+    importance = data.get("importance", 1)
 
     # 设置当前会话ID，供 read_conversation_history 工具使用
     from agent.tools.basic_tools import set_current_conversation_id
@@ -224,8 +261,8 @@ async def chat(request: Request):
             )
         # 保存用户消息
         await db.execute(
-            "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (conversation_id, "user", message, now)
+            "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, "user", message, now, importance)
         )
         await db.commit()
 
@@ -281,8 +318,8 @@ async def chat(request: Request):
             try:
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
-                        "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                        (conversation_id, "assistant", full_response, int(time.time() * 1000))
+                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                        (conversation_id, "assistant", full_response, int(time.time() * 1000), importance)
                     )
                     await db.commit()
             except Exception:
@@ -439,22 +476,120 @@ async def get_messages(conversation_id: str):
 
 
 @app.get("/conversations/{conversation_id}/search")
-async def search_messages(conversation_id: str, q: str):
-    """FTS5 全文搜索指定会话的消息"""
+async def search_messages(conversation_id: str, q: str, cross_session: bool = False):
+    """FTS5 全文搜索消息。cross_session=True 时搜索所有会话。"""
     if not q.strip():
         return []
     # 转义 FTS5 特殊字符，用双引号包裹整个 query
     safe_q = f'"{q}"'
     async with aiosqlite.connect(DB_PATH) as db:
-        rows = await db.execute_fetchall(
-            """SELECT m.role, m.content, m.timestamp
-               FROM messages_fts fts
-               JOIN messages m ON fts.rowid = m.id
-               WHERE messages_fts MATCH ? AND m.conversation_id = ?
-               ORDER BY rank LIMIT 20""",
-            (safe_q, conversation_id)
+        if cross_session:
+            rows = await db.execute_fetchall(
+                """SELECT m.role, m.content, m.timestamp, m.conversation_id, m.importance
+                   FROM messages_fts fts
+                   JOIN messages m ON fts.rowid = m.id
+                   WHERE messages_fts MATCH ?
+                   ORDER BY m.importance DESC, rank LIMIT 20""",
+                (safe_q,)
+            )
+            return [{"role": r[0], "content": r[1], "timestamp": r[2], "conversation_id": r[3], "importance": r[4]} for r in rows]
+        else:
+            rows = await db.execute_fetchall(
+                """SELECT m.role, m.content, m.timestamp, m.importance
+                   FROM messages_fts fts
+                   JOIN messages m ON fts.rowid = m.id
+                   WHERE messages_fts MATCH ? AND m.conversation_id = ?
+                   ORDER BY m.importance DESC, rank LIMIT 20""",
+                (safe_q, conversation_id)
+            )
+            return [{"role": r[0], "content": r[1], "timestamp": r[2], "importance": r[3]} for r in rows]
+
+
+@app.post("/messages/mark_important")
+async def mark_important(request: Request):
+    """将包含指定前缀的消息标记为高重要性"""
+    body = await request.json()
+    prefix = body.get("content_prefix", "")
+    if not prefix:
+        return {"count": 0}
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE messages SET importance = 3 WHERE content LIKE ?",
+            (f"{prefix}%",)
         )
-        return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+        await db.commit()
+        return {"count": cursor.rowcount}
+
+
+@app.post("/messages/{message_id}/embedding")
+async def save_embedding(message_id: int, request: Request):
+    """保存消息的向量嵌入"""
+    import struct
+    embedding = await request.json()
+    blob = struct.pack(f'{len(embedding)}f', *embedding)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO message_embeddings (message_id, embedding) VALUES (?, ?)",
+            (message_id, blob)
+        )
+        await db.commit()
+    return {"ok": True}
+
+
+@app.post("/messages/search_by_embedding")
+async def search_by_embedding(request: Request):
+    """向量相似度搜索（余弦相似度）"""
+    import struct
+    import math
+
+    body = await request.json()
+    query_embedding = body.get("embedding", [])
+    conversation_id = body.get("conversation_id")
+    limit = body.get("limit", 20)
+
+    if not query_embedding:
+        return []
+
+    q_norm = math.sqrt(sum(x * x for x in query_embedding))
+    if q_norm == 0:
+        return []
+
+    results = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        if conversation_id:
+            rows = await db.execute_fetchall(
+                """SELECT me.message_id, me.embedding, m.role, m.content, m.timestamp, m.conversation_id, m.importance
+                   FROM message_embeddings me
+                   JOIN messages m ON me.message_id = m.id
+                   WHERE m.conversation_id = ?""",
+                (conversation_id,)
+            )
+        else:
+            rows = await db.execute_fetchall(
+                """SELECT me.message_id, me.embedding, m.role, m.content, m.timestamp, m.conversation_id, m.importance
+                   FROM message_embeddings me
+                   JOIN messages m ON me.message_id = m.id"""
+            )
+
+        for row in rows:
+            mid, blob, role, content, ts, conv_id, importance = row
+            emb = list(struct.unpack(f'{len(blob) // 4}f', blob))
+            e_norm = math.sqrt(sum(x * x for x in emb))
+            if e_norm == 0:
+                continue
+            sim = sum(a * b for a, b in zip(query_embedding, emb)) / (q_norm * e_norm)
+            results.append({
+                "message_id": mid,
+                "similarity": sim,
+                "role": role,
+                "content": content,
+                "timestamp": ts,
+                "conversation_id": conv_id,
+                "importance": importance,
+            })
+
+    results.sort(key=lambda x: (-x["importance"], -x["similarity"]))
+    return results[:limit]
 
 
 @app.delete("/conversations/{conversation_id}")

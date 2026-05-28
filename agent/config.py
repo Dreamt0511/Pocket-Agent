@@ -63,6 +63,11 @@ AUTO_SKILLS_DIR = os.path.join(PROJECT_ROOT, "agent", "skills", "auto-skills")
 TASKS_DIR = os.path.join(PROJECT_ROOT, "tasks")
 
 # ==============================
+# Embedding 配置
+# ==============================
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+# ==============================
 # 日志配置
 # ==============================
 # 日志目录

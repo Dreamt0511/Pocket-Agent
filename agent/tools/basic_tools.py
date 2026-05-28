@@ -328,6 +328,75 @@ def set_current_conversation_id(conversation_id: str):
     global _current_conversation_id
     _current_conversation_id = conversation_id
 
+
+# ── 混合检索辅助函数 ──────────────────────────────────────────────
+_embedding_client = None
+
+def _get_embedding_client():
+    """获取或创建 EmbeddingClient 单例"""
+    global _embedding_client
+    if _embedding_client is None:
+        from agent.embedding import EmbeddingClient
+        from agent.config import EMBEDDING_MODEL
+        # 复用 LLM 的 base_url 和 api_key
+        base_url = os.getenv("DEFAULT_LLM_BASE_URL", "")
+        api_key = os.getenv("LLM_API_KEY", "")
+        if base_url and api_key:
+            _embedding_client = EmbeddingClient(base_url, api_key, EMBEDDING_MODEL)
+    return _embedding_client
+
+def _fts_search(query: str, conversation_id: str = None) -> list:
+    """FTS5 全文搜索"""
+    params = {"q": query}
+    if conversation_id:
+        url = f"http://127.0.0.1:8000/conversations/{conversation_id}/search"
+    else:
+        # 跨会话：用任意 conversation_id 但 cross_session=True
+        url = "http://127.0.0.1:8000/conversations/_/search"
+        params["cross_session"] = "true"
+    resp = requests.get(url, params=params, timeout=5)
+    if resp.status_code == 200:
+        return resp.json()
+    return []
+
+def _vector_search(query: str, conversation_id: str = None) -> list:
+    """向量相似度搜索"""
+    client = _get_embedding_client()
+    if not client or not client.is_available():
+        return []
+    embedding = client.embed(query)
+    if not embedding:
+        return []
+    body = {"embedding": embedding, "limit": 20}
+    if conversation_id:
+        body["conversation_id"] = conversation_id
+    resp = requests.post("http://127.0.0.1:8000/messages/search_by_embedding", json=body, timeout=10)
+    if resp.status_code == 200:
+        return resp.json()
+    return []
+
+def _rrf_merge(fts_results: list, vec_results: list, k: int = 60) -> list:
+    """Reciprocal Rank Fusion 混合排序（参考 EchoMind 设计）"""
+    scores = {}
+    # FTS5 结果按 rank 排序
+    for rank, msg in enumerate(fts_results):
+        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+    # 向量结果按 similarity 排序
+    for rank, msg in enumerate(vec_results):
+        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+    # 按 RRF 分数排序
+    sorted_keys = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    # 从原始结果中恢复完整消息
+    all_msgs = {}
+    for msg in fts_results + vec_results:
+        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        if key not in all_msgs:
+            all_msgs[key] = msg
+    return [all_msgs[k] for k in sorted_keys if k in all_msgs]
+
+
 @tool
 async def update_user_profile(section: str, content: str) -> str:
     """
@@ -470,29 +539,59 @@ async def tts_speak(text: str) -> str:
 
 
 @tool
-def read_conversation_history(query: str) -> str:
-    """搜索当前会话的历史消息，找回被压缩遗忘的细节。当用户提到之前说过的内容但你不记得时使用。
+def mark_message_important(message_content_prefix: str) -> str:
+    """将包含指定前缀的消息标记为重要（importance=3），防止被遗忘。用于标记用户的关键决定或偏好。
+
+    Args:
+        message_content_prefix: 消息内容的前缀文本（用于匹配）
+    """
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:8000/messages/mark_important",
+            json={"content_prefix": message_content_prefix},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return f"已标记 {data.get('count', 0)} 条消息为重要"
+        return "标记失败"
+    except Exception as e:
+        return f"标记出错: {e}"
+
+
+@tool
+def search_memory(query: str, scope: str = "all") -> str:
+    """搜索历史消息找回遗忘的细节。
 
     Args:
         query: 搜索关键词或短语
+        scope: "current" 仅当前会话（FTS5 关键词搜索），"all" 跨会话（FTS5 + 向量混合检索）
     """
     try:
-        if not _current_conversation_id:
-            return "❌ 无法获取当前会话ID，请确保会话已初始化"
-        resp = requests.get(
-            f"http://127.0.0.1:8000/conversations/{_current_conversation_id}/search",
-            params={"q": query},
-            timeout=5
-        )
-        if resp.status_code != 200:
-            return f"搜索失败: HTTP {resp.status_code}"
-        results = resp.json()
+        current_only = scope == "current"
+        conv_id = _current_conversation_id if current_only else None
+
+        # 1. FTS5 搜索
+        fts_results = _fts_search(query, conv_id)
+
+        # 2. 向量搜索（仅跨会话时使用，如果 embedding 可用）
+        if not current_only:
+            vec_results = _vector_search(query, conv_id)
+            if vec_results:
+                results = _rrf_merge(fts_results, vec_results)
+            else:
+                results = fts_results
+        else:
+            results = fts_results
+
         if not results:
             return "未找到相关消息"
+
         lines = []
-        for msg in results:
+        for msg in results[:20]:
             role = "用户" if msg["role"] == "user" else "AI"
-            lines.append(f"[{role}] {msg['content']}")
+            session_tag = f" [会话:{msg.get('conversation_id','')[:8]}]" if not current_only else ""
+            lines.append(f"[{role}]{session_tag} {msg['content']}")
         return "\n---\n".join(lines)
     except Exception as e:
         return f"搜索出错: {e}"
@@ -575,5 +674,5 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
 
 
 ALL_TOOLS = [
-    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, read_conversation_history
+    file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, search_memory, mark_message_important
 ]
