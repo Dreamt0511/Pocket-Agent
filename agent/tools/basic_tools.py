@@ -564,7 +564,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             )
             if resp.status_code == 200:
                 return f"已保存事实记忆: {content[:50]}..."
-            return f"保存失败: HTTP {resp.status_code}"
+            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]}"
 
         elif type == "episodic":
             resp = requests.post(
@@ -574,7 +574,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             )
             if resp.status_code == 200:
                 return f"已保存事件记忆: {content[:50]}..."
-            return f"保存失败: HTTP {resp.status_code}"
+            return f"保存失败: HTTP {resp.status_code} - {resp.text[:200]}"
 
         else:
             return "type 必须是 'fact' 或 'episodic'"

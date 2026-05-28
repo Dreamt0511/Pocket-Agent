@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import logging
 import aiosqlite
 
@@ -669,47 +669,48 @@ async def vector_search(q: str, conversation_id: str = None, limit: int = 20):
 @app.post("/memory/save")
 async def save_memory_endpoint(request: Request):
     """保存记忆到对应存储"""
-    body = await request.json()
-    content = body.get("content", "")
-    mem_type = body.get("type", "fact")
-    importance = max(1, min(10, body.get("importance", 3)))
-    conversation_id = body.get("conversation_id")
+    try:
+        body = await request.json()
+        content = body.get("content", "")
+        mem_type = body.get("type", "fact")
+        importance = max(1, min(10, body.get("importance", 3)))
+        conversation_id = body.get("conversation_id")
 
-    if not content:
-        return {"error": "content is required"}
+        if not content:
+            return {"error": "content is required"}
 
-    if mem_type == "fact":
-        # 存入 ChromaDB
-        if _vector_store:
-            metadata = {"importance": importance, "type": "fact"}
-            _vector_store.add(
-                message_id=hash(content) % (2**31),  # 用内容 hash 作为 ID
-                content=content,
-                metadata=metadata
-            )
-        return {"ok": True, "type": "fact"}
+        if mem_type == "fact":
+            if _vector_store:
+                metadata = {"importance": importance, "type": "fact"}
+                _vector_store.add(
+                    message_id=hash(content) % (2**31),
+                    content=content,
+                    metadata=metadata
+                )
+            return {"ok": True, "type": "fact"}
 
-    elif mem_type == "episodic":
-        # 存入 SQLite messages 表（FTS5 关键词搜索）
-        if not conversation_id:
-            return {"error": "conversation_id required for episodic"}
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, "memory", content, int(time.time() * 1000), importance)
-            )
-            await db.commit()
-        # 同时存入 ChromaDB（向量语义搜索）
-        if _vector_store:
-            metadata = {"importance": importance, "type": "episodic", "conversation_id": conversation_id}
-            _vector_store.add(
-                message_id=hash(content) % (2**31),
-                content=content,
-                metadata=metadata
-            )
-        return {"ok": True, "type": "episodic"}
+        elif mem_type == "episodic":
+            if not conversation_id:
+                return {"error": "conversation_id required for episodic"}
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                    (conversation_id, "memory", content, int(time.time() * 1000), importance)
+                )
+                await db.commit()
+            if _vector_store:
+                metadata = {"importance": importance, "type": "episodic", "conversation_id": conversation_id}
+                _vector_store.add(
+                    message_id=hash(content) % (2**31),
+                    content=content,
+                    metadata=metadata
+                )
+            return {"ok": True, "type": "episodic"}
 
-    return {"error": f"unknown type: {mem_type}"}
+        return {"error": f"unknown type: {mem_type}"}
+    except Exception as e:
+        logger.error(f"save_memory error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.delete("/conversations/{conversation_id}")
