@@ -24,6 +24,10 @@ DB_PATH = os.path.join(PROJECT_ROOT, "pocket_agent.db")
 
 app = FastAPI(title="Pocket-Agent API")
 
+# ─── 心跳机制 ──────────────────────────────────
+_last_heartbeat = time.time()
+_HEARTBEAT_TIMEOUT = 90  # 秒，超过此时间未收到心跳则自动关闭
+
 
 async def _add_to_vector_store(message_id: int, content: str, conversation_id: str, importance: int):
     """异步添加消息到向量索引"""
@@ -142,6 +146,18 @@ async def startup():
     # 清理低重要性旧消息的 embedding（遗忘机制）
     await _cleanup_old_messages()
 
+    # 启动心跳看门狗：App 被杀后超时自动关闭 uvicorn
+    import signal, threading
+    def _heartbeat_watchdog():
+        while True:
+            time.sleep(30)
+            if time.time() - _last_heartbeat > _HEARTBEAT_TIMEOUT:
+                logger.info(f"心跳超时 {_HEARTBEAT_TIMEOUT}s，自动关闭 uvicorn")
+                os.kill(os.getpid(), signal.SIGTERM)
+                break
+    threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
+    logger.info(f"心跳看门狗已启动（超时 {_HEARTBEAT_TIMEOUT}s）")
+
 # ─── Agent 单例缓存 ──────────────────────────────
 # 共享同一个 agent 实例，通过不同 thread_id 隔离各会话历史
 # 仅当 LLM 配置变化时才重建 agent
@@ -226,6 +242,13 @@ async def health():
         "python": sys.version,
         "project_root": PROJECT_ROOT,
     }
+
+
+@app.post("/heartbeat")
+async def heartbeat():
+    global _last_heartbeat
+    _last_heartbeat = time.time()
+    return {"status": "ok"}
 
 
 @app.get("/version")
