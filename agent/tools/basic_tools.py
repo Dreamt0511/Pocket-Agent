@@ -324,7 +324,7 @@ def set_memory_instance(memory):
 _current_conversation_id = None
 
 def set_current_conversation_id(conversation_id: str):
-    """设置当前会话ID，供 read_conversation_history 工具使用"""
+    """设置当前会话ID，供 search_memory 工具使用"""
     global _current_conversation_id
     _current_conversation_id = conversation_id
 

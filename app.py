@@ -252,7 +252,7 @@ async def chat(request: Request):
     conversation_id = data.get("conversation_id", "default-session")
     importance = data.get("importance", 1)
 
-    # 设置当前会话ID，供 read_conversation_history 工具使用
+    # 设置当前会话ID，供 search_memory 工具使用
     from agent.tools.basic_tools import set_current_conversation_id
     set_current_conversation_id(conversation_id)
 

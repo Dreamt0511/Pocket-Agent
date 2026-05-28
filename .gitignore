@@ -121,3 +121,7 @@ CLAUDE.md
 test_ssh_cmd.py
 同步代码到手动端-ssh机制.py
 docs/经验/08-ssh连接手机终端说明.md
+
+最新同步记录.txt
+termux指令.md
+2026-05-22-agent速度优化.md
