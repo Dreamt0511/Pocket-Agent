@@ -458,7 +458,7 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
         return []
 
 def _embeddings_keyword_search(query: str, memory_type: str = None, days: int = None) -> list:
-    """在 embeddings 表中用 LIKE 搜索记忆内容（补充 messages 表的 FTS 搜索）"""
+    """在 embeddings 表中搜索记忆内容（FTS5 trigram + LIKE 兜底），补充 messages 表搜索"""
     if not _db_path_ref:
         return []
     conn = None
@@ -470,41 +470,64 @@ def _embeddings_keyword_search(query: str, memory_type: str = None, days: int = 
         if not keywords:
             keywords = [query]
 
-        # 获取所有 embedding 记录，按 metadata 过滤
-        rows = conn.execute("SELECT id, content, metadata FROM embeddings").fetchall()
         results = []
         seen_ids = set()
 
-        for row_id, content, meta_json in rows:
-            # LIKE 匹配
-            if not any(k in content for k in keywords):
-                continue
-
-            meta = json.loads(meta_json) if meta_json else {}
-
-            # memory_type 过滤
-            if memory_type and meta.get("type") != memory_type:
-                continue
-
-            # days 时间过滤
-            if days:
-                cutoff = int((time.time() - days * 86400) * 1000)
-                if meta.get("timestamp", 0) < cutoff:
+        def _apply_filters(rows):
+            """对查询结果应用 memory_type 和 days 过滤"""
+            filtered = []
+            for row_id, content, meta_json in rows:
+                meta = json.loads(meta_json) if meta_json else {}
+                if memory_type and meta.get("type") != memory_type:
                     continue
+                if days:
+                    cutoff = int((time.time() - days * 86400) * 1000)
+                    if meta.get("timestamp", 0) < cutoff:
+                        continue
+                if row_id not in seen_ids:
+                    seen_ids.add(row_id)
+                    filtered.append({
+                        "id": row_id,
+                        "conversation_id": meta.get("conversation_id", ""),
+                        "role": "memory",
+                        "content": content,
+                        "importance": meta.get("importance", 5),
+                        "last_access_at": meta.get("last_access_at", 0),
+                        "timestamp": meta.get("timestamp", 0),
+                    })
+            return filtered
 
-            if row_id not in seen_ids:
-                seen_ids.add(row_id)
-                results.append({
-                    "id": row_id,
-                    "conversation_id": meta.get("conversation_id", ""),
-                    "role": "memory",
-                    "content": content,
-                    "importance": meta.get("importance", 5),
-                    "last_access_at": meta.get("last_access_at", 0),
-                    "timestamp": meta.get("timestamp", 0),
-                })
+        # 策略1: FTS5 trigram（>=3字符的关键词）
+        long_keywords = [k for k in keywords if len(k) >= 3]
+        if long_keywords:
+            try:
+                fts_query = " OR ".join(long_keywords)
+                rows = conn.execute(
+                    """SELECT e.id, e.content, e.metadata
+                       FROM embeddings_fts fts JOIN embeddings e ON fts.rowid = e.rowid
+                       WHERE fts MATCH ?
+                       ORDER BY rank LIMIT 20""",
+                    [fts_query]
+                ).fetchall()
+                results.extend(_apply_filters(rows))
+            except Exception:
+                pass
 
-        # 按 content 长度升序（短的更精确）
+        # 策略2: LIKE 兜底（短词 <3字符，或 FTS 没搜到时）
+        short_keywords = [k for k in keywords if len(k) < 3]
+        if short_keywords or not results:
+            fallback_keywords = short_keywords if short_keywords else keywords
+            like_conditions = ["e.content LIKE ?" for _ in fallback_keywords]
+            like_params = [f"%{k}%" for k in fallback_keywords]
+            like_clause = " OR ".join(like_conditions)
+            rows = conn.execute(
+                f"""SELECT e.id, e.content, e.metadata
+                    FROM embeddings e WHERE ({like_clause})
+                    ORDER BY length(e.content) ASC LIMIT 20""",
+                like_params
+            ).fetchall()
+            results.extend(_apply_filters(rows))
+
         results.sort(key=lambda x: len(x["content"]))
         return results
     except Exception:
@@ -820,13 +843,14 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             emb_results = _embeddings_keyword_search(query, memory_type=memory_type, days=days)
             # embeddings 表只存记忆，不传 msg_type（metadata 无 role 字段）
             vec_results = _vector_search(query, days=days, memory_type=memory_type)
-            # 合并 FTS 和 embeddings LIKE 结果（去重）
-            merged_keyword = fts_results
-            seen = {r.get("id") for r in fts_results}
+            # 合并 FTS 和 embeddings 搜索结果（按 content 去重，因为两张表 id 类型不同）
+            merged_keyword = list(fts_results)
+            seen_contents = {r.get("content", "")[:100] for r in fts_results}
             for r in emb_results:
-                if r.get("id") not in seen:
+                key = r.get("content", "")[:100]
+                if key not in seen_contents:
                     merged_keyword.append(r)
-                    seen.add(r.get("id"))
+                    seen_contents.add(key)
             results = _rrf_merge(merged_keyword, vec_results)
         else:
             return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"

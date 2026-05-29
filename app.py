@@ -197,6 +197,32 @@ async def startup():
         db_path=DB_PATH,
         embedding_client=_embedding_client
     )
+    # embeddings FTS5 索引（与 VectorStore 共用同一个 SQLite 文件）
+    async with get_db() as db:
+        await db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts
+            USING fts5(content, tokenize='trigram')
+        """)
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ai AFTER INSERT ON embeddings BEGIN
+                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
+            END
+        """)
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ad AFTER DELETE ON embeddings BEGIN
+                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+            END
+        """)
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS embeddings_fts_au AFTER UPDATE ON embeddings BEGIN
+                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
+            END
+        """)
+        await db.execute("INSERT INTO embeddings_fts(embeddings_fts) VALUES('rebuild')")
+        await db.commit()
+    logger.info("embeddings FTS5 索引已初始化")
+
     # 注入引用到工具模块，避免 HTTP 自调用死锁
     from agent.tools.basic_tools import set_memory_refs
     set_memory_refs(_vector_store, DB_PATH)
