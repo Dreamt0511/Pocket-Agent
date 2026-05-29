@@ -690,8 +690,8 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
         if type not in ("fact", "episodic"):
             return "type 必须是 'fact' 或 'episodic'"
 
-        if type == "episodic" and not _current_conversation_id:
-            return "保存失败: episodic 类型需要 conversation_id"
+        if not _current_conversation_id:
+            return "保存失败: 需要 conversation_id（请在会话中调用）"
 
         # 存入 messages 表（两种类型都存，带 memory_type 标记）
         if _current_conversation_id and _db_path_ref:
