@@ -178,10 +178,14 @@ class VectorStore:
         if not rows:
             return []
 
-        # 过滤（按 metadata 中的 conversation_id）
-        if where and "conversation_id" in where:
-            cid = where["conversation_id"]
-            rows = [r for r in rows if json.loads(r[2]).get("conversation_id") == cid]
+        # 过滤（按 metadata 中的所有 where 条件）
+        if where:
+            filtered = []
+            for r in rows:
+                meta = json.loads(r[2])
+                if all(meta.get(k) == v for k, v in where.items()):
+                    filtered.append(r)
+            rows = filtered
 
         # numpy 批量计算余弦相似度
         query_vec = np.array(query_embedding, dtype=np.float32)

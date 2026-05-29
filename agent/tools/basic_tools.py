@@ -9,6 +9,7 @@ import re
 import subprocess
 import sqlite3
 import time
+import uuid
 from typing import Dict, List, Optional
 from langchain_core.tools import tool
 import requests
@@ -342,7 +343,7 @@ def set_current_conversation_id(conversation_id: str):
 
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
-def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
+def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None, memory_type: str = None) -> list:
     """FTS5 trigram 搜索为主，搜不到时用 LIKE 补充"""
     if not _db_path_ref:
         return []
@@ -366,6 +367,9 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
                 return []
             conditions.append("m.role = ?")
             params.append(msg_type)
+        if memory_type:
+            conditions.append("m.memory_type = ?")
+            params.append(memory_type)
 
         where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
         fts_where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
@@ -666,7 +670,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 
     Args:
         content: 要记忆的内容，简洁明确
-        type: "fact" 存入向量数据库（跨会话），"episodic" 同时存入消息表和向量数据库（带会话上下文）。两者都支持语义搜索和关键词搜索。
+        type: "fact" 事实记忆（用户偏好、技术决定、知识性信息），"episodic" 事件记忆（操作结果、问题解决方案、时间相关事件）。两者都同时存入消息表（支持关键词搜索）和向量数据库（支持语义搜索）。
         importance: 重要性 1-10，自行判断打分。大多数记忆应在 3-5 分，只有真正影响后续决策的才值得 7 分以上。
 
         打分参考（仅供大致参考，不必死板遵守）：
@@ -678,65 +682,48 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 
         注意：不要每条都打高分，大部分记忆 3-5 分即可。高分要留给真正值得反复回忆的内容。
     """
+    t0 = time.monotonic()
     try:
-        t0 = time.monotonic()
         current_timestamp = int(time.time() * 1000)
+        msg_id = str(uuid.uuid4().int % (2**31))
 
-        if type == "fact":
-            # 存入 messages 表
-            if _current_conversation_id and _db_path_ref:
-                conn = None
-                try:
-                    conn = sqlite3.connect(_db_path_ref, timeout=30)
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA busy_timeout=30000")
-                    conn.execute(
-                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                        (_current_conversation_id, "memory", content, current_timestamp, importance)
-                    )
-                    conn.commit()
-                finally:
-                    if conn:
-                        conn.close()
-            # 存入向量数据库（包含 timestamp 用于时间过滤）
-            if _vector_store_ref:
-                _vector_store_ref.add(
-                    message_id=hash(content) % (2**31),
-                    content=content,
-                    metadata={"importance": importance, "type": "fact", "timestamp": current_timestamp}
-                )
-            elapsed = round(time.monotonic() - t0, 2)
-            return f"已保存事实记忆: {content[:50]}... (耗时 {elapsed}s)"
-
-        elif type == "episodic":
-            if not _current_conversation_id:
-                return "保存失败: episodic 类型需要 conversation_id"
-            if _db_path_ref:
-                conn = None
-                try:
-                    conn = sqlite3.connect(_db_path_ref, timeout=30)
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA busy_timeout=30000")
-                    conn.execute(
-                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                        (_current_conversation_id, "memory", content, current_timestamp, importance)
-                    )
-                    conn.commit()
-                finally:
-                    if conn:
-                        conn.close()
-            # 存入向量数据库（包含 timestamp 用于时间过滤）
-            if _vector_store_ref:
-                _vector_store_ref.add(
-                    message_id=hash(content) % (2**31),
-                    content=content,
-                    metadata={"importance": importance, "type": "episodic", "conversation_id": _current_conversation_id, "timestamp": current_timestamp}
-                )
-            elapsed = round(time.monotonic() - t0, 2)
-            return f"已保存事件记忆: {content[:50]}... (耗时 {elapsed}s)"
-
-        else:
+        if type not in ("fact", "episodic"):
             return "type 必须是 'fact' 或 'episodic'"
+
+        if type == "episodic" and not _current_conversation_id:
+            return "保存失败: episodic 类型需要 conversation_id"
+
+        # 存入 messages 表（两种类型都存，带 memory_type 标记）
+        if _current_conversation_id and _db_path_ref:
+            conn = None
+            try:
+                conn = sqlite3.connect(_db_path_ref, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, timestamp, importance, memory_type) VALUES (?, ?, ?, ?, ?, ?)",
+                    (_current_conversation_id, "memory", content, current_timestamp, importance, type)
+                )
+                conn.commit()
+            finally:
+                if conn:
+                    conn.close()
+
+        # 存入向量数据库
+        if _vector_store_ref:
+            metadata = {"importance": importance, "type": type, "timestamp": current_timestamp}
+            if type == "episodic":
+                metadata["conversation_id"] = _current_conversation_id
+            _vector_store_ref.add(
+                message_id=msg_id,
+                content=content,
+                metadata=metadata
+            )
+
+        elapsed = round(time.monotonic() - t0, 2)
+        label = "事实记忆" if type == "fact" else "事件记忆"
+        return f"已保存{label}: {content[:50]}... (耗时 {elapsed}s)"
+
     except Exception as e:
         elapsed = round(time.monotonic() - t0, 2)
         return f"保存出错: {e} (耗时 {elapsed}s)"
@@ -770,11 +757,13 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             # 只搜当前会话的原始对话 — 关键词检索，不做权重排序
             results = _fts_search(query, conversation_id=_current_conversation_id, days=days)
             results = [r for r in results if r.get("role") != "memory"][:5]
-        else:
-            # "memory" — 搜跨会话记忆，关键词 + 语义混合检索
-            fts_results = _fts_search(query, days=days, msg_type="memory")
+        elif scope == "memory":
+            # 搜跨会话记忆，关键词 + 语义混合检索
+            fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
             vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
             results = _rrf_merge(fts_results, vec_results)
+        else:
+            return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"
 
         if not results:
             return "未找到相关消息"

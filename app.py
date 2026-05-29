@@ -93,6 +93,12 @@ async def _init_db():
         except Exception:
             pass  # duplicate column — 已存在
 
+        # 兼容旧数据库：添加 memory_type 字段（区分 fact/episodic 记忆）
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN memory_type TEXT DEFAULT NULL")
+        except Exception:
+            pass  # duplicate column — 已存在
+
         # FTS5 虚拟表 —— 会话历史全文搜索（使用 trigram tokenizer 支持中文搜索）
         # 检查是否需要重建为 trigram tokenizer
         existing_fts = await db.execute_fetchall(
