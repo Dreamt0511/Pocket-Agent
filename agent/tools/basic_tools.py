@@ -747,23 +747,19 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
     Args:
         query: 搜索内容。优先用一句完整的话（如"用户之前提到的实习安排"），而不是零散关键词（如"实习 安排"）。完整句子能保留语义信息，搜索更准。
         scope: 搜索范围（影响 query 写法和检索策略）
-               - "all"（默认）: 搜索全部——记忆（agent 主动保存的重要信息）+ 原始消息，用语义+关键词混合检索。query 建议写成完整句子。
-               - "session": 只搜索当前会话的对话记录，适合回溯本轮对话中提到过的细节。query 可以是关键词或句子。
+               - "memory"（默认）: 搜索跨会话记忆（agent 主动保存的重要信息），用语义+关键词混合检索。query 建议写成完整句子。
+               - "session": 只搜索当前会话的原始对话记录（用户消息和 AI 回复），适合回溯本轮对话中提到过的细节。query 可以是关键词或句子。
         days: 时间过滤，只返回过去 N 天内的消息（如 days=7 表示过去 7 天）
-        msg_type: 消息类型过滤（仅 session 有效）
-                  - "user": 只搜用户消息
-                  - "assistant": 只搜 AI 回复
-                  - "memory": 只搜当前会话的记忆
     """
     try:
         if scope == "session":
-            # 只搜当前会话 — 关键词检索，不做权重排序
-            results = _fts_search(query, conversation_id=_current_conversation_id, days=days, msg_type=msg_type)
-            results = results[:5]
+            # 只搜当前会话的原始对话 — 关键词检索，不做权重排序
+            results = _fts_search(query, conversation_id=_current_conversation_id, days=days)
+            results = [r for r in results if r.get("role") != "memory"][:5]
         else:
-            # "all" — 记忆 + 原始消息混合检索
-            fts_results = _fts_search(query, days=days)
-            vec_results = _vector_search(query, days=days)
+            # "memory" — 搜跨会话记忆，关键词 + 语义混合检索
+            fts_results = _fts_search(query, days=days, msg_type="memory")
+            vec_results = _vector_search(query, days=days, msg_type="memory")
             results = _rrf_merge(fts_results, vec_results)
 
         if not results:
