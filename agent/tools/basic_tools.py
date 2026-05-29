@@ -457,6 +457,63 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
     except Exception:
         return []
 
+def _embeddings_keyword_search(query: str, memory_type: str = None, days: int = None) -> list:
+    """在 embeddings 表中用 LIKE 搜索记忆内容（补充 messages 表的 FTS 搜索）"""
+    if not _db_path_ref:
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(_db_path_ref, timeout=10)
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        keywords = query.split()
+        if not keywords:
+            keywords = [query]
+
+        # 获取所有 embedding 记录，按 metadata 过滤
+        rows = conn.execute("SELECT id, content, metadata FROM embeddings").fetchall()
+        results = []
+        seen_ids = set()
+
+        for row_id, content, meta_json in rows:
+            # LIKE 匹配
+            if not any(k in content for k in keywords):
+                continue
+
+            meta = json.loads(meta_json) if meta_json else {}
+
+            # memory_type 过滤
+            if memory_type and meta.get("type") != memory_type:
+                continue
+
+            # days 时间过滤
+            if days:
+                cutoff = int((time.time() - days * 86400) * 1000)
+                if meta.get("timestamp", 0) < cutoff:
+                    continue
+
+            if row_id not in seen_ids:
+                seen_ids.add(row_id)
+                results.append({
+                    "id": row_id,
+                    "conversation_id": meta.get("conversation_id", ""),
+                    "role": "memory",
+                    "content": content,
+                    "importance": meta.get("importance", 5),
+                    "last_access_at": meta.get("last_access_at", 0),
+                    "timestamp": meta.get("timestamp", 0),
+                })
+
+        # 按 content 长度升序（短的更精确）
+        results.sort(key=lambda x: len(x["content"]))
+        return results
+    except Exception:
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
 def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3) -> list:
     """综合排序：RRF + 时间衰减 + 重要性
     参考 EchoMind 设计：语义相关性(0.45) > 重要性(0.3) > 时间衰减(0.25)
@@ -758,10 +815,18 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             results = _fts_search(query, conversation_id=_current_conversation_id, days=days)
             results = [r for r in results if r.get("role") != "memory"][:5]
         elif scope == "memory":
-            # 搜跨会话记忆，关键词 + 语义混合检索
+            # 搜跨会话记忆：messages FTS + embeddings LIKE + 向量语义
             fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
+            emb_results = _embeddings_keyword_search(query, memory_type=memory_type, days=days)
             vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
-            results = _rrf_merge(fts_results, vec_results)
+            # 合并 FTS 和 embeddings LIKE 结果（去重）
+            merged_keyword = fts_results
+            seen = {r.get("id") for r in fts_results}
+            for r in emb_results:
+                if r.get("id") not in seen:
+                    merged_keyword.append(r)
+                    seen.add(r.get("id"))
+            results = _rrf_merge(merged_keyword, vec_results)
         else:
             return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"
 
