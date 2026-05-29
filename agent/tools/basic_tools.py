@@ -567,7 +567,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
 
     Args:
         content: 要记忆的内容，简洁明确
-        type: "fact" 存入向量数据库（语义搜索），"episodic" 存入消息表（关键词搜索），两者都支持向量检索
+        type: "fact" 存入向量数据库（跨会话），"episodic" 同时存入消息表和向量数据库（带会话上下文）。两者都支持语义搜索和关键词搜索。
         importance: 重要性 1-10，自行判断打分。大多数记忆应在 3-5 分，只有真正影响后续决策的才值得 7 分以上。
 
         打分参考（仅供大致参考，不必死板遵守）：

@@ -117,8 +117,8 @@ cd ~/llama.cpp
 | 层级 | 存储 | 用途 | 工具 |
 |------|------|------|------|
 | 用户画像 | `memory/user_profile.md` | 永久性个人信息 | `update_user_profile` |
-| 事实记忆 | SQLite 向量索引 | 项目决定、技术选型 | `save_memory(type="fact")` |
-| 事件记忆 | SQLite FTS5 + 向量索引 | 重要事件结果 | `save_memory(type="episodic")` |
+| 事实记忆 | 向量索引（跨会话） | 项目决定、技术选型 | `save_memory(type="fact")` |
+| 事件记忆 | 消息表 + 向量索引（带会话上下文） | 重要事件结果 | `save_memory(type="episodic")` |
 | 程序记忆 | `auto-skills/main/` SKILL.md | 操作流程 | `file_write` |
 
 ### 记忆工具
