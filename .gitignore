@@ -133,3 +133,6 @@ termux指令.md
 Pocket-Agent优化报告.md
 docs/memory-system-design.md
 审查报告.md
+
+# 测试脚本目录
+my_test_scripts/
