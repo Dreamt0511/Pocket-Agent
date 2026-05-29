@@ -452,15 +452,58 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
         return []
 
 def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3) -> list:
-    """综合排序：FTS 结果优先，向量结果补充
-    简化排序逻辑，避免时间衰减导致相关结果被挤掉
+    """综合排序：RRF + 时间衰减 + 重要性
+    参考 EchoMind 设计：语义相关性(0.45) > 重要性(0.3) > 时间衰减(0.25)
+    时间衰减使用指数衰减（DECAY_RATE=0.995 每小时）
     """
-    # FTS 结果已按相关性排序（短消息优先），直接取前 5 条
-    if fts_results:
-        return fts_results[:5]
+    current_time = time.time() * 1000  # 毫秒
+    DECAY_RATE = 0.995  # 每小时衰减
 
-    # 如果没有 FTS 结果，返回向量结果
-    return vec_results[:5]
+    scores = {}
+
+    # FTS5 结果按 rank 排序
+    for rank, msg in enumerate(fts_results):
+        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        rrf_score = 1 / (k + rank + 1)
+        scores[key] = {"rrf": rrf_score, "msg": msg}
+
+    # 向量结果按 similarity 排序
+    for rank, msg in enumerate(vec_results):
+        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        rrf_score = 1 / (k + rank + 1)
+        if key in scores:
+            scores[key]["rrf"] += rrf_score
+        else:
+            scores[key] = {"rrf": rrf_score, "msg": msg}
+
+    # 计算综合分数
+    for key, data in scores.items():
+        msg = data["msg"]
+
+        # 语义相关性（RRF 分数）
+        semantic_score = data["rrf"]
+
+        # 时间相关性：指数衰减
+        last_access = msg.get("last_access_at", current_time)
+        if last_access == 0:
+            last_access = current_time
+        hours_passed = (current_time - last_access) / 3600000  # 毫秒转小时
+        recency_score = DECAY_RATE ** hours_passed
+
+        # 重要性
+        importance_score = msg.get("importance", 3) / 10  # 归一化到 0-1
+
+        # 综合分数
+        data["final_score"] = (
+            alpha * semantic_score +
+            beta * recency_score +
+            gamma * importance_score
+        )
+
+    # 按综合分数排序
+    sorted_items = sorted(scores.values(), key=lambda x: x["final_score"], reverse=True)
+
+    return [item["msg"] for item in sorted_items[:5]]
 
 
 @tool
@@ -706,6 +749,7 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
         scope: 搜索范围
                - "all"（默认）: 搜索全部——当前会话记录 + 跨会话的事实记忆和事件记忆，混合排序返回最相关的结果
                - "session": 只搜索当前会话的对话记录，适合回溯本轮对话中提到过的细节,当你的上下文中有内容时无需检索此项
+               - "memory": 只搜记忆（需要语义+关键词混合检索）
         days: 时间过滤，只返回过去 N 天内的消息（如 days=7 表示过去 7 天）
         msg_type: 消息类型过滤
                   - "user": 只搜用户消息
@@ -713,29 +757,34 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
                   - "memory": 只搜记忆
     """
     try:
-        fts_results = []
-        vec_results = []
-
         if scope == "session":
-            # 只搜当前会话
-            fts_results = _fts_search(query, conversation_id=_current_conversation_id, days=days, msg_type=msg_type)
-        else:
-            # "all" — 当前会话 + 跨会话记忆
-            fts_results = _fts_search(query, days=days, msg_type=msg_type)
-            vec_results = _vector_search(query, days=days, msg_type=msg_type)
-
-        # 综合排序
-        if fts_results and vec_results:
+            # 只搜当前会话 — 关键词检索，不做权重排序
+            results = _fts_search(query, conversation_id=_current_conversation_id, days=days, msg_type=msg_type)
+            results = results[:5]
+        elif scope == "memory":
+            # 只搜记忆 — 关键词 + 语义并行检索，RRF 排序后权重排序
+            fts_results = _fts_search(query, days=days, msg_type="memory")
+            vec_results = _vector_search(query, days=days, msg_type="memory")
             results = _rrf_merge(fts_results, vec_results)
-        elif vec_results:
-            results = vec_results[:5]
         else:
-            results = fts_results[:5]
+            # "all" — 原始消息关键词检索 + 记忆混合检索
+            # 原始消息：关键词检索，直接返回
+            msg_results = _fts_search(query, days=days, msg_type=msg_type or "user")
+            msg_results = [r for r in msg_results if r.get("role") != "memory"][:3]
+
+            # 记忆：关键词 + 语义并行检索，RRF 排序后权重排序
+            memory_fts = _fts_search(query, days=days, msg_type="memory")
+            memory_vec = _vector_search(query, days=days, msg_type="memory")
+            memory_results = _rrf_merge(memory_fts, memory_vec)
+
+            # 合并：记忆优先，原始消息补充
+            results = memory_results + msg_results
+            results = results[:5]
 
         if not results:
             return "未找到相关消息"
 
-        # 更新 last_access_at
+        # 更新 last_access_at（只更新记忆）
         if results and _db_path_ref:
             current_timestamp = int(time.time() * 1000)
             conn = None
@@ -743,20 +792,20 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
                 conn = sqlite3.connect(_db_path_ref, timeout=30)
                 conn.execute("PRAGMA busy_timeout=5000")
                 for msg in results:
-                    if msg.get("id"):
+                    if msg.get("id") and msg.get("role") == "memory":
                         conn.execute(
                             "UPDATE messages SET last_access_at = ? WHERE id = ?",
                             (current_timestamp, msg["id"])
                         )
                 conn.commit()
             except Exception:
-                pass  # 更新失败不影响返回结果
+                pass
             finally:
                 if conn:
                     conn.close()
 
         lines = []
-        for msg in results:  # _rrf_merge 已返回 5 条，无需再切片
+        for msg in results:
             role_label = {"user": "用户", "assistant": "AI", "memory": "记忆"}.get(msg.get("role", ""), msg.get("role", ""))
             session_tag = f" [会话:{msg.get('conversation_id','')[:8]}]" if msg.get("conversation_id") else ""
             lines.append(f"[{role_label}]{session_tag} {msg['content']}")

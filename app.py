@@ -133,23 +133,23 @@ async def _init_db():
 
 
 async def _cleanup_old_messages():
-    """清理低重要性旧消息的向量索引（保留策略：30天+importance=1 的释放embedding）"""
+    """清理低重要性旧记忆的向量索引（保留策略：30天+importance<=2 的记忆释放embedding）"""
     thirty_days_ago = int((time.time() - 30 * 24 * 3600) * 1000)
     try:
         async with get_db() as db:
-            # 查询需要清理的消息 ID
+            # 查询需要清理的记忆 ID（只清理 memory 类型的消息）
             old_message_ids = await db.execute_fetchall(
                 """SELECT id FROM messages
-                   WHERE importance <= 2 AND timestamp < ?""",
+                   WHERE role = 'memory' AND importance <= 2 AND timestamp < ?""",
                 (thirty_days_ago,)
             )
             # 同时清理向量索引
             if _vector_store:
                 for row in old_message_ids:
                     _vector_store.delete(row[0])
-            logger.info(f"已清理 {len(old_message_ids)} 条低重要性旧消息的向量索引")
+            logger.info(f"已清理 {len(old_message_ids)} 条低重要性旧记忆的向量索引")
     except Exception:
-        logger.warning("清理旧消息向量索引失败", exc_info=True)
+        logger.warning("清理旧记忆向量索引失败", exc_info=True)
 
 
 @app.on_event("startup")
@@ -428,7 +428,6 @@ async def chat(request: Request):
     message = data.get("message", "")
     req_config = data.get("config", {})
     conversation_id = data.get("conversation_id", "default-session")
-    importance = data.get("importance", 3)
 
     # 设置当前会话ID，供 search_memory 工具使用
     from agent.tools.basic_tools import set_current_conversation_id
@@ -458,17 +457,17 @@ async def chat(request: Request):
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (now, conversation_id)
             )
-        # 保存用户消息
+        # 保存用户消息（原始对话不设 importance）
         cursor = await db.execute(
-            "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-            (conversation_id, "user", message, now, importance)
+            "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (conversation_id, "user", message, now)
         )
         await db.commit()
         user_message_id = cursor.lastrowid
 
     # 已禁用自动嵌入：改为 Agent 主动调用 save_memory 工具
     # import asyncio
-    # asyncio.create_task(_add_to_vector_store(user_message_id, message, conversation_id, importance))
+    # asyncio.create_task(_add_to_vector_store(user_message_id, message, conversation_id))
 
     async def generate():
         global _cancel_requested
@@ -522,13 +521,13 @@ async def chat(request: Request):
             try:
                 async with get_db() as db:
                     cursor = await db.execute(
-                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                        (conversation_id, "assistant", full_response, int(time.time() * 1000), importance)
+                        "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                        (conversation_id, "assistant", full_response, int(time.time() * 1000))
                     )
                     await db.commit()
                     ai_message_id = cursor.lastrowid
                 # 已禁用自动嵌入：改为 Agent 主动调用 save_memory 工具
-                # asyncio.create_task(_add_to_vector_store(ai_message_id, full_response, conversation_id, importance))
+                # asyncio.create_task(_add_to_vector_store(ai_message_id, full_response, conversation_id))
             except Exception:
                 logger.exception("Failed to save assistant message")
 
