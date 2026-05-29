@@ -438,7 +438,7 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
         if memory_type:
             where["type"] = memory_type
 
-        results = _vector_store_ref.query(query, n_results=20, where=where if where else None)
+        results = _vector_store_ref.query(query, n_results=20, where=where or None)
 
         # 应用时间过滤
         if days:
