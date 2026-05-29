@@ -358,7 +358,7 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             fts_keywords = [f"{k}*" for k in keywords]
             fts_query = " OR ".join(fts_keywords)
         else:
-            fts_query = f"{query}*
+            fts_query = f"{query}*"
 
         # 构建查询条件
         conditions = ["messages_fts MATCH ?"]
