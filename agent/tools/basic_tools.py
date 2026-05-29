@@ -380,13 +380,14 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
         results = []
 
         # LIKE 搜索（能覆盖所有中文关键词）
+        # 短消息优先（更可能是精确匹配），同长度按时间倒序
         like_conditions = [f"m.content LIKE ?" for _ in keywords]
         like_params = [f"%{k}%" for k in keywords]
         like_clause = " OR ".join(like_conditions)
         rows = conn.execute(
             f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
                 FROM messages m WHERE ({like_clause}){where_extra}
-                ORDER BY m.timestamp DESC LIMIT 20""",
+                ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
             like_params + params
         ).fetchall()
         for r in rows:
