@@ -421,7 +421,7 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
         if conn:
             conn.close()
 
-def _vector_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
+def _vector_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None, memory_type: str = None) -> list:
     """向量语义搜索（直接查询，避免 HTTP 自调用死锁）"""
     if not _vector_store_ref:
         return []
@@ -431,6 +431,8 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
             where["conversation_id"] = conversation_id
         if msg_type:
             where["role"] = msg_type
+        if memory_type:
+            where["type"] = memory_type
 
         results = _vector_store_ref.query(query, n_results=20, where=where if where else None)
 
@@ -741,15 +743,27 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 
 
 @tool
-def search_memory(query: str, scope: str = "all", days: int = None, msg_type: str = None) -> str:
-    """搜索历史消息和跨会话记忆，找回遗忘的细节。当你不确定某个信息、需要回忆之前的对话内容、或想查找用户之前提到过的决定/偏好时，应该调用此工具。
+def search_memory(query: str, scope: str = "memory", memory_type: str = None, days: int = None) -> str:
+    """搜索历史消息和跨会话记忆，找回遗忘的细节。
+
+    何时调用：
+    - 用户提到"之前""上次""记得"等回忆性词汇
+    - 不确定某个信息，需要回忆之前的对话内容
+    - 查找用户之前提到过的决定、偏好、事件结果
+
+    参数选择：
+    - scope="session": 回溯本轮对话细节，确认用户刚说过什么。5 条结果。
+    - scope="memory":（默认）搜索跨会话记忆，用语义+关键词混合检索。
+      - memory_type=None: 不限类型，搜全部记忆
+      - memory_type="fact": 只搜事实记忆（用户偏好、技术决定、知识性信息）
+      - memory_type="episodic": 只搜事件记忆（操作结果、问题解决方案、时间相关事件）
+    - days=7: 只返回过去 7 天内的结果
 
     Args:
-        query: 搜索内容。优先用一句完整的话（如"用户之前提到的实习安排"），而不是零散关键词（如"实习 安排"）。完整句子能保留语义信息，搜索更准。
-        scope: 搜索范围（影响 query 写法和检索策略）
-               - "memory"（默认）: 搜索跨会话记忆（agent 主动保存的重要信息），用语义+关键词混合检索。query 建议写成完整句子。
-               - "session": 只搜索当前会话的原始对话记录（用户消息和 AI 回复），适合回溯本轮对话中提到过的细节。query 可以是关键词或句子。
-        days: 时间过滤，只返回过去 N 天内的消息（如 days=7 表示过去 7 天）
+        query: 搜索内容。优先用完整句子（如"用户之前提到的实习安排"），保留语义信息搜索更准。
+        scope: "memory"（默认）搜跨会话记忆，"session" 搜当前会话原始对话。
+        memory_type: 记忆类型过滤，仅 scope="memory" 时生效。"fact" 只搜事实，"episodic" 只搜事件，不传则全部。
+        days: 时间过滤，只返回过去 N 天内的结果。
     """
     try:
         if scope == "session":
@@ -759,7 +773,7 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
         else:
             # "memory" — 搜跨会话记忆，关键词 + 语义混合检索
             fts_results = _fts_search(query, days=days, msg_type="memory")
-            vec_results = _vector_search(query, days=days, msg_type="memory")
+            vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
             results = _rrf_merge(fts_results, vec_results)
 
         if not results:
