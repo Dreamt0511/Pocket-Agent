@@ -946,11 +946,11 @@ class LangChainPocketAgent:
                         )
                     await self._run_executor_foreground(task_path, task_id)
 
-            # ── 技能验证：通知主Agent检查新沉淀的技能 ──
+            # ── 技能验证：立即通知主Agent检查新沉淀的技能（后台静默） ──
             if self._pending_skill_verification:
                 skills_str = ", ".join(self._pending_skill_verification)
                 try:
-                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请对照 skill-creator 格式检查并修正。")
+                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请用 file_read 读取并对照 skill-creator 格式检查，不符合的用 file_write 修正。")
                     await self.agent.update_state(self.config, {"messages": [msg]})
                 except Exception:
                     pass
@@ -1247,11 +1247,11 @@ class LangChainPocketAgent:
                 except Exception as e:
                     yield {"type": "token", "content": f"\n[error] 技能沉淀异常: {str(e)[:100]}\n"}
 
-            # ── 技能验证：通知主Agent检查新沉淀的技能 ──
+            # ── 技能验证：立即通知主Agent检查新沉淀的技能（后台静默） ──
             if self._pending_skill_verification:
                 skills_str = ", ".join(self._pending_skill_verification)
                 try:
-                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请对照 skill-creator 格式检查并修正。")
+                    msg = HumanMessage(content=f"【技能验证】新技能：{skills_str}。请用 file_read 读取并对照 skill-creator 格式检查，不符合的用 file_write 修正。")
                     await self.agent.update_state(config, {"messages": [msg]})
                 except Exception:
                     pass
@@ -1753,6 +1753,7 @@ class LangChainPocketAgent:
                 if skill_was_written:
                     if self.ui:
                         self.ui.console.print(f"\n  [dim]\U0001f4dd 子Agent已沉淀技能[/dim]")
+                    # 记录待验证技能，立即通知主Agent验证
                     self._pending_skill_verification.extend(new_skills)
                 else:
                     # 检查是否真的执行了操作（executor_step > 2 说明有过实际工具调用）

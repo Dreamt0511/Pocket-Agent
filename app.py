@@ -87,6 +87,12 @@ async def _init_db():
         except Exception:
             pass  # duplicate column — 已存在
 
+        # 兼容旧数据库：添加 last_access_at 字段
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN last_access_at INTEGER DEFAULT 0")
+        except Exception:
+            pass  # duplicate column — 已存在
+
         # FTS5 虚拟表 —— 会话历史全文搜索
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id)

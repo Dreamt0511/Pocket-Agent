@@ -342,71 +342,139 @@ def set_current_conversation_id(conversation_id: str):
 
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
-def _fts_search(query: str, conversation_id: str = None) -> list:
+def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
     """FTS5 全文搜索（直接查询，避免 HTTP 自调用死锁）"""
     if not _db_path_ref:
         return []
+    conn = None
     try:
         conn = sqlite3.connect(_db_path_ref, timeout=10)
         conn.execute("PRAGMA busy_timeout=5000")
+
+        # 将查询关键词用 OR 连接
+        keywords = query.split()
+        fts_query = " OR ".join(keywords) if keywords else query
+
+        # 构建查询条件
+        conditions = ["messages_fts MATCH ?"]
+        params = [fts_query]
+
         if conversation_id:
-            rows = conn.execute(
-                """SELECT m.id, m.conversation_id, m.role, m.content, m.importance
-                   FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
-                   WHERE messages_fts MATCH ? AND m.conversation_id = ?
-                   ORDER BY rank LIMIT 20""",
-                (query, conversation_id)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT m.id, m.conversation_id, m.role, m.content, m.importance
-                   FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
-                   WHERE messages_fts MATCH ?
-                   ORDER BY rank LIMIT 20""",
-                (query,)
-            ).fetchall()
-        conn.close()
-        return [{"conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4]} for r in rows]
+            conditions.append("m.conversation_id = ?")
+            params.append(conversation_id)
+
+        if days:
+            conditions.append("m.timestamp > ?")
+            params.append(int((time.time() - days * 86400) * 1000))
+
+        # msg_type 白名单验证，防止 SQL 注入
+        if msg_type:
+            valid_types = ("user", "assistant", "memory")
+            if msg_type not in valid_types:
+                return []
+            conditions.append("m.role = ?")
+            params.append(msg_type)
+
+        where_clause = " AND ".join(conditions)
+
+        rows = conn.execute(
+            f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
+                WHERE {where_clause}
+                ORDER BY rank LIMIT 20""",
+            params
+        ).fetchall()
+        return [{"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]} for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
-def _vector_search(query: str, conversation_id: str = None) -> list:
+def _vector_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
     """向量语义搜索（直接查询，避免 HTTP 自调用死锁）"""
     if not _vector_store_ref:
         return []
     try:
-        where = {"conversation_id": conversation_id} if conversation_id else None
-        results = _vector_store_ref.query(query, n_results=20, where=where)
+        where = {}
+        if conversation_id:
+            where["conversation_id"] = conversation_id
+        if msg_type:
+            where["role"] = msg_type
+
+        results = _vector_store_ref.query(query, n_results=20, where=where if where else None)
+
+        # 应用时间过滤
+        if days:
+            cutoff_time = int((time.time() - days * 86400) * 1000)
+            results = [r for r in results if r.get("metadata", {}).get("timestamp", 0) > cutoff_time]
+
         return [{
+            "id": r.get("id", ""),
             "role": r.get("metadata", {}).get("role", ""),
             "content": r.get("document", ""),
             "conversation_id": r.get("metadata", {}).get("conversation_id", ""),
             "importance": r.get("metadata", {}).get("importance", 1),
+            "last_access_at": r.get("metadata", {}).get("last_access_at", 0),
             "similarity": 1 - r.get("distance", 0),
         } for r in results]
     except Exception:
         return []
 
-def _rrf_merge(fts_results: list, vec_results: list, k: int = 60) -> list:
-    """Reciprocal Rank Fusion 混合排序（参考 EchoMind 设计）"""
+def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3) -> list:
+    """综合排序：RRF + 时间衰减 + 重要性
+    参考 EchoMind 设计：语义相关性(0.45) > 重要性(0.3) > 时间衰减(0.25)
+    """
+    current_time = time.time() * 1000  # 毫秒
+    DECAY_RATE = 0.995  # 每小时衰减
+
     scores = {}
+
     # FTS5 结果按 rank 排序
     for rank, msg in enumerate(fts_results):
         key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
-        scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+        rrf_score = 1 / (k + rank + 1)
+        scores[key] = {"rrf": rrf_score, "msg": msg}
+
     # 向量结果按 similarity 排序
     for rank, msg in enumerate(vec_results):
         key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
-        scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-    # 按 RRF 分数排序
-    sorted_keys = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    # 从原始结果中恢复完整消息
-    all_msgs = {}
-    for msg in fts_results + vec_results:
-        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
-        if key not in all_msgs:
-            all_msgs[key] = msg
-    return [all_msgs[k] for k in sorted_keys if k in all_msgs]
+        rrf_score = 1 / (k + rank + 1)
+        if key in scores:
+            scores[key]["rrf"] += rrf_score
+        else:
+            scores[key] = {"rrf": rrf_score, "msg": msg}
+
+    # 计算综合分数
+    for key, data in scores.items():
+        msg = data["msg"]
+
+        # 语义相关性（RRF 分数）
+        semantic_score = data["rrf"]
+
+        # 时间衰减：使用 last_access_at（最近访问时间）
+        # 被频繁访问的记忆保持优先级，符合"常用记忆更容易被检索"的逻辑
+        last_access = msg.get("last_access_at", current_time)
+        if last_access == 0:
+            last_access = current_time
+        hours_passed = (current_time - last_access) / 3600000  # 转换为小时
+        recency_score = DECAY_RATE ** hours_passed
+
+        # 重要性
+        importance_score = msg.get("importance", 1) / 10  # 归一化到 0-1
+
+        # 综合分数
+        data["final_score"] = (
+            alpha * semantic_score +
+            beta * recency_score +
+            gamma * importance_score
+        )
+
+    # 按综合分数排序
+    sorted_items = sorted(scores.values(), key=lambda x: x["final_score"], reverse=True)
+
+    # 返回最相关的 5 条
+    return [item["msg"] for item in sorted_items[:5]]
 
 
 @tool
@@ -581,12 +649,30 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
     """
     try:
         t0 = time.monotonic()
+        current_timestamp = int(time.time() * 1000)
+
         if type == "fact":
+            # 存入 messages 表
+            if _current_conversation_id and _db_path_ref:
+                conn = None
+                try:
+                    conn = sqlite3.connect(_db_path_ref, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA busy_timeout=30000")
+                    conn.execute(
+                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                        (_current_conversation_id, "memory", content, current_timestamp, importance)
+                    )
+                    conn.commit()
+                finally:
+                    if conn:
+                        conn.close()
+            # 存入向量数据库（包含 timestamp 用于时间过滤）
             if _vector_store_ref:
                 _vector_store_ref.add(
                     message_id=hash(content) % (2**31),
                     content=content,
-                    metadata={"importance": importance, "type": "fact"}
+                    metadata={"importance": importance, "type": "fact", "timestamp": current_timestamp}
                 )
             elapsed = round(time.monotonic() - t0, 2)
             return f"已保存事实记忆: {content[:50]}... (耗时 {elapsed}s)"
@@ -595,20 +681,25 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
             if not _current_conversation_id:
                 return "保存失败: episodic 类型需要 conversation_id"
             if _db_path_ref:
-                conn = sqlite3.connect(_db_path_ref, timeout=30)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA busy_timeout=30000")
-                conn.execute(
-                    "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                    (_current_conversation_id, "memory", content, int(time.time() * 1000), importance)
-                )
-                conn.commit()
-                conn.close()
+                conn = None
+                try:
+                    conn = sqlite3.connect(_db_path_ref, timeout=30)
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA busy_timeout=30000")
+                    conn.execute(
+                        "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+                        (_current_conversation_id, "memory", content, current_timestamp, importance)
+                    )
+                    conn.commit()
+                finally:
+                    if conn:
+                        conn.close()
+            # 存入向量数据库（包含 timestamp 用于时间过滤）
             if _vector_store_ref:
                 _vector_store_ref.add(
                     message_id=hash(content) % (2**31),
                     content=content,
-                    metadata={"importance": importance, "type": "episodic", "conversation_id": _current_conversation_id}
+                    metadata={"importance": importance, "type": "episodic", "conversation_id": _current_conversation_id, "timestamp": current_timestamp}
                 )
             elapsed = round(time.monotonic() - t0, 2)
             return f"已保存事件记忆: {content[:50]}... (耗时 {elapsed}s)"
@@ -621,7 +712,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
 
 
 @tool
-def search_memory(query: str, scope: str = "all") -> str:
+def search_memory(query: str, scope: str = "all", days: int = None, msg_type: str = None) -> str:
     """搜索历史消息和跨会话记忆，找回遗忘的细节。当你不确定某个信息、需要回忆之前的对话内容、或想查找用户之前提到过的决定/偏好时，应该调用此工具。
 
     Args:
@@ -629,6 +720,11 @@ def search_memory(query: str, scope: str = "all") -> str:
         scope: 搜索范围
                - "all"（默认）: 搜索全部——当前会话记录 + 跨会话的事实记忆和事件记忆，混合排序返回最相关的结果
                - "session": 只搜索当前会话的对话记录，适合回溯本轮对话中提到过的细节,当你的上下文中有内容时无需检索此项
+        days: 时间过滤，只返回过去 N 天内的消息（如 days=7 表示过去 7 天）
+        msg_type: 消息类型过滤
+                  - "user": 只搜用户消息
+                  - "assistant": 只搜 AI 回复
+                  - "memory": 只搜记忆
     """
     try:
         fts_results = []
@@ -636,25 +732,45 @@ def search_memory(query: str, scope: str = "all") -> str:
 
         if scope == "session":
             # 只搜当前会话
-            fts_results = _fts_search(query, conversation_id=_current_conversation_id)
+            fts_results = _fts_search(query, conversation_id=_current_conversation_id, days=days, msg_type=msg_type)
         else:
             # "all" — 当前会话 + 跨会话记忆
-            fts_results = _fts_search(query)
-            vec_results = _vector_search(query)
+            fts_results = _fts_search(query, days=days, msg_type=msg_type)
+            vec_results = _vector_search(query, days=days, msg_type=msg_type)
 
-        # RRF 混合排序
+        # 综合排序
         if fts_results and vec_results:
             results = _rrf_merge(fts_results, vec_results)
         elif vec_results:
-            results = vec_results
+            results = vec_results[:5]
         else:
-            results = fts_results
+            results = fts_results[:5]
 
         if not results:
             return "未找到相关消息"
 
+        # 更新 last_access_at
+        if results and _db_path_ref:
+            current_timestamp = int(time.time() * 1000)
+            conn = None
+            try:
+                conn = sqlite3.connect(_db_path_ref, timeout=30)
+                conn.execute("PRAGMA busy_timeout=5000")
+                for msg in results:
+                    if msg.get("id"):
+                        conn.execute(
+                            "UPDATE messages SET last_access_at = ? WHERE id = ?",
+                            (current_timestamp, msg["id"])
+                        )
+                conn.commit()
+            except Exception:
+                pass  # 更新失败不影响返回结果
+            finally:
+                if conn:
+                    conn.close()
+
         lines = []
-        for msg in results[:20]:
+        for msg in results:  # _rrf_merge 已返回 5 条，无需再切片
             role_label = {"user": "用户", "assistant": "AI", "memory": "记忆"}.get(msg.get("role", ""), msg.get("role", ""))
             session_tag = f" [会话:{msg.get('conversation_id','')[:8]}]" if msg.get("conversation_id") else ""
             lines.append(f"[{role_label}]{session_tag} {msg['content']}")
