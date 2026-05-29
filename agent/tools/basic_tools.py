@@ -452,59 +452,15 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
         return []
 
 def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3) -> list:
-    """综合排序：RRF + 时间衰减 + 重要性
-    参考 EchoMind 设计：语义相关性(0.45) > 重要性(0.3) > 时间衰减(0.25)
+    """综合排序：FTS 结果优先，向量结果补充
+    简化排序逻辑，避免时间衰减导致相关结果被挤掉
     """
-    current_time = time.time() * 1000  # 毫秒
-    DECAY_RATE = 0.995  # 每小时衰减
+    # FTS 结果已按相关性排序（短消息优先），直接取前 5 条
+    if fts_results:
+        return fts_results[:5]
 
-    scores = {}
-
-    # FTS5 结果按 rank 排序
-    for rank, msg in enumerate(fts_results):
-        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
-        rrf_score = 1 / (k + rank + 1)
-        scores[key] = {"rrf": rrf_score, "msg": msg}
-
-    # 向量结果按 similarity 排序
-    for rank, msg in enumerate(vec_results):
-        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
-        rrf_score = 1 / (k + rank + 1)
-        if key in scores:
-            scores[key]["rrf"] += rrf_score
-        else:
-            scores[key] = {"rrf": rrf_score, "msg": msg}
-
-    # 计算综合分数
-    for key, data in scores.items():
-        msg = data["msg"]
-
-        # 语义相关性（RRF 分数）
-        semantic_score = data["rrf"]
-
-        # 时间衰减：使用 last_access_at（最近访问时间）
-        # 被频繁访问的记忆保持优先级，符合"常用记忆更容易被检索"的逻辑
-        last_access = msg.get("last_access_at", current_time)
-        if last_access == 0:
-            last_access = current_time
-        hours_passed = (current_time - last_access) / 3600000  # 转换为小时
-        recency_score = DECAY_RATE ** hours_passed
-
-        # 重要性
-        importance_score = msg.get("importance", 3) / 10  # 归一化到 0-1
-
-        # 综合分数
-        data["final_score"] = (
-            alpha * semantic_score +
-            beta * recency_score +
-            gamma * importance_score
-        )
-
-    # 按综合分数排序
-    sorted_items = sorted(scores.values(), key=lambda x: x["final_score"], reverse=True)
-
-    # 返回最相关的 5 条
-    return [item["msg"] for item in sorted_items[:5]]
+    # 如果没有 FTS 结果，返回向量结果
+    return vec_results[:5]
 
 
 @tool
