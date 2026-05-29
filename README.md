@@ -74,7 +74,8 @@ EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
 # 从 .env 读取模型路径
 EMBED_MODEL="$(grep '^EMBEDDING_MODEL_PATH=' ~/Pocket-Agent/.env | cut -d= -f2 | tr -d '\"')"
 
-llama-server \
+cd ~/llama.cpp
+./build/bin/llama-server \
   -m "$EMBED_MODEL" \
   --embedding \
   -c 8192 \
