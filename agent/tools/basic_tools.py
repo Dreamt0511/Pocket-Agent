@@ -753,6 +753,7 @@ def search_memory(query: str, scope: str = "all", days: int = None, msg_type: st
         msg_type: 消息类型过滤（仅 session 有效）
                   - "user": 只搜用户消息
                   - "assistant": 只搜 AI 回复
+                  - "memory": 只搜当前会话的记忆
     """
     try:
         if scope == "session":
