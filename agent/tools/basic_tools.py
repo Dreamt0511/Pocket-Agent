@@ -343,7 +343,7 @@ def set_current_conversation_id(conversation_id: str):
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
 def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
-    """FTS5 全文搜索 + LIKE 搜索混合（trigram 对短中文词支持差，用 LIKE 补充）"""
+    """FTS5 trigram 搜索为主，搜不到时用 LIKE 补充"""
     if not _db_path_ref:
         return []
     conn = None
@@ -368,34 +368,22 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             params.append(msg_type)
 
         where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
+        fts_where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
 
-        # 将查询拆分为关键词，分别用 FTS 和 LIKE 搜索
         keywords = query.split()
         if not keywords:
             keywords = [query]
 
-        # 策略1: FTS trigram 搜索（>=3字符的关键词）
-        # 策略2: LIKE 搜索（所有关键词，作为补充）
         seen_ids = set()
         results = []
 
-        # LIKE 搜索（能覆盖所有中文关键词）
-        # 短消息优先（更可能是精确匹配），同长度按时间倒序
-        like_conditions = [f"m.content LIKE ?" for _ in keywords]
-        like_params = [f"%{k}%" for k in keywords]
-        like_clause = " OR ".join(like_conditions)
-        rows = conn.execute(
-            f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
-                FROM messages m WHERE ({like_clause}){where_extra}
-                ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
-            like_params + params
-        ).fetchall()
-        for r in rows:
-            if r[0] not in seen_ids:
-                seen_ids.add(r[0])
-                results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
+        def _add(rows):
+            for r in rows:
+                if r[0] not in seen_ids:
+                    seen_ids.add(r[0])
+                    results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
 
-        # FTS 搜索（>=3字符的关键词，提高排序精度）
+        # 策略1: FTS5 trigram 搜索（>=3字符的关键词）
         long_keywords = [k for k in keywords if len(k) >= 3]
         if long_keywords:
             try:
@@ -403,16 +391,28 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
                 fts_rows = conn.execute(
                     f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
                         FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
-                        WHERE fts MATCH ?{where_extra}
+                        WHERE fts MATCH ?{fts_where_extra}
                         ORDER BY rank LIMIT 20""",
                     [fts_query] + params
                 ).fetchall()
-                for r in fts_rows:
-                    if r[0] not in seen_ids:
-                        seen_ids.add(r[0])
-                        results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
+                _add(fts_rows)
             except Exception:
-                pass  # FTS 搜索失败不影响 LIKE 结果
+                pass
+
+        # 策略2: LIKE 补充（短词 <3字符，或 FTS 没搜到时）
+        short_keywords = [k for k in keywords if len(k) < 3]
+        if short_keywords or not results:
+            fallback_keywords = short_keywords if short_keywords else keywords
+            like_conditions = [f"m.content LIKE ?" for _ in fallback_keywords]
+            like_params = [f"%{k}%" for k in fallback_keywords]
+            like_clause = " OR ".join(like_conditions)
+            rows = conn.execute(
+                f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                    FROM messages m WHERE ({like_clause}){where_extra}
+                    ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
+                like_params + params
+            ).fetchall()
+            _add(rows)
 
         return results
     except Exception:
