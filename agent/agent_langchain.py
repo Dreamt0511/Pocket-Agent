@@ -1207,6 +1207,7 @@ class LangChainPocketAgent:
 
             # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
             pending_tasks = consume_pending_tasks()
+            skill_background_tasks = []  # 收集后台技能沉淀任务
             for pt in pending_tasks:
                 task_path = pt.get("task_path", "")
                 task_id = pt.get("task_id", "unknown")
@@ -1218,9 +1219,33 @@ class LangChainPocketAgent:
                         async for event in self._run_executor_foreground(task_path, task_id):
                             if self._check_cancel():
                                 break
-                            yield event
+                            # 收集后台技能沉淀任务，稍后等待
+                            if event.get("type") == "_skill_task":
+                                skill_background_tasks.append((event["task"], event["queue"]))
+                            else:
+                                yield event
                     finally:
                         self._executor_task = None
+
+            # ── 等待后台技能沉淀任务完成，输出结果 ──
+            for skill_task, skill_queue in skill_background_tasks:
+                try:
+                    # 输出技能沉淀开始标记
+                    yield {"type": "token", "content": "\n\n📝 技能沉淀中...\n"}
+                    # 从队列中读取输出直到结束标记
+                    while True:
+                        try:
+                            item = await asyncio.wait_for(skill_queue.get(), timeout=120)
+                        except asyncio.TimeoutError:
+                            yield {"type": "token", "content": "\n[error] 技能沉淀超时\n"}
+                            break
+                        if item is None:
+                            break
+                        yield item
+                    # 确保后台任务完成
+                    await asyncio.wait_for(skill_task, timeout=5)
+                except Exception as e:
+                    yield {"type": "token", "content": f"\n[error] 技能沉淀异常: {str(e)[:100]}\n"}
 
             # ── 技能验证：通知主Agent检查新沉淀的技能 ──
             if self._pending_skill_verification:
@@ -1698,10 +1723,10 @@ class LangChainPocketAgent:
             if self.ui:
                 self.ui.console.print(f"\n  [green]{status_text}，⏱️ {executor_elapsed}s{token_text}[/green]")
 
-            # yield 完成事件
+            # yield 完成事件（立即汇报，不等待技能沉淀）
             yield {"type": "executor_done", "task_id": task_id, "status": "completed" if not has_failures else "completed_with_failures"}
 
-            # ── 技能沉淀：后台执行，不阻塞汇报 ──
+            # ── 技能沉淀：后台异步执行，完成后通过队列输出 ──
             steps = task_data.get("steps", [])
             objective = task_data.get("objective", "")
             needs_skill = len(steps) >= 3 and objective and not has_failures
@@ -1735,32 +1760,59 @@ class LangChainPocketAgent:
                         if self.ui:
                             self.ui.console.print(f"\n  [dim]\U0001f4dd 子Agent未执行有效操作（仅{executor_step}步），跳过技能沉淀[/dim]")
                     else:
-                        # 没写 → 后台异步督办，不阻塞主流程
+                        # 后台异步执行技能沉淀，通过队列传递输出
                         if self.ui:
                             self.ui.console.print(f"\n  [dim]\U0001f4dd 技能沉淀后台进行中...[/dim]")
 
-                    async def _consolidate_skill():
-                        try:
-                            skill_followup = (
-                                "任务已完成。现在请沉淀技能到 `agent/skills/auto-skills/executor/`：\n\n"
-                                "1. 先用 `directory_list('agent/skills/auto-skills/executor/')` 检查已有技能\n"
-                                "2. 如果找到相关技能 → 用 `file_read` 读取，评估是否需要补充完善\n"
-                                "3. 如果已覆盖 → 用 `file_write` 写一个说明文件说明'已有XX技能覆盖'\n"
-                                "4. 如果需要完善 → 用 `file_write` 更新，补充本次执行的关键发现\n"
-                                "5. 如果没找到 → 用 `file_write` 创建新技能\n\n"
-                                "技能内容需包含：包名、关键坐标、操作步骤、失败经验。"
-                            )
-                            async for _chunk in executor_agent.astream(
-                                {"messages": [HumanMessage(content=skill_followup)]},
-                                config={"configurable": {"thread_id": "executor_skill_" + task_id}},
-                                stream_mode=["messages", "updates"],
-                                version="v2",
-                            ):
-                                pass  # 后台流式处理，不输出到UI
-                        except Exception:
-                            pass
+                        # 创建队列用于传递后台任务的输出
+                        skill_output_queue = asyncio.Queue()
 
-                    asyncio.create_task(_consolidate_skill())
+                        async def _consolidate_skill():
+                            try:
+                                skill_followup = (
+                                    "任务已完成。现在请沉淀技能到 `agent/skills/auto-skills/executor/`：\n\n"
+                                    "1. 先用 `directory_list('agent/skills/auto-skills/executor/')` 检查已有技能\n"
+                                    "2. 如果找到相关技能 → 用 `file_read` 读取，评估是否需要补充完善\n"
+                                    "3. 如果已覆盖 → 用 `file_write` 写一个说明文件说明'已有XX技能覆盖'\n"
+                                    "4. 如果需要完善 → 用 `file_write` 更新，补充本次执行的关键发现\n"
+                                    "5. 如果没找到 → 用 `file_write` 创建新技能\n\n"
+                                    "技能内容需包含：包名、关键坐标、操作步骤、失败经验。"
+                                )
+                                async for _chunk in executor_agent.astream(
+                                    {"messages": [HumanMessage(content=skill_followup)]},
+                                    config={"configurable": {"thread_id": "executor_skill_" + task_id}},
+                                    stream_mode=["messages", "updates"],
+                                    version="v2",
+                                ):
+                                    if _chunk["type"] == "messages":
+                                        message_chunk, metadata = _chunk["data"]
+                                        node = metadata.get("langgraph_node", "")
+                                        if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                                            if type(message_chunk) is not AIMessage:
+                                                content = message_chunk.content
+                                                await skill_output_queue.put({"type": "token", "content": content})
+                                    elif _chunk["type"] == "updates":
+                                        for source, update in _chunk["data"].items():
+                                            if source == "model":
+                                                message = update["messages"][-1]
+                                                if hasattr(message, 'tool_calls') and message.tool_calls:
+                                                    for tc in message.tool_calls:
+                                                        tool_name = tc["name"]
+                                                        tool_args = tc["args"]
+                                                        await skill_output_queue.put({"type": "tool_start", "name": tool_name, "args": tool_args})
+                                            elif source == "tools":
+                                                message = update["messages"][-1]
+                                                tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                                                await skill_output_queue.put({"type": "tool_end", "name": tool_name_2})
+                                await skill_output_queue.put(None)  # 结束标记
+                            except Exception as e:
+                                await skill_output_queue.put({"type": "token", "content": f"\n[error] 技能沉淀失败: {str(e)[:100]}\n"})
+                                await skill_output_queue.put(None)
+
+                        # 启动后台任务
+                        skill_task = asyncio.create_task(_consolidate_skill())
+                        # 返回后台任务引用，供调用方等待
+                        yield {"type": "_skill_task", "task": skill_task, "queue": skill_output_queue}
 
             return
 
