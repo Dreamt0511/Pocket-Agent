@@ -93,9 +93,19 @@ async def _init_db():
         except Exception:
             pass  # duplicate column — 已存在
 
-        # FTS5 虚拟表 —— 会话历史全文搜索
+        # FTS5 虚拟表 —— 会话历史全文搜索（使用 trigram tokenizer 支持中文搜索）
+        # 检查是否需要重建为 trigram tokenizer
+        existing_fts = await db.execute_fetchall(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+        )
+        if existing_fts and "trigram" not in (existing_fts[0][0] or ""):
+            # 旧表需要重建
+            await db.execute("DROP TABLE IF EXISTS messages_fts")
+            await db.execute("DROP TRIGGER IF EXISTS messages_fts_ai")
+            await db.execute("DROP TRIGGER IF EXISTS messages_fts_ad")
+            await db.execute("DROP TRIGGER IF EXISTS messages_fts_au")
         await db.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id)
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
         """)
         # INSERT 同步触发器
         await db.execute("""
@@ -109,6 +119,15 @@ async def _init_db():
                 INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
             END
         """)
+        # UPDATE 同步触发器
+        await db.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
+        # 重建 FTS 索引（确保数据一致）
+        await db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
 
         await db.commit()
 
