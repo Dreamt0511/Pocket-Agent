@@ -343,7 +343,7 @@ def set_current_conversation_id(conversation_id: str):
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
 def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None) -> list:
-    """FTS5 全文搜索（直接查询，避免 HTTP 自调用死锁）"""
+    """FTS5 全文搜索 + LIKE 搜索混合（trigram 对短中文词支持差，用 LIKE 补充）"""
     if not _db_path_ref:
         return []
     conn = None
@@ -351,28 +351,15 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
         conn = sqlite3.connect(_db_path_ref, timeout=10)
         conn.execute("PRAGMA busy_timeout=5000")
 
-        # 将查询关键词用 OR 连接（中文需要前缀匹配）
-        keywords = query.split()
-        if keywords:
-            # 为每个关键词添加前缀匹配符号，支持中文搜索
-            fts_keywords = [f"{k}*" for k in keywords]
-            fts_query = " OR ".join(fts_keywords)
-        else:
-            fts_query = f"{query}*"
-
-        # 构建查询条件
-        conditions = ["messages_fts MATCH ?"]
-        params = [fts_query]
-
+        # 构建通用过滤条件
+        conditions = []
+        params = []
         if conversation_id:
             conditions.append("m.conversation_id = ?")
             params.append(conversation_id)
-
         if days:
             conditions.append("m.timestamp > ?")
             params.append(int((time.time() - days * 86400) * 1000))
-
-        # msg_type 白名单验证，防止 SQL 注入
         if msg_type:
             valid_types = ("user", "assistant", "memory")
             if msg_type not in valid_types:
@@ -380,16 +367,53 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             conditions.append("m.role = ?")
             params.append(msg_type)
 
-        where_clause = " AND ".join(conditions)
+        where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
 
+        # 将查询拆分为关键词，分别用 FTS 和 LIKE 搜索
+        keywords = query.split()
+        if not keywords:
+            keywords = [query]
+
+        # 策略1: FTS trigram 搜索（>=3字符的关键词）
+        # 策略2: LIKE 搜索（所有关键词，作为补充）
+        seen_ids = set()
+        results = []
+
+        # LIKE 搜索（能覆盖所有中文关键词）
+        like_conditions = [f"m.content LIKE ?" for _ in keywords]
+        like_params = [f"%{k}%" for k in keywords]
+        like_clause = " OR ".join(like_conditions)
         rows = conn.execute(
             f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
-                FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
-                WHERE {where_clause}
-                ORDER BY rank LIMIT 20""",
-            params
+                FROM messages m WHERE ({like_clause}){where_extra}
+                ORDER BY m.timestamp DESC LIMIT 20""",
+            like_params + params
         ).fetchall()
-        return [{"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]} for r in rows]
+        for r in rows:
+            if r[0] not in seen_ids:
+                seen_ids.add(r[0])
+                results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
+
+        # FTS 搜索（>=3字符的关键词，提高排序精度）
+        long_keywords = [k for k in keywords if len(k) >= 3]
+        if long_keywords:
+            try:
+                fts_query = " OR ".join(long_keywords)
+                fts_rows = conn.execute(
+                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                        FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
+                        WHERE fts MATCH ?{where_extra}
+                        ORDER BY rank LIMIT 20""",
+                    [fts_query] + params
+                ).fetchall()
+                for r in fts_rows:
+                    if r[0] not in seen_ids:
+                        seen_ids.add(r[0])
+                        results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
+            except Exception:
+                pass  # FTS 搜索失败不影响 LIKE 结果
+
+        return results
     except Exception:
         return []
     finally:
