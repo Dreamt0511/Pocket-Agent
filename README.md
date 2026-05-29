@@ -29,13 +29,13 @@ DEFAULT_LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o
 
-# Embedding 配置（可选，留空则复用 LLM 配置）
-EMBEDDING_BASE_URL=
-EMBEDDING_API_KEY=
-EMBEDDING_MODEL=text-embedding-3-small
+# Embedding 配置（本地 llama-server）
+EMBEDDING_SERVER_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL=bge-m3
+EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
 
 # MCP 服务
-NEURALBRIDGE_MCP_URL=http://127.0.0.1:7474/mcp
+MCP_SERVER_URL=http://127.0.0.1:7474/mcp
 ```
 
 ### 运行
@@ -45,6 +45,7 @@ NEURALBRIDGE_MCP_URL=http://127.0.0.1:7474/mcp
 python main.py
 
 # HTTP API 模式（供 Android App 调用）
+# Android App 会自动通过 Termux 启动此服务，无需手动执行
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
@@ -57,16 +58,24 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 **模型下载：**
 ```bash
 # BGE-M3 GGUF（推荐，支持中英文，最大 8192 token）
-# 下载后放到项目根目录下
-wget -O bge-m3-Q4_K_M.gguf \
+wget -O /sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf \
   https://hf-mirror.com/gpustack/bge-m3-GGUF/blob/main/bge-m3-Q4_K_M.gguf
+```
+
+**配置模型路径：**
+
+在 `.env` 文件中设置 `EMBEDDING_MODEL_PATH` 为 GGUF 模型文件的绝对路径：
+```env
+EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
 ```
 
 **手动启动参数：**
 ```bash
-cd ~/llama.cpp
-./build/bin/llama-server \
-  -m "$(find ~/Pocket-Agent -name 'bge-m3*.gguf' -type f | head -1)" \
+# 从 .env 读取模型路径
+EMBED_MODEL="$(grep '^EMBEDDING_MODEL_PATH=' ~/Pocket-Agent/.env | cut -d= -f2 | tr -d '\"')"
+
+llama-server \
+  -m "$EMBED_MODEL" \
   --embedding \
   -c 8192 \
   --port 8080 \
@@ -77,7 +86,7 @@ cd ~/llama.cpp
   -t 4
 ```
 
-> App 启动时会自动在项目目录下查找 `bge-m3*.gguf` 模型文件并拉起 embedding 服务。不安装模型时，全文搜索（FTS5）仍可用，语义搜索自动跳过。
+> App 启动时会自动读取 `.env` 中的 `EMBEDDING_MODEL_PATH` 并拉起 llama-server。未配置路径或文件不存在时，全文搜索（FTS5）仍可用，语义搜索自动跳过。
 
 ## 架构
 
@@ -97,7 +106,6 @@ cd ~/llama.cpp
 │   │   └── auto-skills/      # 自动沉淀的技能
 │   └── prompts/              # 系统提示词
 ├── memory/                   # 用户画像存储
-├── bge-m3-Q4_K_M.gguf       # BGE-M3 嵌入模型（可选）
 └── pocket_agent.db           # SQLite 数据库
 ```
 
@@ -115,11 +123,11 @@ cd ~/llama.cpp
 ### 记忆工具
 
 ```python
-# 存储记忆
-save_memory(content="项目使用 SQLite 作为数据库", type="fact", tags=["技术选型"])
+# 存储记忆（importance: 1-10，大部分记忆 3-5 分即可）
+save_memory(content="项目使用 SQLite 作为数据库", type="fact", importance=5)
 
 # 检索记忆
-search_memory(query="数据库选型", scope="all")  # scope: "fact" / "episodic" / "all"
+search_memory(query="数据库选型", scope="all")  # scope: "all" / "session"
 
 # 更新用户画像
 update_user_profile(section="偏好设置", content="喜欢简洁的回答风格")
@@ -207,23 +215,25 @@ curl -X POST http://localhost:8000/memory/save \
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `MAX_ITERATIONS` | 100 | 最大工具调用轮数 |
-| `RECURSION_LIMIT` | 200 | LangGraph 递归限制 |
+| `MAX_ITERATIONS` | 300 | 最大工具调用轮数 |
+| `RECURSION_LIMIT` | 600 | LangGraph 递归限制（建议设为 MAX_ITERATIONS 的 2 倍） |
 | `MAX_CONTEXT_TOKENS` | 128000 | 上下文窗口大小 |
-| `EMBEDDING_MODEL` | bge-m3 | Embedding 模型 |
+| `EMBEDDING_MODEL` | bge-m3 | Embedding 模型名称 |
 | `EMBEDDING_SERVER_URL` | http://127.0.0.1:8080/v1 | 本地 embedding 服务地址 |
+| `EMBEDDING_MODEL_PATH` | （空） | GGUF 模型文件绝对路径，App 据此自动拉起 llama-server |
 
 ### 环境变量
 
 | 变量 | 说明 |
 |------|------|
-| `DEFAULT_LLM_BASE_URL` | LLM API 地址 |
+| `DEFAULT_LLM_BASE_URL` | LLM API 地址（兼容 OpenAI 格式） |
 | `LLM_API_KEY` | API 密钥 |
 | `LLM_MODEL` | 模型名称 |
-| `EMBEDDING_BASE_URL` | Embedding API 地址（留空复用 LLM） |
-| `EMBEDDING_API_KEY` | Embedding API 密钥 |
-| `EMBEDDING_MODEL` | Embedding 模型名称 |
 | `EMBEDDING_SERVER_URL` | 本地 embedding 服务地址（默认 localhost:8080） |
+| `EMBEDDING_MODEL` | Embedding 模型名称 |
+| `EMBEDDING_MODEL_PATH` | GGUF 模型文件绝对路径 |
+| `EMBEDDING_BASE_URL` | 远程 Embedding API 地址（使用远程服务时填写） |
+| `EMBEDDING_API_KEY` | 远程 Embedding API 密钥 |
 
 ## 依赖
 
