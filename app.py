@@ -36,6 +36,9 @@ async def get_db():
 
 app = FastAPI(title="Pocket-Agent API")
 
+# ─── 服务启动时间 ──────────────────────────────
+_start_time = time.time()
+
 # ─── 心跳机制 ──────────────────────────────────
 _last_heartbeat = time.time()
 _HEARTBEAT_TIMEOUT = 60  # 秒，超过此时间未收到心跳则自动关闭
@@ -265,6 +268,16 @@ async def health():
         "status": "ok",
         "python": sys.version,
         "project_root": PROJECT_ROOT,
+    }
+
+
+@app.get("/uptime")
+async def uptime():
+    """返回服务运行时长（秒）"""
+    elapsed = int(time.time() - _start_time)
+    return {
+        "uptime_seconds": elapsed,
+        "started_at": _start_time,
     }
 
 
