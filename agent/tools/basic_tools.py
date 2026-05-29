@@ -440,10 +440,11 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
 
         results = _vector_store_ref.query(query, n_results=20, where=where or None)
 
-        # 应用时间过滤
+        # 应用时间过滤（timestamp=0 视为无时间戳，不过滤）
         if days:
             cutoff_time = int((time.time() - days * 86400) * 1000)
-            results = [r for r in results if r.get("metadata", {}).get("timestamp", 0) > cutoff_time]
+            results = [r for r in results if r.get("metadata", {}).get("timestamp", 0) == 0
+                       or r.get("metadata", {}).get("timestamp", 0) > cutoff_time]
 
         return [{
             "id": r.get("id", ""),
@@ -481,9 +482,11 @@ def _embeddings_keyword_search(query: str, memory_type: str = None, days: int = 
                 if memory_type and meta.get("type") != memory_type:
                     continue
                 if days:
-                    cutoff = int((time.time() - days * 86400) * 1000)
-                    if meta.get("timestamp", 0) < cutoff:
-                        continue
+                    ts = meta.get("timestamp", 0)
+                    if ts > 0:
+                        cutoff = int((time.time() - days * 86400) * 1000)
+                        if ts < cutoff:
+                            continue
                 if row_id not in seen_ids:
                     seen_ids.add(row_id)
                     filtered.append({
