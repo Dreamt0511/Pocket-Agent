@@ -409,7 +409,7 @@ async def chat(request: Request):
     message = data.get("message", "")
     req_config = data.get("config", {})
     conversation_id = data.get("conversation_id", "default-session")
-    importance = data.get("importance", 1)
+    importance = data.get("importance", 3)
 
     # 设置当前会话ID，供 search_memory 工具使用
     from agent.tools.basic_tools import set_current_conversation_id
@@ -724,7 +724,7 @@ async def save_memory_endpoint(request: Request):
         body = await request.json()
         content = body.get("content", "")
         mem_type = body.get("type", "fact")
-        importance = max(1, min(10, body.get("importance", 3)))
+        importance = max(1, min(10, body.get("importance", 5)))
         conversation_id = body.get("conversation_id")
 
         if not content:

@@ -351,9 +351,14 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
         conn = sqlite3.connect(_db_path_ref, timeout=10)
         conn.execute("PRAGMA busy_timeout=5000")
 
-        # 将查询关键词用 OR 连接
+        # 将查询关键词用 OR 连接（中文需要前缀匹配）
         keywords = query.split()
-        fts_query = " OR ".join(keywords) if keywords else query
+        if keywords:
+            # 为每个关键词添加前缀匹配符号，支持中文搜索
+            fts_keywords = [f"{k}*" for k in keywords]
+            fts_query = " OR ".join(fts_keywords)
+        else:
+            fts_query = f"{query}*
 
         # 构建查询条件
         conditions = ["messages_fts MATCH ?"]
@@ -414,7 +419,7 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
             "role": r.get("metadata", {}).get("role", ""),
             "content": r.get("document", ""),
             "conversation_id": r.get("metadata", {}).get("conversation_id", ""),
-            "importance": r.get("metadata", {}).get("importance", 1),
+            "importance": r.get("metadata", {}).get("importance", 3),
             "last_access_at": r.get("metadata", {}).get("last_access_at", 0),
             "similarity": 1 - r.get("distance", 0),
         } for r in results]
@@ -461,7 +466,7 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float =
         recency_score = DECAY_RATE ** hours_passed
 
         # 重要性
-        importance_score = msg.get("importance", 1) / 10  # 归一化到 0-1
+        importance_score = msg.get("importance", 3) / 10  # 归一化到 0-1
 
         # 综合分数
         data["final_score"] = (
@@ -619,7 +624,7 @@ async def tts_speak(text: str) -> str:
 
 
 @tool
-def save_memory(content: str, type: str = "fact", importance: int = 3) -> str:
+def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
     """保存重要信息到记忆系统。只在值得记的内容时调用，不要每条对话都存。
 
     何时调用：
