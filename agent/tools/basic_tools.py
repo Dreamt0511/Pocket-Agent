@@ -832,6 +832,8 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
         memory_type: 记忆类型过滤，仅 scope="memory" 时生效。"fact" 只搜事实，"episodic" 只搜事件，不传则全部。
         days: 时间过滤，只返回过去 N 天内的结果。
     """
+    # 容错：清理 scope 参数中的引号和空格
+    scope = scope.strip().strip("'\"")
     try:
         if scope == "session":
             # 只搜当前会话的原始对话 — 关键词检索，不做权重排序
