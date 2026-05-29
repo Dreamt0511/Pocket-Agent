@@ -818,7 +818,8 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             # 搜跨会话记忆：messages FTS + embeddings LIKE + 向量语义
             fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
             emb_results = _embeddings_keyword_search(query, memory_type=memory_type, days=days)
-            vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
+            # embeddings 表只存记忆，不传 msg_type（metadata 无 role 字段）
+            vec_results = _vector_search(query, days=days, memory_type=memory_type)
             # 合并 FTS 和 embeddings LIKE 结果（去重）
             merged_keyword = fts_results
             seen = {r.get("id") for r in fts_results}
