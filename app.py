@@ -168,15 +168,21 @@ async def startup():
     _sync_conn.close()
     logger.info("数据库 WAL 模式已强制设置")
     await _init_db()
-    # 初始化持久化 checkpointer（AsyncSqliteSaver）
-    import aiosqlite
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-    _checkpoint_conn = await aiosqlite.connect(DB_PATH)
-    await _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
-    await _checkpoint_conn.execute("PRAGMA busy_timeout=30000")
-    _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
-    await _checkpoint_saver.setup()
-    logger.info("AsyncSqliteSaver checkpoint 已初始化")
+    # 初始化持久化 checkpointer（AsyncSqliteSaver，失败则降级为 MemorySaver）
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        _checkpoint_conn = await aiosqlite.connect(DB_PATH)
+        await _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+        await _checkpoint_conn.execute("PRAGMA busy_timeout=30000")
+        _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
+        await _checkpoint_saver.setup()
+        logger.info("AsyncSqliteSaver checkpoint 已初始化")
+    except Exception as e:
+        logger.warning(f"AsyncSqliteSaver 初始化失败，降级为 MemorySaver: {e}")
+        from langgraph.checkpoint.memory import MemorySaver
+        _checkpoint_saver = MemorySaver()
+        logger.info("MemorySaver checkpoint 已初始化（会话历史不持久化）")
 
     # 初始化 SQLite 向量存储（BGE-M3 本地 embedding）
     from agent.embedding import EmbeddingClient, VectorStore
