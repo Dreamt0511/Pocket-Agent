@@ -550,6 +550,9 @@ async def chat(request: Request):
                     # 保留已累积的内容（含工具调用标记），仅在为空时用 agent 的 response
                     if not full_response:
                         full_response = event.get("response", "")
+                    elapsed = event.get("elapsed", 0)
+                    if elapsed > 0:
+                        yield f"data: [TOOL] {json.dumps({'type': 'done_stats', 'elapsed': elapsed}, ensure_ascii=False)}\n\n"
                     yield f"data: [DONE]\n\n"
                 elif event["type"] == "error":
                     full_response = event.get("message", "")

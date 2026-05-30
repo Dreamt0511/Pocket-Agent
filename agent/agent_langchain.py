@@ -1274,7 +1274,7 @@ class LangChainPocketAgent:
             asyncio.create_task(self._refresh_env_cache())
 
             # yield 完成事件
-            yield {"type": "done", "response": full_response.strip(), "success": True, "tool_calls": tool_call_count}
+            yield {"type": "done", "response": full_response.strip(), "success": True, "tool_calls": tool_call_count, "elapsed": elapsed}
 
         except asyncio.CancelledError:
             # 重新抛出取消异常，让上层处理
@@ -1420,7 +1420,7 @@ class LangChainPocketAgent:
                     "status": "failed",
                     "summary": "❌ 任务文件不存在",
                 })
-                yield {"type": "executor_done", "task_id": task_id, "status": "failed"}
+                yield {"type": "executor_done", "task_id": task_id, "status": "failed", "elapsed": 0, "tokens": 0}
                 return
 
             with open(task_path, "r", encoding="utf-8") as f:
@@ -1676,7 +1676,7 @@ class LangChainPocketAgent:
                 self.ui.console.print(f"\n  [green]{status_text}，⏱️ {executor_elapsed}s{token_text}[/green]")
 
             # yield 完成事件（立即汇报，不等待技能沉淀）
-            yield {"type": "executor_done", "task_id": task_id, "status": "completed" if not has_failures else "completed_with_failures"}
+            yield {"type": "executor_done", "task_id": task_id, "status": "completed" if not has_failures else "completed_with_failures", "elapsed": executor_elapsed, "tokens": executor_tokens}
 
             # ── 技能沉淀：子Agent继续执行，使用之前的上下文 ──
             steps = task_data.get("steps", [])
@@ -1782,7 +1782,7 @@ class LangChainPocketAgent:
             self.logger.log_executor_end(task_id, "中断")
             if self.ui:
                 self.ui.console.print("\n  [yellow]⏹️ 子Agent执行被中断[/yellow]")
-            yield {"type": "executor_done", "task_id": task_id, "status": "cancelled"}
+            yield {"type": "executor_done", "task_id": task_id, "status": "cancelled", "elapsed": 0, "tokens": 0}
             raise
         except Exception:
             import traceback
@@ -1835,5 +1835,4 @@ class LangChainPocketAgent:
                 "summary": f"❌ 执行失败: {error_short[:200]}",
             })
 
-            yield {"type": "executor_done", "task_id": task_id, "status": "failed"}
-
+            yield {"type": "executor_done", "task_id": task_id, "status": "failed", "elapsed": 0, "tokens": 0}
