@@ -1258,50 +1258,56 @@ class LangChainPocketAgent:
                     finally:
                         self._executor_task = None
 
-            # ── 技能验证：立即启动后台任务执行验证 ──
+            # ── 技能验证：同步执行，yield 中间过程推送到 app ──
             if self._pending_skill_verification:
                 skills_to_verify = self._pending_skill_verification.copy()
                 self._pending_skill_verification = []
-
-                async def _verify_skills():
-                    """后台静默执行技能验证"""
-                    failed_skills = []
+                failed_skills = []
+                for skill_name in skills_to_verify:
+                    yield {"type": "skill_verify", "status": "start", "skill": skill_name}
                     try:
-                        for skill_name in skills_to_verify:
-                            skill_path = f"agent/skills/auto-skills/executor/{skill_name}"
-                            verify_msg = HumanMessage(content=(
-                                f"【技能验证】请检查新沉淀的技能：{skill_name}\n\n"
-                                f"**重要：只检查这个技能，禁止扫描目录或检查其他技能！**\n\n"
-                                f"操作步骤：\n"
-                                f"1. 用 file_read 读取 `agent/skills/main-skills/dev/skill-creator/SKILL.md` 获取规范格式\n"
-                                f"2. 用 file_read 读取 `{skill_path}/SKILL.md`\n"
-                                f"3. 对照规范格式检查内容是否符合要求\n"
-                                f"4. 如果不符合规范，用 file_write 修正为规范格式\n"
-                                f"5. 完成后回复'技能验证完成'即可\n\n"
-                                f"**禁止：扫描目录、检查其他技能、执行任何与上述技能无关的操作！**"
-                            ))
-                            # 使用独立 thread_id 避免污染主对话上下文
-                            verify_config = {"configurable": {"thread_id": f"verify_{skill_name}"}}
-                            async for chunk in self.agent.astream(
-                                {"messages": [verify_msg]},
-                                config=verify_config,
-                                stream_mode=["messages", "updates"],
-                                version="v2",
-                            ):
-                                pass
-                            if self.ui:
-                                self.ui.console.print(f"\n  [dim]✅ 技能验证完成: {skill_name}[/dim]")
+                        skill_path = f"agent/skills/auto-skills/executor/{skill_name}"
+                        verify_msg = HumanMessage(content=(
+                            f"【技能验证】请检查新沉淀的技能：{skill_name}\n\n"
+                            f"**重要：只检查这个技能，禁止扫描目录或检查其他技能！**\n\n"
+                            f"操作步骤：\n"
+                            f"1. 用 file_read 读取 `agent/skills/main-skills/dev/skill-creator/SKILL.md` 获取规范格式\n"
+                            f"2. 用 file_read 读取 `{skill_path}/SKILL.md`\n"
+                            f"3. 对照规范格式检查内容是否符合要求\n"
+                            f"4. 如果不符合规范，用 file_write 修正为规范格式\n"
+                            f"5. 完成后回复'技能验证完成'即可\n\n"
+                            f"**禁止：扫描目录、检查其他技能、执行任何与上述技能无关的操作！**"
+                        ))
+                        verify_config = {"configurable": {"thread_id": f"verify_{skill_name}"}}
+                        async for chunk in self.agent.astream(
+                            {"messages": [verify_msg]},
+                            config=verify_config,
+                            stream_mode=["messages", "updates"],
+                            version="v2",
+                        ):
+                            if chunk["type"] == "updates":
+                                for source, update in chunk["data"].items():
+                                    if source == "model":
+                                        msg = update["messages"][-1]
+                                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                            for tc in msg.tool_calls:
+                                                yield {"type": "tool_start", "name": tc["name"], "args": tc["args"]}
+                                    elif source == "tools":
+                                        msg = update["messages"][-1]
+                                        tname = msg.name if hasattr(msg, 'name') else "工具"
+                                        yield {"type": "tool_end", "name": tname}
+                        yield {"type": "skill_verify", "status": "done", "skill": skill_name}
+                        if self.ui:
+                            self.ui.console.print(f"\n  [dim]✅ 技能验证完成: {skill_name}[/dim]")
                     except Exception as e:
+                        yield {"type": "skill_verify", "status": "failed", "skill": skill_name, "error": str(e)[:100]}
                         if self.ui:
                             self.ui.console.print(f"\n  [dim]❌ 技能验证失败: {str(e)[:100]}[/dim]")
-                        failed_skills.extend(skills_to_verify)
-                    finally:
-                        if failed_skills:
-                            self._pending_skill_verification.extend(failed_skills)
-                            if self.ui:
-                                self.ui.console.print(f"\n  [dim]⚠️ {len(failed_skills)} 个技能验证失败，下次对话重试[/dim]")
-
-                self._verify_task = asyncio.create_task(_verify_skills())
+                        failed_skills.append(skill_name)
+                if failed_skills:
+                    self._pending_skill_verification.extend(failed_skills)
+                    if self.ui:
+                        self.ui.console.print(f"\n  [dim]⚠️ {len(failed_skills)} 个技能验证失败，下次对话重试[/dim]")
 
             # ── 清理主Agent状态中的 delegate_task 相关消息 ──
             # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
@@ -1802,15 +1808,26 @@ class LangChainPocketAgent:
                         f"技能内容需包含：包名、关键坐标、操作步骤、失败经验。\n"
                         f"**禁止扫描目录 `agent/skills/auto-skills/executor/` 或检查其他技能！**"
                     )
-                    # 子Agent继续执行技能沉淀（使用之前的上下文）
+                    # 子Agent继续执行技能沉淀，yield 中间过程推送到 app
+                    yield {"type": "skill_condense", "status": "start", "skill": skill_name}
                     async for _chunk in executor_agent.astream(
                         {"messages": [HumanMessage(content=skill_followup)]},
                         config={"configurable": {"thread_id": "executor_" + task_id}},
                         stream_mode=["messages", "updates"],
                         version="v2",
                     ):
-                        # 静默消费所有输出，不推送到app
-                        pass
+                        if _chunk["type"] == "updates":
+                            for _src, _upd in _chunk["data"].items():
+                                if _src == "model":
+                                    _msg = _upd["messages"][-1]
+                                    if hasattr(_msg, 'tool_calls') and _msg.tool_calls:
+                                        for _tc in _msg.tool_calls:
+                                            yield {"type": "tool_start", "name": _tc["name"], "args": _tc["args"]}
+                                elif _src == "tools":
+                                    _msg = _upd["messages"][-1]
+                                    _tname = _msg.name if hasattr(_msg, 'name') else "工具"
+                                    yield {"type": "tool_end", "name": _tname}
+                    yield {"type": "skill_condense", "status": "done", "skill": skill_name}
 
                     # 技能沉淀完成后，记录待验证技能
                     skill_file_path = os.path.join(AUTO_SKILLS_DIR, "executor", skill_name, "SKILL.md")

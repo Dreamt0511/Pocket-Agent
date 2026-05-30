@@ -544,7 +544,7 @@ async def chat(request: Request):
                     args_str = json.dumps(tool_args, ensure_ascii=False) if isinstance(tool_args, dict) else str(tool_args)
                     full_response += f"\n\n[__TOOL_CALL__]{tool_name}: {args_str}[__TOOL_CALL_END__]\n"
                     yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] in ("tool_end", "thinking", "executor_start", "executor_done"):
+                elif event["type"] in ("tool_end", "thinking", "executor_start", "executor_done", "skill_condense", "skill_verify"):
                     yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "done":
                     # 保留已累积的内容（含工具调用标记），仅在为空时用 agent 的 response
