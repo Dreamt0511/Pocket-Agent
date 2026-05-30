@@ -721,17 +721,29 @@ async def get_messages(conversation_id: str):
     async with get_db() as db:
         db.row_factory = sqlite3.Row
         rows = await db.execute_fetchall(
-            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
+            "SELECT id, role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
             (conversation_id,)
         )
         return [
             {
+                "id": row["id"],
                 "role": row["role"],
                 "content": row["content"],
                 "timestamp": row["timestamp"],
             }
             for row in rows
         ]
+
+
+@app.delete("/messages/{message_id}")
+async def delete_message(message_id: int):
+    """删除单条消息"""
+    async with get_db() as db:
+        cursor = await db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        await db.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="消息不存在")
+    return {"status": "ok"}
 
 
 @app.get("/conversations/{conversation_id}/search")
