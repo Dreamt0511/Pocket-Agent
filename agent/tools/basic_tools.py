@@ -67,6 +67,23 @@ def file_write(filepath: str, content: str, append: bool = False) -> str:
         append: 是否追加模式，默认False
     """
     try:
+        # ── 任务完成门禁：写入 task.json 且 all_completed=true 时，检查所有 steps 是否都已完成 ──
+        if not append and filepath.endswith("task.json"):
+            try:
+                task_data = json.loads(content)
+                if task_data.get("all_completed") is True:
+                    steps = task_data.get("steps", [])
+                    unfinished = [s for s in steps if s.get("status") != "completed"]
+                    if unfinished:
+                        first = unfinished[0]
+                        return (
+                            f"❌ 门禁拦截：任务还有 {len(unfinished)} 个步骤未完成，不能标记 all_completed。"
+                            f"第一个未完成的步骤：步骤{first.get('id')} - {first.get('desc')}。"
+                            f"请继续执行该步骤，完成后再标记 all_completed。"
+                        )
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
         mode = 'a' if append else 'w'
         with open(filepath, mode, encoding='utf-8') as f:
             f.write(content)
@@ -918,11 +935,20 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
     每个步骤是单步操作（如"打开拼多多APP"），禁止合并（如"去拼多多买件衣服"）。
     不分解会导致子Agent无法执行。
 
+    ⚠️ 任务目标必须清晰，必须包含明确的终止条件和注意事项：
+    - objective 要写清楚"做什么"和"做到什么程度算完成"
+    - 最后一个步骤应该是"汇报完成情况"或"保存结果"，确保任务有明确收尾
+    - 如果有注意事项（如"不要倍速""必须保存到笔记"），写在 guidance 字段中
+
+    ⚠️ steps 中每个步骤必须包含 status 字段，初始化为 "pending"：
+    - 子Agent每完成一步会把对应 status 改为 "completed"
+    - 所有步骤都 completed 后才能标记整体任务完成
+
     Args:
         description: 自然语言描述任务目标和内容
         tasks_json: (必填) 按原子粒度分解后的任务定义。
-                    包含 objective 和 steps（steps 每个元素是单步操作）。
-                    例如：{"objective": "打开拼多多买衣服", "steps": [{"id": 1, "desc": "打开拼多多APP"}, {"id": 2, "desc": "搜索黑色鞋子"}, {"id": 3, "desc": "筛选价格100左右"}]}
+                    包含 objective、steps（每个step必须有id、desc、status）、可选 guidance。
+                    例如：{"objective": "在拼多多搜索树莓派并咨询客服", "steps": [{"id": 1, "desc": "打开拼多多APP", "status": "pending"}, {"id": 2, "desc": "搜索树莓派", "status": "pending"}, {"id": 3, "desc": "咨询客服", "status": "pending"}, {"id": 4, "desc": "汇报结果", "status": "pending"}], "guidance": "必须在拼多多内操作"}
                     不提供时整段描述作为单个步骤，子Agent可能无法正确执行。
     """
     from datetime import datetime
@@ -948,10 +974,13 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
         task_data = {}
 
     task_data.setdefault("objective", description)
-    task_data.setdefault("status", "pending")
+    task_data.setdefault("all_completed", False)
     # 主Agent必须传 tasks_json 分解步骤，不传时整段描述作为单个步骤
     if "steps" not in task_data or not task_data["steps"]:
         task_data["steps"] = [{"id": 1, "desc": description[:200], "status": "pending"}]
+    # 兜底：确保每个 step 都有 status 字段
+    for step in task_data["steps"]:
+        step.setdefault("status", "pending")
 
     with open(task_file, "w", encoding="utf-8") as f:
         json.dump(task_data, f, ensure_ascii=False, indent=2)
