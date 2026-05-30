@@ -820,20 +820,6 @@ async def save_memory_endpoint(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
-    """删除指定会话及其所有消息、checkpoint"""
-    async with get_db() as db:
-        await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-        await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-        await db.execute("DELETE FROM checkpoints WHERE thread_id = ?", (conversation_id,))
-        await db.execute("DELETE FROM writes WHERE thread_id = ?", (conversation_id,))
-        await db.commit()
-    if _agent_instance is not None:
-        _agent_instance.clear_history(thread_id=conversation_id)
-    return {"status": "ok"}
-
-
 @app.delete("/conversations/all")
 async def clear_all_conversations():
     """清空所有会话、消息和 checkpoint（保留 embeddings 记忆）"""
@@ -846,6 +832,20 @@ async def clear_all_conversations():
     if _agent_instance is not None:
         _agent_instance.clear_history()
     return {"status": "ok", "message": "已清空所有会话（记忆已保留）"}
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """删除指定会话及其所有消息、checkpoint"""
+    async with get_db() as db:
+        await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        await db.execute("DELETE FROM checkpoints WHERE thread_id = ?", (conversation_id,))
+        await db.execute("DELETE FROM writes WHERE thread_id = ?", (conversation_id,))
+        await db.commit()
+    if _agent_instance is not None:
+        _agent_instance.clear_history(thread_id=conversation_id)
+    return {"status": "ok"}
 
 
 # ─── 技能列表 ─────────────────────────────────
