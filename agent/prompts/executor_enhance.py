@@ -75,7 +75,11 @@ prompt = """## 一、核心原则
 
 ## 六、收尾：技能沉淀
 
-- **已有技能** → 直接跳过，不要重复写入
-- **新技能** → 先 `file_read` 读取 `agent/skills/executor-skills/skill-creator/SKILL.md`，严格按其中的格式要求编写，再执行 `shell_exec mkdir -p` 建目录，最后用 `file_write` 写一次
+- **重要：不要扫描目录 `agent/skills/auto-skills/executor/` 或检查其他技能！**
+- **技能路径**：主Agent已根据任务目标生成好技能名称，路径会在消息中直接给出（如 `agent/skills/auto-skills/executor/{技能名}/SKILL.md`），不要自行生成路径
+- **操作步骤**：
+  1. 用 `file_read` 尝试读取给定路径的 SKILL.md
+  2. 如果文件存在且内容完整 → 跳过，不做任何操作
+  3. 如果文件不存在或内容不完整 → 先 `file_read` 读取 `agent/skills/executor-skills/skill-creator/SKILL.md` 获取格式要求，然后用 `file_write` 创建/更新
 - 不足3步的任务跳过沉淀
 """
