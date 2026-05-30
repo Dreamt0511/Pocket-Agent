@@ -76,7 +76,7 @@ prompt = """## 一、核心原则
 ## 六、收尾：技能沉淀
 
 - **重要：不要扫描目录 `agent/skills/auto-skills/executor/` 或检查其他技能！**
-- **技能路径**：主Agent已根据任务目标生成好技能名称，路径会在消息中直接给出（如 `agent/skills/auto-skills/executor/{技能名}/SKILL.md`），不要自行生成路径
+- **技能路径**：主Agent已根据任务目标生成好技能名称，路径会在消息中直接给出（如 `agent/skills/auto-skills/executor/{{技能名}}/SKILL.md`），不要自行生成路径
 - **操作步骤**：
   1. 用 `file_read` 尝试读取给定路径的 SKILL.md
   2. 如果文件存在且内容完整 → 跳过，不做任何操作
