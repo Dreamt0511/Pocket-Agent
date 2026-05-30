@@ -21,17 +21,14 @@ class LongTermMemory:
             default_profile = """# 用户画像
 
 ## 基本信息
-- **姓名**: 未知
-- **职业**: 未知
-- **兴趣**: 未知
 
-## 偏好设置
-- 喜欢的风格: 简洁、明确
-- 话题偏好: 技术、生活、学习
+## 沟通偏好
 
-## 特殊要求
-- 回答要求: 准确、有用
-- 避免内容: 原则性问题
+## 行为要求
+
+## 反馈
+
+## 其他
 """
             self.profile_file.write_text(default_profile, encoding='utf-8')
 
