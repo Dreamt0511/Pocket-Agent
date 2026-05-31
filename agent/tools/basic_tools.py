@@ -18,6 +18,17 @@ import requests
 _vector_store_ref = None
 _db_path_ref = None
 
+
+def _notify_progress(message: str):
+    """安全地推送工具执行进度（如果在 LangGraph 上下文中）"""
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+        if writer:
+            writer({"type": "progress", "message": message})
+    except Exception:
+        pass  # 不在 LangGraph 上下文中时静默忽略
+
 def set_memory_refs(vector_store, db_path):
     global _vector_store_ref, _db_path_ref
     _vector_store_ref = vector_store
@@ -643,6 +654,7 @@ async def update_user_profile(section: str, content: str) -> str:
         return "❌ 记忆系统未初始化，无法更新用户画像"
 
     try:
+        _notify_progress("正在更新用户画像...")
         # 异步执行更新，不阻塞主流程
         import asyncio
         loop = asyncio.get_running_loop()
@@ -803,6 +815,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
             return "保存失败: 需要 conversation_id（请在会话中调用）"
 
         # 存入 messages 表（两种类型都存，带 memory_type 标记）
+        _notify_progress("正在写入数据库...")
         if _current_conversation_id and _db_path_ref:
             conn = None
             try:
@@ -819,6 +832,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
                     conn.close()
 
         # 存入向量数据库
+        _notify_progress("正在更新向量索引...")
         if _vector_store_ref:
             metadata = {"importance": importance, "type": type, "timestamp": current_timestamp}
             if type == "episodic":
@@ -866,12 +880,16 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
     try:
         if scope == "session":
             # 只搜当前会话的原始对话 — 关键词检索，不做权重排序
+            _notify_progress("正在搜索当前会话...")
             results = _fts_search(query, conversation_id=_current_conversation_id, days=days)
             results = [r for r in results if r.get("role") != "memory"][:5]
         elif scope == "memory":
             # 搜跨会话记忆：messages FTS + embeddings LIKE + 向量语义
+            _notify_progress("正在搜索关键词...")
             fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
+            _notify_progress("正在搜索嵌入表...")
             emb_results = _embeddings_keyword_search(query, memory_type=memory_type, days=days)
+            _notify_progress("正在语义搜索...")
             # embeddings 表只存记忆，不传 msg_type（metadata 无 role 字段）
             vec_results = _vector_search(query, days=days, memory_type=memory_type)
             # 合并 FTS 和 embeddings 搜索结果（按 content 去重，因为两张表 id 类型不同）
@@ -882,6 +900,7 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
                 if key not in seen_contents:
                     merged_keyword.append(r)
                     seen_contents.add(key)
+            _notify_progress("正在合并排序...")
             results = _rrf_merge(merged_keyword, vec_results)
         else:
             return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"

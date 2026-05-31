@@ -538,6 +538,9 @@ async def chat(request: Request):
                 if event["type"] == "token":
                     full_response += event["content"]
                     yield f"data: {json.dumps(event['content'], ensure_ascii=False)}\n\n"
+                elif event["type"] == "progress":
+                    # 工具执行进度推送
+                    yield f"data: [TOOL] {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "tool_start":
                     tool_name = event.get("name", "工具")
                     tool_args = event.get("args", {})

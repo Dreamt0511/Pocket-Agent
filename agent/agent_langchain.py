@@ -204,6 +204,53 @@ _chat_base._convert_message_to_dict = _patched_convert_message_to_dict
 import uuid
 
 
+class ToolCallRepeatMiddleware(AgentMiddleware):
+    """检测连续重复的工具调用，第二次重复时返回警告，让模型自我纠正"""
+
+    def __init__(self):
+        self._last_tool_call = None  # (name, args_json)
+
+    def wrap_tool_call(self, request, handler):
+        tool_call = request.tool_call
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+        args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+        # 检测是否与上一次调用完全相同
+        if self._last_tool_call and self._last_tool_call == (name, args_json):
+            # 重复调用，返回警告而不是执行
+            return ToolMessage(
+                content=f"⚠️ 你刚刚已经调用过 {name}({args_json[:100]}) 并且得到了结果，请勿重复调用。请基于已有结果继续下一步操作。",
+                tool_call_id=tool_call.get("id", ""),
+                name=name,
+            )
+
+        # 不是重复，正常执行并记录
+        result = handler(request)
+        self._last_tool_call = (name, args_json)
+        return result
+
+    async def awrap_tool_call(self, request, handler):
+        tool_call = request.tool_call
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+        args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+        # 检测是否与上一次调用完全相同
+        if self._last_tool_call and self._last_tool_call == (name, args_json):
+            # 重复调用，返回警告而不是执行
+            return ToolMessage(
+                content=f"⚠️ 你刚刚已经调用过 {name}({args_json[:100]}) 并且得到了结果，请勿重复调用。请基于已有结果继续下一步操作。",
+                tool_call_id=tool_call.get("id", ""),
+                name=name,
+            )
+
+        # 不是重复，正常执行并记录
+        result = await handler(request)
+        self._last_tool_call = (name, args_json)
+        return result
+
+
 class ToolCallIdMiddleware(AgentMiddleware):
     """确保所有工具调用都有有效的id字段"""
 
@@ -703,6 +750,8 @@ class LangChainPocketAgent:
             MCPToolResultMiddleware(),
             # 图片内容优化：避免历史图片base64数据累积导致token溢出
             ImageOptimizationMiddleware(),
+            # 连续重复工具调用检测：第二次重复时返回警告，让模型自我纠正
+            ToolCallRepeatMiddleware(),
             # 修复工具调用ID：某些LLM生成的tool_call缺少id字段
             ToolCallIdMiddleware(),
             # 历史消息自动压缩：token超过64K时自动压缩，保留最近20条消息
@@ -1119,11 +1168,18 @@ class LangChainPocketAgent:
             async for chunk in self.agent.astream(
                 {"messages": input_messages},
                 config=config,
-                stream_mode=["messages", "updates"],
+                stream_mode=["messages", "updates", "custom"],
                 version="v2"
             ):
                 if self._check_cancel():
                     break
+
+                # 处理工具执行进度（get_stream_writer 推送）
+                if chunk["type"] == "custom":
+                    progress_data = chunk["data"]
+                    if isinstance(progress_data, dict) and progress_data.get("type") == "progress":
+                        yield {"type": "progress", "message": progress_data.get("message", "")}
+                    continue
 
                 # 处理消息流（用于流式输出回复内容）
                 if chunk["type"] == "messages":

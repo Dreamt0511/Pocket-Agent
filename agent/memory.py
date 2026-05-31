@@ -42,10 +42,12 @@ class LongTermMemory:
         lines = profile.split('\n')
         updated_lines = []
         in_section = False
+        section_found = False
 
         for line in lines:
             if line.startswith(f"## {section}"):
                 in_section = True
+                section_found = True
                 updated_lines.append(line)
                 updated_lines.append(content)
             elif line.startswith("## ") and in_section:
@@ -53,5 +55,9 @@ class LongTermMemory:
                 updated_lines.append(line)
             elif not in_section:
                 updated_lines.append(line)
+
+        if not section_found:
+            updated_lines.append(f"\n## {section}")
+            updated_lines.append(content)
 
         self.profile_file.write_text('\n'.join(updated_lines), encoding='utf-8')
