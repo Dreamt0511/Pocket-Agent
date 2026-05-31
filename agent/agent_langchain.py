@@ -661,8 +661,8 @@ class LangChainPocketAgent:
             "model": "gelab-zero-4b-preview",
             "temperature": 0.7,
             "max_tokens": 8000,
-            "timeout": 10,  # 总超时10秒（原来是30秒）
-            "max_retries": 1,  # 失败后最多重试1次（原来是2次）
+            "timeout": 30,  # 总超时30秒
+            "max_retries": 1,  # 失败后最多重试1次
         }
         config = {**default_config, **self.llm_config}
 
