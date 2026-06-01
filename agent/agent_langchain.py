@@ -741,7 +741,9 @@ class LangChainPocketAgent:
         tool_names = ", ".join([tool.name for tool in ALL_TOOLS])
         enhanced_system_prompt = self.base_system_prompt + "\n\n" + agent_enhance_prompt.format(
             tool_names=tool_names,
-            skills_list=skills_list
+            skills_list=skills_list,
+            tasks_dir=TASKS_DIR,
+            logs_dir=LOGS_DIR
         )
 
         # 配置中间件
