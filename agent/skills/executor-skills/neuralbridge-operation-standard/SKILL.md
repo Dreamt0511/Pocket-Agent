@@ -49,8 +49,23 @@ description: 【降级方案】NeuralBridge MCP Server 操作规范，仅用于 
 ## 核心三原则
 
 1. **坐标禁止猜测**：所有点击/长按/滑动的坐标必须 100% 来自 `android_get_ui_tree` 返回的 bounds，禁止通过截图估算
-2. **每步必验证**：操作后先 `android_wait_for_idle`，再用 `android_get_ui_tree` 验证结果，确认成功才下一步
+2. **操作后直接验证**：一般操作（点击、滑动、输入、按键）完成后，直接调用 `android_get_ui_tree` 或 `android_find_elements` 验证结果，**无需等待**。只有页面明显需要加载时（启动应用、打开新页面、网络请求）才用 `android_wait_for_idle`，且 timeout_ms 最大 2000。禁止无脑在每个操作后都加等待
 3. **专用工具优先**：启动应用用 `android_launch_app`、按键用 `android_press_key`、查找元素用 `android_find_elements`/`android_get_ui_tree`，禁止用通用点击/滑动模拟专用操作。全程自动执行，禁止半途而废让用户手动
+
+### 等待时间规定（强制执行）
+
+| 场景 | 等待策略 | timeout_ms |
+|------|---------|------------|
+| 点击/滑动/输入/按键后 | **不等待**，直接获取 UI 树验证 | - |
+| 启动应用 | `android_wait_for_idle` | 2000 |
+| 打开新页面/跳转 | `android_wait_for_idle` | 2000 |
+| 网络请求触发的页面变化 | `android_wait_for_idle` | 2000 |
+| 低端设备加载重型页面（极端情况） | `android_wait_for_idle` | 3000 |
+
+**禁止**：
+- 禁止每个操作后都调用 `android_wait_for_idle`
+- 禁止 timeout_ms 超过 3000
+- 禁止用 `time.sleep()` 或其他 shell sleep 替代 `android_wait_for_idle`
 
 ## 常用按键
 
@@ -72,7 +87,8 @@ description: 【降级方案】NeuralBridge MCP Server 操作规范，仅用于 
 
 ## 二、验证与降级
 
-- **优先**：操作 → `android_wait_for_idle` → `android_get_ui_tree` 验证状态变化
+- **一般操作**：操作完成 → 直接 `android_get_ui_tree` 验证状态变化（无需等待）
+- **页面加载场景**：操作完成 → `android_wait_for_idle(timeout_ms=2000)` → `android_get_ui_tree` 验证
 - **降级**：UI 树无法反映变化时用 `android_screenshot` 肉眼确认
 - 验证不通过：重获 UI 树 → 分析原因 → 调整坐标/方案重试，禁止连续盲目点击
 
@@ -123,7 +139,7 @@ android_input_text(text="目标内容", resource_id="EditText的resource_id")
 2. 计算坐标：`paste_x = left + 40`（输入框左侧微偏右），`paste_y = bottom + 50`（输入框正下方）
 3. `android_set_clipboard(text="目标文本")` — 存入剪贴板
 4. `android_tap(x=输入框中心x, y=输入框中心y)` — 点击输入框弹出键盘（若键盘已弹出可跳过）
-5. 等待 1 秒，键盘检测到剪贴板内容后会在顶部建议栏显示"粘贴"按钮
+5. `android_wait_for_idle(timeout_ms=1000)` — 等键盘弹出，键盘检测到剪贴板内容后会在顶部建议栏显示"粘贴"按钮
 6. `android_tap(x=paste_x, y=paste_y)` — 点击粘贴按钮
 7. 验证：重新获取 UI 树，检查输入框 text 是否变化
 8. 点击发送按钮
@@ -132,54 +148,11 @@ android_input_text(text="目标内容", resource_id="EditText的resource_id")
 
 > **设备差异**：不同手机屏幕尺寸/键盘布局下，`bottom + 50` 可能严重偏离实际位置（尤其是键盘弹出后内容上滚的设备）。方案C 连续失败时直接降级到方案D。
 
-**方案D：OCR 动态定位（终极通用方案，适配所有机型/屏幕/键盘）**
+**方案D：OCR 动态定位（终极降级方案）**
 
-当方案C 的公式坐标在所有设备上都点不到粘贴建议时，用截图 + OCR 精确定位。依赖 `tesseract`（需 `pkg install`）和 `pytesseract`（已加入依赖列表）。
+方案C 连续失败时使用。依赖 `tesseract` + `pytesseract`。
 
-**核心思路：** 截图 → OCR 识别键盘建议栏中的剪贴板文字 → 获取坐标 → 点击。
-
-```python
-import subprocess, json, base64
-
-# 1. 设剪贴板 + 点输入框弹键盘（同方案C）
-mcp_call("android_set_clipboard", {"text": "目标文本"})
-mcp_call("android_tap", {"x": 输入框center_x, "y": 输入框center_y})
-mcp_call("android_wait_for_idle", {"timeout_ms": 2000})
-
-# 2. 截图
-screenshot = mcp_call("android_screenshot", {"quality": "full", "max_width": 1080})
-with open('/tmp/ocr_input.jpg', 'wb') as f:
-    f.write(base64.b64decode(screenshot['image_data']))
-
-# 3. OCR 找剪贴板文字
-cmd = ['tesseract', '/tmp/ocr_input.jpg', 'stdout', '-l', 'chi_sim+eng', 'tsv']
-result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-target = "目标文本前5字"  # 用剪贴板内容的前几个字匹配
-for line in result.stdout.strip().split('\n')[1:]:
-    parts = line.split('\t')
-    if len(parts) >= 12 and target in parts[11]:
-        x, y, w, h = int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9])
-        paste_x, paste_y = x + w//2, y + h//2
-        break
-
-# 4. 点击粘贴建议
-mcp_call("android_tap", {"x": paste_x, "y": paste_y})
-mcp_call("android_wait_for_idle", {"timeout_ms": 500})
-
-# 5. OCR 找"发送"按钮（同上方法）
-result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-for line in result.stdout.strip().split('\n')[1:]:
-    parts = line.split('\t')
-    if len(parts) >= 12 and '发送' in parts[11]:
-        x, y, w, h = int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9])
-        send_x, send_y = x + w//2, y + h//2
-        break
-
-# 6. 点击发送
-mcp_call("android_tap", {"x": send_x, "y": send_y})
-```
-
-> **注意**：OCR 匹配用剪贴板前 5 个字可避免误匹配。发送按钮搜"发送"或"send"。
+**思路**：设剪贴板 → 点输入框弹键盘 → 截图 → tesseract OCR 识别剪贴板文字坐标 → 点击粘贴建议 → 找发送按钮点击。用剪贴板前 5 字匹配避免误命中。
 
 ```
 Try 方案A: android_input_text
