@@ -88,3 +88,4 @@ prompt = """重要规则：
        - scope: "all"（默认）搜全部，"session" 只搜当前会话
        - days: 时间过滤，如 days=7 表示过去 7 天
        - msg_type: "user" 只搜用户消息，"assistant" 只搜 AI 回复，"memory" 只搜记忆
+"""

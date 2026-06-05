@@ -130,14 +130,66 @@ android_input_text(text="目标内容", resource_id="EditText的resource_id")
 
 > **坐标校准**：若粘贴失败，按 `paste_y += 20` 递增重试（最多 2 次），因为不同键盘的建议栏高度略有差异。禁止无限制重复点击。
 
-### 执行流程（优先级从高到低）
+> **设备差异**：不同手机屏幕尺寸/键盘布局下，`bottom + 50` 可能严重偏离实际位置（尤其是键盘弹出后内容上滚的设备）。方案C 连续失败时直接降级到方案D。
+
+**方案D：OCR 动态定位（终极通用方案，适配所有机型/屏幕/键盘）**
+
+当方案C 的公式坐标在所有设备上都点不到粘贴建议时，用截图 + OCR 精确定位。依赖 `tesseract`（需 `pkg install`）和 `pytesseract`（已加入依赖列表）。
+
+**核心思路：** 截图 → OCR 识别键盘建议栏中的剪贴板文字 → 获取坐标 → 点击。
+
+```python
+import subprocess, json, base64
+
+# 1. 设剪贴板 + 点输入框弹键盘（同方案C）
+mcp_call("android_set_clipboard", {"text": "目标文本"})
+mcp_call("android_tap", {"x": 输入框center_x, "y": 输入框center_y})
+mcp_call("android_wait_for_idle", {"timeout_ms": 2000})
+
+# 2. 截图
+screenshot = mcp_call("android_screenshot", {"quality": "full", "max_width": 1080})
+with open('/tmp/ocr_input.jpg', 'wb') as f:
+    f.write(base64.b64decode(screenshot['image_data']))
+
+# 3. OCR 找剪贴板文字
+cmd = ['tesseract', '/tmp/ocr_input.jpg', 'stdout', '-l', 'chi_sim+eng', 'tsv']
+result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+target = "目标文本前5字"  # 用剪贴板内容的前几个字匹配
+for line in result.stdout.strip().split('\n')[1:]:
+    parts = line.split('\t')
+    if len(parts) >= 12 and target in parts[11]:
+        x, y, w, h = int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9])
+        paste_x, paste_y = x + w//2, y + h//2
+        break
+
+# 4. 点击粘贴建议
+mcp_call("android_tap", {"x": paste_x, "y": paste_y})
+mcp_call("android_wait_for_idle", {"timeout_ms": 500})
+
+# 5. OCR 找"发送"按钮（同上方法）
+result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+for line in result.stdout.strip().split('\n')[1:]:
+    parts = line.split('\t')
+    if len(parts) >= 12 and '发送' in parts[11]:
+        x, y, w, h = int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9])
+        send_x, send_y = x + w//2, y + h//2
+        break
+
+# 6. 点击发送
+mcp_call("android_tap", {"x": send_x, "y": send_y})
+```
+
+> **注意**：OCR 匹配用剪贴板前 5 个字可避免误匹配。发送按钮搜"发送"或"send"。
 
 ```
 Try 方案A: android_input_text
   ├─ 成功 → 继续
-  └─ 失败 → Try 方案B: 三步法
-              ├─ press_key paste 成功 → 继续
-              └─ press_key paste 失败 → Try 方案C: 键盘粘贴建议
+  └─ 失败 → Try 方案B: 三步法 (clipboard + press_key paste)
+              ├─ 验证成功 → 继续
+              └─ 验证失败（UI树text没变）→ Try 方案C: 键盘粘贴建议坐标
+                  ├─ 点击成功（验证通过）→ 继续
+                  └─ 坐标点不到 → Try 方案D: OCR 动态定位
+                      └─ 识别成功 → 继续
 ```
 
 **禁止**：

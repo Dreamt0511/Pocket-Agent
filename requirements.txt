@@ -30,3 +30,6 @@ fastapi>=0.115.0
 uvicorn>=0.34.0
 sse-starlette>=2.0.0
 numpy>=1.24.0
+
+# OCR 方案D（可选，输入失败时的终极兜底）
+pytesseract>=0.3.13

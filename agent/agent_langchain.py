@@ -1371,6 +1371,19 @@ class LangChainPocketAgent:
                 "recursion_limit": self.max_iterations
             }
 
+    def switch_conversation(self, thread_id: str) -> None:
+        """切换到指定会话（恢复 checkpoint 中的对话历史）
+
+        与 clear_history 不同：不销毁旧状态，直接切换 thread_id 以加载已有 checkpoint。
+        """
+        self._thread_id_map = getattr(self, '_thread_id_map', {})
+        # 清除该 thread_id 的重映射（如果有），恢复原始 thread_id
+        self._thread_id_map.pop(thread_id, None)
+        self.config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+        }
+
     def cancel(self) -> None:
         """请求取消当前正在执行的推理"""
         self._cancel_requested = True
