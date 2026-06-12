@@ -7,6 +7,8 @@ import sys
 import json
 import sqlite3
 import subprocess
+import warnings
+warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
 import time
 import contextlib
 from pathlib import Path

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Pocket Agent 3D - Body Viewer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#b8e4f0;font-family:system-ui,sans-serif}
+canvas{display:block}
+#status{position:fixed;bottom:50px;left:50%;transform:translateX(-50%);z-index:10;background:rgba(0,0,0,.5);color:#fff;padding:3px 10px;border-radius:10px;font-size:10px;pointer-events:none}
+#chat-bar{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);z-index:20;display:flex;gap:6px;align-items:center;width:min(360px,90vw)}
+#chat-input{flex:1;padding:8px 12px;border:none;border-radius:18px;background:rgba(255,255,255,.9);font-size:14px;outline:none;box-shadow:0 1px 6px rgba(0,0,0,.15)}
+#chat-input:focus{background:#fff;box-shadow:0 1px 8px rgba(0,0,0,.2)}
+#chat-send{width:34px;height:34px;border:none;border-radius:50%;background:#4a9eff;color:#fff;font-size:16px;cursor:pointer;box-shadow:0 1px 6px rgba(0,0,0,.15);display:flex;align-items:center;justify-content:center}
+#chat-send:active{transform:scale(.92)}
+#chat-log{position:fixed;top:8px;left:8px;right:8px;z-index:20;max-height:40vh;overflow-y:auto;display:flex;flex-direction:column;gap:4px;pointer-events:auto}
+.chat-msg{padding:3px 7px;border-radius:8px;font-size:11px;max-width:75vw;word-break:break-word;line-height:1.3}
+.chat-user{background:rgba(74,158,255,.6);color:#fff;align-self:flex-end;border-bottom-right-radius:3px}
+.chat-ai{background:rgba(255,255,255,.45);color:#222;align-self:flex-start;border-bottom-left-radius:3px;box-shadow:0 1px 2px rgba(0,0,0,.08);white-space:pre-wrap;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+.chat-tool{background:rgba(0,0,0,.06);color:#666;align-self:flex-start;font-size:10px;padding:2px 6px;border-radius:6px}
+#thinking-indicator{align-self:flex-start;display:none;align-items:center;gap:4px;padding:6px 12px;background:rgba(255,255,255,.35);border-radius:12px;border-bottom-left-radius:3px;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+#thinking-indicator .dot{width:6px;height:6px;border-radius:50%;background:rgba(0,0,0,.25);animation:thinkBounce 1.2s ease-in-out infinite}
+#thinking-indicator .dot:nth-child(2){animation-delay:.2s}
+#thinking-indicator .dot:nth-child(3){animation-delay:.4s}
+@keyframes thinkBounce{0%,60%,100%{transform:translateY(0);opacity:.3}30%{transform:translateY(-4px);opacity:.8}}
+</style>
+</head>
+<body>
+<div id="chat-log"></div>
+<div id="thinking-indicator"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+<div id="chat-bar">
+  <input id="chat-input" type="text" placeholder="给Agent发消息..." autocomplete="off">
+  <button id="chat-send">&#10148;</button>
+</div>
+<div id="status">等待连接...</div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const DEG2RAD = Math.PI / 180;
+const statusEl = document.getElementById('status');
+
+// ══════════════════════════════════════════════
+// SCENE
+// ══════════════════════════════════════════════
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xb8e4f0);
+scene.fog = new THREE.Fog(0xb8e4f0, 12, 25);
+
+const camera = new THREE.PerspectiveCamera(30, innerWidth/innerHeight, .1, 50);
+camera.position.set(0, 1.0, 7);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = .08;
+controls.minDistance = 2;
+controls.maxDistance = 15;
+controls.autoRotate = false;
+controls.target.set(0, .4, 0);
+
+scene.add(new THREE.AmbientLight(0xffffff, .6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+sun.position.set(3, 6, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+scene.add(sun);
+scene.add(new THREE.DirectionalLight(0x88bbff, .6).translateX(-3).translateY(3));
+scene.add(new THREE.DirectionalLight(0xffffff, .4).translateZ(-4).translateY(2));
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(10,10), new THREE.ShadowMaterial({opacity:.12}));
+ground.rotation.x = -Math.PI/2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ══════════════════════════════════════════════
+// Bone state
+// ══════════════════════════════════════════════
+const bones = {};
+const boneList = [
+  'root','body','head',
+  'left_leg','right_leg',
+  'da_tui','da_tui2',
+  'left_hand','right_hand',
+  'da_shou','da_shou2',
+  'you_ear','zuo_ear2'
+];
+
+const cur = {};
+for (const n of boneList) cur[n] = {x:0, y:0, z:0};
+
+const target = {};
+for (const n of boneList) target[n] = {x:0, y:0, z:0};
+
+const manual = new Set();
+let animMode = 'idle';
+let animTime = 0;
+const LERP_SPEED = 8;
+
+// Root位移状态
+const rootPos = {x: 0, y: 0, z: 0};
+const targetRootPos = {x: 0, y: 0, z: 0};
+
+// ══════════════════════════════════════════════
+// Original animation keyframes (look_at_player)
+// ══════════════════════════════════════════════
+const IDLE_KFS = {
+  right_hand: {0: [0,0,-20], 0.5: [0,0,-17.5], 1: [0,0,-20]},
+  left_hand:  {0: [0,0,20],  0.5: [0,0,17.5],  1: [0,0,20]},
+  root:       {0: [0,0,0],   0.5: [-0.5,0,0],   1: [0,0,0]},
+  body:       {0: [0,0,0],   0.5: [-1,0,0],     1: [0,0,0]},
+  head:       {0: [10,0,0]},
+  you_ear:    {0: [0,0,0],   0.5: [-2.5,0,0],   1: [0,0,0]},
+  zuo_ear2:   {0: [0,0,0],   0.5: [-2.5,0,0],   1: [0,0,0]},
+  da_shou:    {0: [0,0,0]},
+  da_shou2:   {0: [0,0,0]},
+  left_leg:   {0: [0,0,0]},
+  right_leg:  {0: [0,0,0]},
+  da_tui:     {0: [0,0,0]},
+  da_tui2:    {0: [0,0,0]},
+};
+
+function sampleKF(kfs, t) {
+  const times = Object.keys(kfs).map(Number).sort((a,b)=>a-b);
+  t = ((t % 1) + 1) % 1;
+  if (times.length === 1) return kfs[times[0]];
+  let i = 0;
+  for (; i < times.length-1; i++) {
+    if (t <= times[i+1]) break;
+  }
+  const t0 = times[i];
+  const t1 = times[i+1];
+  const v0 = kfs[t0];
+  const v1 = kfs[t1];
+  if (t0 === t1) return v0;
+  const f = (t - t0) / (t1 - t0);
+  return [v0[0]+(v1[0]-v0[0])*f, v0[1]+(v1[1]-v0[1])*f, v0[2]+(v1[2]-v0[2])*f];
+}
+
+function updateAnim(dt) {
+  if (animMode !== 'idle') return;
+  animTime = (animTime + dt) % 1;
+  for (const name of boneList) {
+    if (manual.has(name)) continue;
+    const kfs = IDLE_KFS[name];
+    if (kfs) {
+      const v = sampleKF(kfs, animTime);
+      target[name] = {x: v[0], y: v[1], z: v[2]};
+    }
+  }
+}
+
+function applyBones(dt) {
+  const lerp = 1 - Math.exp(-LERP_SPEED * dt);
+  for (const name of boneList) {
+    const bone = bones[name];
+    if (!bone) continue;
+    const c = cur[name];
+    const t = target[name];
+    c.x += (t.x - c.x) * lerp;
+    c.y += (t.y - c.y) * lerp;
+    c.z += (t.z - c.z) * lerp;
+    bone.rotation.set(c.x * DEG2RAD, c.y * DEG2RAD, c.z * DEG2RAD, 'XYZ');
+  }
+  // Root位移插值
+  if (bones.root) {
+    rootPos.x += (targetRootPos.x - rootPos.x) * lerp;
+    rootPos.y += (targetRootPos.y - rootPos.y) * lerp;
+    rootPos.z += (targetRootPos.z - rootPos.z) * lerp;
+    bones.root.position.set(rootPos.x, rootPos.y, rootPos.z);
+  }
+}
+
+function goIdle() {
+  animMode = 'idle';
+  manual.clear();
+  // 重置所有骨骼到待机状态
+  for (const name of boneList) {
+    const kfs = IDLE_KFS[name];
+    if (kfs) {
+      const times = Object.keys(kfs).map(Number).sort((a,b)=>a-b);
+      const v = kfs[times[0]];
+      target[name] = {x: v[0], y: v[1], z: v[2]};
+    } else {
+      target[name] = {x:0, y:0, z:0};
+    }
+  }
+  // 重置root位移
+  targetRootPos.x = 0;
+  targetRootPos.y = 0;
+  targetRootPos.z = 0;
+}
+
+// ══════════════════════════════════════════════
+// SSE命令接收
+// ══════════════════════════════════════════════
+function startSSE() {
+  const eventSource = new EventSource('/api/events');
+
+  eventSource.onmessage = function(event) {
+    try {
+      const cmd = JSON.parse(event.data);
+
+      if (cmd.type === 'set_bone') {
+        const bone = cmd.bone;
+        const x = cmd.x || 0;
+        const y = cmd.y || 0;
+        const z = cmd.z || 0;
+
+        if (bones[bone]) {
+          target[bone] = {x, y, z};
+          animMode = 'manual';
+          manual.add(bone);
+          statusEl.textContent = `Agent: ${bone} (${x}, ${y}, ${z})`;
+        }
+      } else if (cmd.type === 'set_position') {
+        targetRootPos.x = cmd.x || 0;
+        targetRootPos.y = cmd.y || 0;
+        targetRootPos.z = cmd.z || 0;
+        animMode = 'manual';
+        statusEl.textContent = `Agent: pos (${targetRootPos.x}, ${targetRootPos.y}, ${targetRootPos.z})`;
+      } else if (cmd.type === 'idle') {
+        goIdle();
+        statusEl.textContent = 'Agent: 待机';
+      }
+    } catch (e) {
+      console.error('解析命令错误:', e);
+    }
+  };
+
+  eventSource.onopen = function() {
+    statusEl.textContent = '已连接';
+  };
+
+  eventSource.onerror = function() {
+    statusEl.textContent = '连接断开，重连中...';
+    eventSource.close();
+    setTimeout(startSSE, 3000);
+  };
+}
+
+// ══════════════════════════════════════════════
+// LOAD MODEL
+// ══════════════════════════════════════════════
+const gltfLoader = new GLTFLoader();
+gltfLoader.load('models/robot.geo.gltf',
+  (gltf) => {
+    const model = gltf.scene;
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const s = 1.0 / maxDim;
+    model.scale.setScalar(s);
+    // 居中后把脚底放到y=0
+    model.position.set(-center.x * s, -box.min.y * s, -center.z * s);
+
+    model.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    scene.add(model);
+
+    model.traverse((child) => {
+      if (child.isObject3D && child.children.length > 0 && !child.isMesh) {
+        bones[child.name] = child;
+      }
+    });
+
+    goIdle();
+    startSSE();
+    statusEl.textContent = '已连接';
+  },
+  undefined,
+  (err) => {
+    console.error(err);
+    statusEl.textContent = '加载失败';
+  }
+);
+
+// ══════════════════════════════════════════════
+// LOOP
+// ══════════════════════════════════════════════
+const clock = new THREE.Clock();
+(function loop() {
+  const dt = clock.getDelta();
+  updateAnim(dt);
+  applyBones(dt);
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+})();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ══════════════════════════════════════════════
+// CHAT + SSE
+// ══════════════════════════════════════════════
+const chatInput = document.getElementById('chat-input');
+const chatSend = document.getElementById('chat-send');
+const chatLog = document.getElementById('chat-log');
+let aiBubble = null;
+let clearTimer = null;
+
+function clearChat() {
+  while (chatLog.firstChild) chatLog.removeChild(chatLog.firstChild);
+  aiBubble = null;
+  if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
+}
+
+function startClearTimer() {
+  if (clearTimer) clearTimeout(clearTimer);
+  clearTimer = setTimeout(clearChat, 60000);
+}
+
+function addChatMsg(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'chat-msg ' + cls;
+  el.textContent = text;
+  chatLog.appendChild(el);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return el;
+}
+
+function startAiBubble() {
+  clearChat();
+  aiBubble = addChatMsg('', 'chat-ai');
+  return aiBubble;
+}
+
+async function sendMessage() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  clearChat();  // 用户发新消息，清除上一轮对话气泡
+  chatInput.value = '';
+  addChatMsg(text, 'chat-user');
+  // 立即显示思考动画，不等后端响应
+  document.getElementById('thinking-indicator').style.display = 'flex';
+  const sendBtn = document.getElementById('chat-send');
+  sendBtn.textContent = '...';
+  sendBtn.disabled = true;
+  try {
+    const resp = await fetch('/api/send_message', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})
+    });
+    const data = await resp.json();
+    if (!data.ok) console.warn('send response abnormal:', data);
+  } catch (e) {
+    console.error('send failed:', e);
+    addChatMsg('send failed, check connection', 'chat-ai');
+    setTimeout(() => {
+      const last = chatLog.lastChild;
+      if (last && last.textContent === 'send failed, check connection') last.remove();
+    }, 3000);
+  } finally {
+    sendBtn.textContent = '▶';
+    sendBtn.disabled = false;
+  }
+}
+
+chatSend.addEventListener('click', sendMessage);
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendMessage();
+});
+
+function startResponseSSE() {
+  const es = new EventSource('/api/response_stream');
+
+  es.onmessage = function(event) {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type === 'thinking') {
+        document.getElementById('thinking-indicator').style.display = 'flex';
+      } else if (data.type === 'token') {
+        document.getElementById('thinking-indicator').style.display = 'none';
+        if (!aiBubble) startAiBubble();
+        aiBubble.textContent += data.content;
+        chatLog.scrollTop = chatLog.scrollHeight;
+      } else if (data.type === 'tool_start') {
+        const toolEl = addChatMsg('调用 ' + data.name + '...', 'chat-tool');
+        setTimeout(() => toolEl.remove(), 3000);
+      } else if (data.type === 'done') {
+        document.getElementById('thinking-indicator').style.display = 'none';
+        if (aiBubble && data.response) {
+          aiBubble.textContent = data.response;
+        }
+        startClearTimer();
+      } else if (data.type === 'error') {
+        document.getElementById('thinking-indicator').style.display = 'none';
+        if (!aiBubble) startAiBubble();
+        aiBubble.textContent = '出错了: ' + data.message;
+        aiBubble.style.color = '#e44';
+        startClearTimer();
+      }
+    } catch (e) {}
+  };
+
+  es.onerror = function() {
+    es.close();
+    setTimeout(startResponseSSE, 3000);
+  };
+}
+
+startResponseSSE();
+</script>
+</body>
+</html>

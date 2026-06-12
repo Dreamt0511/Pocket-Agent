@@ -9,7 +9,10 @@ import sys
 import os
 import sqlite3
 import time
+import warnings
 from datetime import datetime
+# 当前 langgraph 版本不支持 allowed_objects 参数，过滤未来警告
+warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
 from agent.ui import PocketUI
 from agent.agent_langchain import LangChainPocketAgent
 from dotenv import load_dotenv
@@ -332,6 +335,7 @@ async def _resume_conversation(ui, agent, conversations: list) -> str | None:
         return None
 
     # 切换 agent 到目标会话
+    # conv_id 是 SQLite 的会话 ID，同时也作为 checkpoint 的 thread_id
     agent.switch_conversation(conv_id)
     set_current_conversation_id(conv_id)
 
@@ -362,13 +366,24 @@ async def main():
     checkpointer = await _init_checkpointer()
     _cleanup_old_messages(vector_store)
 
-    # 终端模式固定会话ID，与 App 的会话隔离
-    conversation_id = "terminal-session"
+    # 终端模式会话ID：每次启动生成新的 UUID，与 agent 的 thread_id 保持一致
+    import uuid
+    conversation_id = str(uuid.uuid4())
     set_current_conversation_id(conversation_id)
 
     # 新版LangChain Agent实现
     model_name = os.getenv("LLM_MODEL", "gelab-zero-4b-preview")
-    ui.show_welcome_screen(model_name + " (LangChain)")  # 展示欢迎界面
+
+    # 启动身体控制服务器
+    body_url = ""
+    try:
+        from agent.tools.body_control_tool import start_body_server
+        start_body_server()
+        body_url = "http://localhost:18081"
+    except Exception as e:
+        print(f"3D身体控制启动失败: {e}")
+
+    ui.show_welcome_screen(model_name + " (LangChain)", body_url)  # 展示欢迎界面
 
     # 系统提示词直接从prompts模块导入
     base_system_prompt = system_base_prompt
@@ -404,12 +419,55 @@ async def main():
         llm_config=llm_config,
         ui=ui,
         checkpointer=checkpointer,
+        thread_id=conversation_id,  # 使用与 conversation_id 相同的 UUID
     )
 
     # 互动式对话循环
     tool_call_count = 0
     current_task = None  # 记录当前正在执行的任务
     is_processing = False  # 标记是否正在处理用户请求
+
+    # 后台任务：处理浏览器消息（asyncio.Event 无轮询，主协程阻塞）
+    async def browser_message_loop():
+        from agent.tools.body_server import (init_browser_event,
+            get_browser_event, get_browser_message, push_response_event)
+        init_browser_event(asyncio.get_event_loop())
+        ev = get_browser_event()
+        while True:
+            # 先看队列是否有积压
+            msg = get_browser_message()
+            if not msg:
+                ev.clear()
+                msg = get_browser_message()  # double-check：防止 clear 和 wait 之间消息到达
+                if not msg:
+                    await ev.wait()
+                    msg = get_browser_message()
+            if is_processing or not msg:
+                continue
+            # 打印分隔线和浏览器消息（与终端输入风格一致）
+            ui.console.print()
+            ui.console.rule(style="dim cyan")
+            ui.console.print(f"[bold green]🪀 浏览器:[/bold green] {msg}")
+            _save_message(conversation_id, "user", msg)
+            push_response_event('thinking', {})
+            try:
+                async for chunk in agent.stream_conversation(msg):
+                    etype = chunk.get('type', '')
+                    if etype == 'token':
+                        push_response_event('token', {'content': chunk.get('content', '')})
+                    elif etype == 'tool_start':
+                        push_response_event('tool_start', {'name': chunk.get('name', '')})
+                    elif etype == 'tool_end':
+                        push_response_event('tool_end', {'name': chunk.get('name', '')})
+                    elif etype == 'done':
+                        _save_message(conversation_id, "assistant", chunk.get('response', ''))
+                        push_response_event('done', {'response': chunk.get('response', '')})
+                    elif etype == 'error':
+                        push_response_event('error', {'message': chunk.get('message', '')})
+            except Exception as e:
+                push_response_event('error', {'message': str(e)})
+
+    asyncio.create_task(browser_message_loop())
 
     while True:
         try:
@@ -425,7 +483,6 @@ async def main():
                 continue
 
             if user_input.lower() in ['q', 'quit', 'exit', 'bye', '退出']:
-                await agent.cleanup()
                 ui.print_success("再见！")
                 break
 
@@ -452,7 +509,17 @@ async def main():
             if user_input.lower() in ['/undo', '/撤回']:
                 # LangChain版本：创建新会话，清空历史
                 agent.clear_history()
-                conversation_id = "terminal-session"
+                # 生成新的会话 ID，确保与 agent 的 thread_id 一致
+                conversation_id = agent._default_thread_id
+                set_current_conversation_id(conversation_id)
+                ui.print_success("✅ 已清空对话历史，你可以重新输入")
+                continue
+
+            # 清空对话历史
+            if user_input.lower() == '/clear':
+                agent.clear_history()
+                # 生成新的会话 ID，确保与 agent 的 thread_id 一致
+                conversation_id = agent._default_thread_id
                 set_current_conversation_id(conversation_id)
                 ui.print_success("✅ 已清空对话历史，你可以重新输入")
                 continue
@@ -503,16 +570,19 @@ async def main():
                     ui.print_conversation_stats(tool_call_count, len(agent.tools))
 
         except KeyboardInterrupt:
-            # 意外传播到外层的Ctrl+C（内层已捕获，此处仅作安全兜底）
             ui.print_success("\n\n再见！")
             break
         except Exception as e:
-            # 忽略键盘中断相关的异常栈输出
             if not isinstance(e, KeyboardInterrupt) and "CancelledError" not in str(type(e)):
                 ui.print_error(f"发现错误: {e}")
-        finally:
-            # 退出前关闭HTTP客户端，避免httpx异步生成器报错
-            await agent.cleanup()
+            break
+
+    # ── 退出清理（body server 端口释放）──
+    try:
+        from agent.tools.body_control_tool import stop_body_server
+        stop_body_server()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

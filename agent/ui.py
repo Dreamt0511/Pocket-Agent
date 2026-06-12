@@ -38,9 +38,10 @@ class PocketUI:
         history_path = os.path.expanduser("~/.pocket_agent_history")
         self.prompt_session = PromptSession(history=FileHistory(history_path))
 
-    def print_banner(self, model_name: str = ""):
+    def print_banner(self, model_name: str = "", body_url: str = ""):
         """打印首页横幅"""
         model_line = f"\n{model_name}" if model_name else ""
+        body_line = f"\n前往 {body_url} 与机器人交互" if body_url else ""
         banner = f"""
 
   █▀█ █▀█ █▀▀ █ █ █▀▀ ▀█▀   █▀█ █▀▀ █▀▀ █▀█ ▀█▀
@@ -49,7 +50,7 @@ class PocketUI:
 
   Pocket-Agent — 移动端AI代理帮手
 
-  轻量、快速、智能{model_line}
+  轻量、快速、智能{model_line}{body_line}
         """
 
         self.console.print(Panel(
@@ -228,10 +229,10 @@ class PocketUI:
         """
         return ascii_art.strip()
 
-    def show_welcome_screen(self, model_name: str = ""):
+    def show_welcome_screen(self, model_name: str = "", body_url: str = ""):
         """显示欢迎界面 — 只保留蓝框横幅"""
         self.console.clear()
-        self.print_banner(model_name)
+        self.print_banner(model_name, body_url)
 
     def create_progress_display(self):
         """创建实时进度显示，使用Live组件实现单行更新"""

@@ -1026,6 +1026,13 @@ def delegate_task(description: str, tasks_json: str = "") -> str:
     )
 
 
+# 导入身体控制工具
+try:
+    from .body_control_tool import control_body, move_body, body_script, body_idle
+    BODY_TOOLS = [control_body, move_body, body_script, body_idle]
+except Exception:
+    BODY_TOOLS = []
+
 ALL_TOOLS = [
     file_read, file_write, file_search, directory_list, system_info, shell_exec, update_user_profile, mcp_call, delegate_task, tts_speak, save_memory, search_memory
-]
+] + BODY_TOOLS

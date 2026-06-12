@@ -515,6 +515,7 @@ class LangChainPocketAgent:
         ui=None,
         max_iterations: int = None,
         checkpointer=None,
+        thread_id: str = None,
     ):
         self.ui = ui
         self.base_system_prompt = system_prompt
@@ -528,11 +529,13 @@ class LangChainPocketAgent:
         # 创建Agent
         self._create_agent()
 
-        # 会话配置：recursion_limit从配置文件读取，作为极端情况的底层兜底
-        # 正常情况下max_iterations会先生效，优雅停止；极端情况recursion_limit兜底报错
+        # 会话配置：使用传入的 thread_id 或生成新的 UUID
+        # 确保新对话不加载旧历史，同时与 main.py 的 conversation_id 保持一致
+        import uuid
+        self._default_thread_id = thread_id or str(uuid.uuid4())
         self.config = {
             "configurable": {
-                "thread_id": "default-session"
+                "thread_id": self._default_thread_id
             },
             "recursion_limit": RECURSION_LIMIT
         }
