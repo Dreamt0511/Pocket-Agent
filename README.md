@@ -16,7 +16,7 @@
 - **手机自动化控制**：通过 NeuralBridge 协议直接操控安卓设备——点击、滑动、输入、截图、获取 UI 树，可自动执行复杂的多步手机操作任务
 - **3D 虚拟身体控制**：Agent 可自主控制 3D 身体模型（挥手、跳舞、点头等），通过提示词实时编排动作，无需预设；配套 Three.js 网页端实时渲染
 - **浏览器双向交互**：Agent 通过 SSE 与浏览器页面实时通信，Web 页面可发送消息给 Agent 并接收回复，3D 模型页面也集成聊天入口
-- **子 Agent 系统**：主 Agent 可将复杂任务委托给子 Agent 后台异步执行，支持独立模型配置，不阻塞对话
+- **子 Agent 系统**：主 Agent 可将复杂手机操作任务委托给子 Agent 同步接管执行，子 Agent 获得完整操作权限后自主完成多步任务，执行结果返回主 Agent
 - **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆，基于 FTS5 + 向量搜索 + RRF 融合排序，跨会话持久化
 - **技能系统**：自动发现 SKILL.md 知识文档，Agent 按需阅读并按指南执行任务，支持主 Agent、子 Agent、自动沉淀三种技能类型
 - **LangChain Agent**：基于官方 `create_agent` 构建，支持中间件链（上下文压缩、模型调用限制等），支持 OpenAI / Ollama / 本地模型
@@ -186,10 +186,10 @@ update_user_profile(section="偏好设置", content="喜欢简洁的回答风格
 
 ## 子 Agent 系统
 
-主 Agent 可通过 `delegate_task` 将独立任务委托给子 Agent 执行。
+主 Agent 可通过 `delegate_task` 将复杂手机操作任务委托给子 Agent 执行。子 Agent 会同步接管任务，自主完成所有操作步骤后返回结果给主 Agent。
 
+- 子 Agent 拥有独立的系统提示词和执行权限，可完整操作手机（点击、滑动、输入等）
 - 子 Agent 默认与主 Agent 共用模型，也可通过环境变量独立配置（`EXECUTOR_LLM_BASE_URL` 等）
-- 子 Agent 拥有独立的系统提示词（`agent/prompts/executor_system.py` + `executor_enhance.py`）
 - 子 Agent 技能存放在 `agent/skills/executor-skills/`，主 Agent 技能存放在 `agent/skills/main-skills/`
 - 子 Agent 执行结果自动返回主 Agent，执行过程通过任务文件（`/tmp/agent_task_*.json`）管理
 
@@ -223,6 +223,22 @@ Web 页面支持双向通信：
 - **SSE 推送**：Agent 的身体控制指令实时推送到页面，3D 模型同步动作
 - **消息输入**：页面上的输入框可发送消息给 Agent，Agent 的回复也会实时显示在页面上
 - **响应流**：Agent 回复内容通过 SSE 实时推送到浏览器
+
+## Android 客户端
+
+Pocket-Agent 提供 Android 原生客户端，将 AI Agent 能力搬到手机系统层面。
+
+- **全局悬浮窗**：系统级悬浮球 + 终端卡片，退出 App 后仍可监控 Agent 执行，且不干扰 UI 自动化操作
+- **语音输入**：内置语音识别，说话即可操控 Agent
+- **任务管理**：后台服务保活，任务队列串行执行，支持排队和取消
+- **技能管理**：扫描、创建、编辑、删除 Agent 技能，支持导出和批量操作
+- **版本管理**：查看当前代码版本（commit SHA），支持版本历史查看和回退
+- **代码同步**：一键通知 Termux 执行 `git pull`，自动拉取最新 Agent 代码
+
+| 资源 | 链接 |
+|------|------|
+| 源码仓库 | [Dreamt0511/Pocket-Agent-Android](https://github.com/Dreamt0511/Pocket-Agent-Android) |
+| APK 下载 | [GitHub Releases](https://github.com/Dreamt0511/Pocket-Agent-Android/releases) |
 
 ## 技能系统
 
@@ -322,18 +338,33 @@ curl -X DELETE "http://localhost:8000/messages/{message_id}"
 | `EMBEDDING_API_KEY` | 远程 Embedding API 密钥 |
 | `MCP_SERVER_URL` | MCP 服务地址 |
 
-## 依赖
+## 环境依赖
 
-- Python 3.10+
-- LangChain / LangGraph
-- numpy（向量计算）
-- FastAPI / Uvicorn / SSE-Starlette（HTTP 服务）
-- aiosqlite（异步 SQLite）
-- rich（终端 UI）
-- prompt_toolkit（输入增强）
-- Pillow / pytesseract（OCR 兜底）
-- geopy（坐标处理）
-- psutil（系统信息）
+### Python 依赖
+
+| 依赖 | 用途 |
+|------|------|
+| Python 3.10+ | 运行环境 |
+| LangChain / LangGraph | Agent 引擎核心 |
+| FastAPI / Uvicorn / SSE-Starlette | HTTP 服务与 SSE 流式推送 |
+| aiosqlite / langgraph-checkpoint-sqlite | 异步持久化 |
+| aiohttp | 异步 HTTP 客户端 |
+| rich | 终端 UI（流式输出、进度条） |
+| prompt_toolkit | 交互式输入 |
+| numpy | 向量计算 |
+| pillow / piexif | 图像处理与 EXIF 解析 |
+| psutil | 系统监控 |
+| geopy | 坐标反查地址 |
+| pytesseract | OCR 兜底识别（可选） |
+
+### Android 端必装应用
+
+| 应用 | 说明 | 下载 |
+|------|------|------|
+| **Pocket-Agent Android** | Android 原生客户端（悬浮窗、语音输入、任务管理） | [GitHub Releases](https://github.com/Dreamt0511/Pocket-Agent-Android/releases) |
+| **Termux** | Android 终端模拟器，运行 Python 后端 | [F-Droid](https://f-droid.org/packages/com.termux/) |
+| **NeuralBridge** | MCP 服务，提供手机无障碍操控能力 | [GitHub](https://github.com/dondetir/NeuralBridge_mcp) |
+| **Termux:API** | Termux 插件，提供系统 API（通知、TTS 等） | [F-Droid](https://f-droid.org/packages/com.termux.api/) |
 
 ## 许可证
 
