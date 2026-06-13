@@ -14,6 +14,8 @@ ollama-backup/
 *.png
 *.jpg
 *.jpeg
+# 但允许文档截图
+!docs/screenshot-*
 
 # 模型目录
 暂时保留/
