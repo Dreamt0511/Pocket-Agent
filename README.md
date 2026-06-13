@@ -13,15 +13,15 @@
 
 ## 特性
 
-- **LangChain Agent**：使用官方 `create_agent` 创建，支持中间件链（MCP 结果处理、上下文压缩、模型调用限制等）
-- **子 Agent 系统**：主 Agent 可通过 `delegate_task` 委托子 Agent 执行独立任务，支持独立模型配置
-- **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆，基于 FTS5 + 向量搜索 + RRF 融合排序
-- **技能系统**：自动发现 SKILL.md，支持主 Agent 技能、执行器技能和自动沉淀技能
-- **MCP 集成**：通过 NeuralBridge MCP 协议控制安卓设备
-- **3D 身体控制**：通过 `control_body` / `move_body` / `body_script` / `body_idle` 工具控制 3D 虚拟身体，支持摆手、点头、跳舞等动作，配套网页端 3D 渲染（Three.js）
-- **浏览器交互**：Agent 可通过 SSE 与浏览器页面实时通信，Web 页面可发送消息给 Agent 并接收回复
-- **持久化对话**：LangGraph MemorySaver 异步 SQLite 存储，重启后恢复
-- **HTTP API**：基于 FastAPI 的 SSE 流式聊天接口，供 Android App 调用
+- **手机自动化控制**：通过 NeuralBridge 协议直接操控安卓设备——点击、滑动、输入、截图、获取 UI 树，可自动执行复杂的多步手机操作任务
+- **3D 虚拟身体控制**：Agent 可自主控制 3D 身体模型（挥手、跳舞、点头等），通过提示词实时编排动作，无需预设；配套 Three.js 网页端实时渲染
+- **浏览器双向交互**：Agent 通过 SSE 与浏览器页面实时通信，Web 页面可发送消息给 Agent 并接收回复，3D 模型页面也集成聊天入口
+- **子 Agent 系统**：主 Agent 可将复杂任务委托给子 Agent 后台异步执行，支持独立模型配置，不阻塞对话
+- **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆，基于 FTS5 + 向量搜索 + RRF 融合排序，跨会话持久化
+- **技能系统**：自动发现 SKILL.md 知识文档，Agent 按需阅读并按指南执行任务，支持主 Agent、子 Agent、自动沉淀三种技能类型
+- **LangChain Agent**：基于官方 `create_agent` 构建，支持中间件链（上下文压缩、模型调用限制等），支持 OpenAI / Ollama / 本地模型
+- **持久化对话**：LangGraph MemorySaver 异步 SQLite 存储，重启后恢复历史会话
+- **HTTP API**：基于 FastAPI 的 SSE 流式聊天接口，供 Android App 或其他客户端调用
 
 ## 快速开始
 
