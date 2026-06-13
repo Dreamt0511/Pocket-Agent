@@ -3,11 +3,12 @@
 轻量级移动端 AI Agent，支持在手机（Termux/Android）和服务器上运行。基于 LangChain + LangGraph 构建，支持工具调用、子 Agent 委托、技能系统、分层记忆、MCP 服务和语音播报。
 
 <p align="center">
-  <img src="docs/screenshot-terminal.jpg" width="45%" alt="Termux 终端 UI" />
-  <img src="docs/screenshot-3d-web.jpg" width="45%" alt="3D 网页交互界面" />
+  <img src="docs/screenshot-terminal.jpg" width="32%" alt="Termux 终端 UI" />
+  <img src="docs/screenshot-3d-web.jpg" width="32%" alt="3D 网页交互界面" />
+  <img src="docs/screenshot-3d-demo.gif" width="32%" alt="3D 身体控制演示" />
 </p>
 <p align="center">
-  <em>左：终端交互模式 UI &nbsp;&nbsp;|&nbsp;&nbsp; 右：3D 身体控制网页版交互</em>
+  <em>终端交互模式 &nbsp;|&nbsp; 3D 网页界面 &nbsp;|&nbsp; Agent 自主 3D 动作演示</em>
 </p>
 
 ## 特性
