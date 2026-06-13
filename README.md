@@ -88,11 +88,11 @@ cd ~/llama.cpp && ./build/bin/llama-server \
 ├── main.py                        # 终端交互式入口
 ├── agent/
 │   ├── agent_langchain.py         # LangChainPocketAgent 核心实现（create_agent + 中间件链）
-│   ├── config.py                  # 全局配置
-│   ├── embedding.py               # EmbeddingClient + VectorStore（SQLite + numpy）
-│   ├── memory.py                  # 用户画像管理（user_profile.md）
-│   ├── task_manager.py            # 任务文件系统管理（文件读写的辅助模块）
-│   ├── logger.py                  # 结构化日志
+│   ├── config.py                  # 全局配置（MAX_ITERATIONS、技能目录路径等）
+│   ├── embedding.py               # EmbeddingClient + VectorStore（SQLite + numpy 向量检索）
+│   ├── memory.py                  # 用户画像管理（memory/user_profile.md）
+│   ├── task_manager.py            # 任务文件系统管理（子 Agent 任务的读写辅助）
+│   ├── logger.py                  # 结构化日志（对话、工具调用、子 Agent 执行）
 │   ├── ui.py                      # 终端 UI（基于 rich 的流式输出、进度条、上下文用量条）
 │   ├── tools/
 │   │   ├── __init__.py
@@ -117,16 +117,18 @@ cd ~/llama.cpp && ./build/bin/llama-server \
 
 1. `main.py` 加载 `.env` → 创建 `LangChainPocketAgent`（内部初始化 LLM + `create_agent` + 中间件链 + MemorySaver）→ 启动对话循环
 2. 用户输入 → `agent.run_conversation()` → LangGraph astream 处理 → 工具调用 / 流式输出 → 返回结果
-3. 对话历史通过 LangGraph AsyncSqliteSaver 持久化
+3. 主 Agent 调用 `delegate_task` 后，任务进入待执行队列 → 主 Agent 流结束后，**子 Agent 前台同步接管**，执行完所有步骤后返回主 Agent
+4. 对话历史通过 LangGraph AsyncSqliteSaver 持久化
 
 ### 中间件链
 
-Agent 配置了 5 个中间件按顺序执行：
+Agent 配置了 6 个中间件按顺序执行：
 
 | 中间件 | 作用 |
 |--------|------|
 | **MCPToolResultMiddleware** | MCP 返回的图片 base64 转为文本描述，避免 token 爆炸 |
 | **ImageOptimizationMiddleware** | 移除历史消息中的图片 base64 数据 |
+| **ToolCallRepeatMiddleware** | 检测连续重复的工具调用，第二次重复时返回警告阻止执行 |
 | **ToolCallIdMiddleware** | 修复某些 LLM（如 GLM 系列）生成的 tool_call 缺少 id 字段 |
 | **SummarizationMiddleware** | token 超过 64K 时自动压缩历史，保留最近 20 条 |
 | **ModelCallLimitMiddleware** | 单次运行最多调用 MAX_ITERATIONS 次模型，达到后优雅结束 |
@@ -223,22 +225,6 @@ Web 页面支持双向通信：
 - **SSE 推送**：Agent 的身体控制指令实时推送到页面，3D 模型同步动作
 - **消息输入**：页面上的输入框可发送消息给 Agent，Agent 的回复也会实时显示在页面上
 - **响应流**：Agent 回复内容通过 SSE 实时推送到浏览器
-
-## Android 客户端
-
-Pocket-Agent 提供 Android 原生客户端，将 AI Agent 能力搬到手机系统层面。
-
-- **全局悬浮窗**：系统级悬浮球 + 终端卡片，退出 App 后仍可监控 Agent 执行，且不干扰 UI 自动化操作
-- **语音输入**：内置语音识别，说话即可操控 Agent
-- **任务管理**：后台服务保活，任务队列串行执行，支持排队和取消
-- **技能管理**：扫描、创建、编辑、删除 Agent 技能，支持导出和批量操作
-- **版本管理**：查看当前代码版本（commit SHA），支持版本历史查看和回退
-- **代码同步**：一键通知 Termux 执行 `git pull`，自动拉取最新 Agent 代码
-
-| 资源 | 链接 |
-|------|------|
-| 源码仓库 | [Dreamt0511/Pocket-Agent-Android](https://github.com/Dreamt0511/Pocket-Agent-Android) |
-| APK 下载 | [GitHub Releases](https://github.com/Dreamt0511/Pocket-Agent-Android/releases) |
 
 ## 技能系统
 
@@ -357,14 +343,22 @@ curl -X DELETE "http://localhost:8000/messages/{message_id}"
 | geopy | 坐标反查地址 |
 | pytesseract | OCR 兜底识别（可选） |
 
-### Android 端必装应用
+### 运行环境（必装）
 
 | 应用 | 说明 | 下载 |
 |------|------|------|
-| **Pocket-Agent Android** | Android 原生客户端（悬浮窗、语音输入、任务管理） | [GitHub Releases](https://github.com/Dreamt0511/Pocket-Agent-Android/releases) |
-| **Termux** | Android 终端模拟器，运行 Python 后端 | [F-Droid](https://f-droid.org/packages/com.termux/) |
-| **NeuralBridge** | MCP 服务，提供手机无障碍操控能力 | [GitHub](https://github.com/dondetir/NeuralBridge_mcp) |
-| **Termux:API** | Termux 插件，提供系统 API（通知、TTS 等） | [F-Droid](https://f-droid.org/packages/com.termux.api/) |
+| **Termux** | Android 终端模拟器，Pocket-Agent 运行在 Termux 环境中 | [F-Droid](https://f-droid.org/packages/com.termux/) |
+| **Termux:API** | Termux 插件，提供 Android 系统 API（通知、TTS、传感器、电池信息等） | [F-Droid](https://f-droid.org/packages/com.termux.api/) |
+| **NeuralBridge** | MCP 服务，提供手机无障碍操控能力（点击、滑动、截图、UI 树分析） | [GitHub](https://github.com/dondetir/NeuralBridge_mcp) |
+
+### Android 客户端（可选）
+
+提供原生 Android App，通过 HTTP API 连接 Termux 中的 Agent 后端。
+
+| 资源 | 链接 |
+|------|------|
+| 源码仓库 | [Dreamt0511/Pocket-Agent-Android](https://github.com/Dreamt0511/Pocket-Agent-Android) |
+| APK 下载 | [GitHub Releases](https://github.com/Dreamt0511/Pocket-Agent-Android/releases) |
 
 ## 许可证
 
