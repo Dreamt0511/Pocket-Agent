@@ -2,6 +2,14 @@
 
 轻量级移动端 AI Agent，支持在手机（Termux/Android）和服务器上运行。基于 LangChain + LangGraph 构建，支持工具调用、子 Agent 委托、技能系统、分层记忆、MCP 服务和语音播报。
 
+<p align="center">
+  <img src="docs/screenshot-terminal.jpg" width="45%" alt="Termux 终端 UI" />
+  <img src="docs/screenshot-3d-web.jpg" width="45%" alt="3D 网页交互界面" />
+</p>
+<p align="center">
+  <em>左：终端交互模式 UI &nbsp;&nbsp;|&nbsp;&nbsp; 右：3D 身体控制网页版交互</em>
+</p>
+
 ## 特性
 
 - **LangChain Agent**：使用官方 `create_agent` 创建，支持中间件链（MCP 结果处理、上下文压缩、模型调用限制等）
@@ -9,6 +17,8 @@
 - **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆，基于 FTS5 + 向量搜索 + RRF 融合排序
 - **技能系统**：自动发现 SKILL.md，支持主 Agent 技能、执行器技能和自动沉淀技能
 - **MCP 集成**：通过 NeuralBridge MCP 协议控制安卓设备
+- **3D 身体控制**：通过 `control_body` / `move_body` / `body_script` / `body_idle` 工具控制 3D 虚拟身体，支持摆手、点头、跳舞等动作，配套网页端 3D 渲染（Three.js）
+- **浏览器交互**：Agent 可通过 SSE 与浏览器页面实时通信，Web 页面可发送消息给 Agent 并接收回复
 - **持久化对话**：LangGraph MemorySaver 异步 SQLite 存储，重启后恢复
 - **HTTP API**：基于 FastAPI 的 SSE 流式聊天接口，供 Android App 调用
 
@@ -85,7 +95,10 @@ cd ~/llama.cpp && ./build/bin/llama-server \
 │   ├── ui.py                      # 终端 UI（基于 rich 的流式输出、进度条、上下文用量条）
 │   ├── tools/
 │   │   ├── __init__.py
-│   │   └── basic_tools.py         # 全部内置工具（文件操作、记忆、MCP、子 Agent、TTS 等）
+│   │   ├── basic_tools.py         # 全部内置工具（文件操作、记忆、MCP、子 Agent、TTS 等）
+│   │   ├── body_control_tool.py   # 3D 身体控制工具（control_body/move_body/body_script/body_idle）
+│   │   ├── body_server.py         # 身体控制 HTTP 服务器（端口 18081，SSE 推送命令到浏览器）
+│   │   └── body_viewer.html       # 3D 身体渲染前端（Three.js，浏览器打开即可交互）
 │   ├── prompts/
 │   │   ├── system_base.py         # 主 Agent 基础人设
 │   │   ├── agent_enhance.py       # 主 Agent 工具规则 + 技能系统说明
@@ -165,6 +178,10 @@ update_user_profile(section="偏好设置", content="喜欢简洁的回答风格
 | `mcp_call` | 调用 MCP 服务 |
 | `tts_speak` | 语音播报 |
 | `delegate_task` | 委托子 Agent 执行独立任务 |
+| `control_body` | 控制 3D 虚拟身体部位旋转（点头、举手、弯腰等） |
+| `move_body` | 移动 3D 虚拟身体整体位置（蹲下、跳跃、前进等） |
+| `body_script` | 执行动作脚本序列，适合跳舞等连续动作 |
+| `body_idle` | 恢复 3D 身体待机状态 |
 
 ## 子 Agent 系统
 
@@ -174,6 +191,37 @@ update_user_profile(section="偏好设置", content="喜欢简洁的回答风格
 - 子 Agent 拥有独立的系统提示词（`agent/prompts/executor_system.py` + `executor_enhance.py`）
 - 子 Agent 技能存放在 `agent/skills/executor-skills/`，主 Agent 技能存放在 `agent/skills/main-skills/`
 - 子 Agent 执行结果自动返回主 Agent，执行过程通过任务文件（`/tmp/agent_task_*.json`）管理
+
+## 3D 身体控制
+
+Pocket-Agent 内置了基于 Three.js 的 3D 虚拟身体控制系统，Agent 可以通过工具控制身体各部位旋转和位移，实现挥手、点头、跳舞、蹲下等动作。
+
+### 快速体验
+
+```bash
+# 启动 Agent（自动在 18081 端口启动身体控制服务器）
+python main.py
+
+# 在浏览器打开
+# http://<手机IP>:18081/  → 3D 身体渲染界面
+# 手机浏览器访问 localhost:18081 即可
+```
+
+### 控制方式
+
+| 工具 | 作用 |
+|------|------|
+| `control_body(part, x, y, z)` | 控制单个部位旋转（头部、手臂、腿、躯干等 12 个部位） |
+| `move_body(x, y, z)` | 移动身体整体位置（左右/上下/前后） |
+| `body_script(moves)` | 执行 JSON 动作脚本序列，适合跳舞等连续动作 |
+| `body_idle()` | 恢复待机状态 |
+
+### 浏览器交互
+
+Web 页面支持双向通信：
+- **SSE 推送**：Agent 的身体控制指令实时推送到页面，3D 模型同步动作
+- **消息输入**：页面上的输入框可发送消息给 Agent，Agent 的回复也会实时显示在页面上
+- **响应流**：Agent 回复内容通过 SSE 实时推送到浏览器
 
 ## 技能系统
 
