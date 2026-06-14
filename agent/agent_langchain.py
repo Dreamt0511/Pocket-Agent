@@ -14,6 +14,9 @@ import asyncio
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable, AsyncGenerator
 from langchain_core.tools import StructuredTool
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.text import Text
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -155,6 +158,22 @@ def load_skills_list(agent_type: str = "main") -> str:
     usage_note = f"\n\n使用说明：需要使用某个技能时，用file_read读取对应SKILL.md即可，例如：file_read(filepath='{first_path}')"
 
     return skills_text + usage_note
+
+
+def load_skills_for_completer(agent_type: str = "main") -> tuple:
+    """返回 (skill_names_list, skill_descriptions_dict, skill_info_dict) 供自动补全使用"""
+    skills_dir = SKILLS_DIR if agent_type == "main" else EXECUTOR_SKILLS_DIR
+    if not os.path.exists(skills_dir):
+        return [], {}, {}
+    skills = _scan_skills(skills_dir)
+    if agent_type == "executor":
+        auto_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+        if os.path.exists(auto_dir):
+            skills.extend(_scan_skills(auto_dir))
+    names = [s[1] for s in skills]
+    descs = {s[1]: s[2] for s in skills if s[2]}
+    info = {s[1]: {"category": s[0], "path": s[3], "desc": s[2]} for s in skills}
+    return names, descs, info
 
 
 # ── 工具初始化 ──────────────────────────────────────────────
@@ -664,20 +683,6 @@ class LangChainPocketAgent:
                 except json.JSONDecodeError:
                     pass
 
-            # 步数
-            step_out = self._run_sensor('termux-sensor -s "step_counter  Non-wakeup" -n 1')
-            if step_out:
-                try:
-                    step_data = json.loads(step_out)
-                    for v in step_data.values():
-                        if isinstance(v, dict) and "values" in v and v["values"]:
-                            steps = int(v["values"][0])
-                            if steps > 0:
-                                descs.append(f"今日走路{steps}步")
-                            break
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
             # 位置
             loc_out = self._run_sensor('termux-location -p network', timeout=3)
             if loc_out:
@@ -789,6 +794,89 @@ class LangChainPocketAgent:
             middleware=middleware,
         )
 
+    def _format_tool_args(self, tool_name: str, args: dict) -> str:
+        """格式化工具参数为详细显示文本，截断50字符"""
+        if not args:
+            return ""
+
+        # 特殊处理某些工具，显示更有意义的参数
+        if tool_name == "file_read" and "filepath" in args:
+            filepath = args["filepath"]
+            # 显示父目录/文件名，区分不同目录下的同名文件
+            parent = os.path.basename(os.path.dirname(filepath))
+            filename = os.path.basename(filepath)
+            display = f"{parent}/{filename}" if parent and parent != "." else filename
+            return display[:50]
+        elif tool_name == "file_write" and "filepath" in args:
+            filepath = args["filepath"]
+            parent = os.path.basename(os.path.dirname(filepath))
+            filename = os.path.basename(filepath)
+            display = f"{parent}/{filename}" if parent and parent != "." else filename
+            content_preview = args.get("content", "")[:20]
+            result = f"{display}, content={content_preview}..."
+            return result[:50] + "..." if len(result) > 50 else result
+        elif tool_name == "file_search" and "pattern" in args:
+            pattern = args["pattern"]
+            directory = args.get("directory", "")
+            if directory:
+                return f"pattern={pattern}, dir={os.path.basename(directory)}"
+            return f"pattern={pattern}"
+        elif tool_name == "shell_exec" and "command" in args:
+            command = args["command"]
+            return command[:50] + "..." if len(command) > 50 else command
+        elif tool_name == "mcp_call" and "tool_name" in args:
+            mcp_tool = args["tool_name"]
+            mcp_args = args.get("arguments", {})
+            if mcp_args:
+                args_preview = str(mcp_args)[:30]
+                return f"{mcp_tool}, args={args_preview}..."
+            return mcp_tool
+        elif tool_name == "search_memory" and "query" in args:
+            query = args["query"]
+            return f"query={query}" if len(query) <= 45 else f"query={query[:45]}..."
+        elif tool_name == "body_script" and "script" in args:
+            script = args["script"]
+            return script[:50] + "..." if len(script) > 50 else script
+        elif tool_name == "delegate_task" and "objective" in args:
+            objective = args["objective"]
+            return objective[:50] + "..." if len(objective) > 50 else objective
+        elif tool_name == "tts_speak" and "text" in args:
+            text = args["text"]
+            return text[:50] + "..." if len(text) > 50 else text
+        else:
+            # 通用处理：显示所有参数（屏蔽内部字段）
+            params = []
+            for k, v in args.items():
+                if k.startswith('_'):
+                    continue
+                v_str = str(v)
+                if len(v_str) > 20:
+                    v_str = v_str[:20] + "..."
+                params.append(f"{k}={v_str}")
+            result = ", ".join(params)
+            return result[:50] + "..." if len(result) > 50 else result
+
+    def _get_last_tool_args(self, tool_name: str, tool_call_id: str = None) -> dict:
+        """获取最近一次指定工具调用的参数"""
+        cache = getattr(self, '_last_tool_args_cache', {})
+        # 优先通过 tool_call_id 查找
+        if tool_call_id and tool_call_id in cache:
+            return cache[tool_call_id]
+        # 回退：查找最近的同名工具调用
+        for key in reversed(list(cache.keys())):
+            if cache[key].get('_tool_name') == tool_name:
+                return cache[key]
+        return {}
+
+    def _cache_tool_args(self, tool_name: str, args: dict, tool_call_id: str = None):
+        """缓存工具调用参数，供tool_end事件使用"""
+        if not hasattr(self, '_last_tool_args_cache'):
+            self._last_tool_args_cache = {}
+        # 使用 tool_call_id 作为键，避免同名工具覆盖
+        key = tool_call_id or tool_name
+        args_with_name = {**args, '_tool_name': tool_name}
+        self._last_tool_args_cache[key] = args_with_name
+
     async def get_context_usage(self) -> dict:
         """获取当前完整上下文的token用量
         直接构建实际发送给AI的完整messages数组+工具定义，一次性估算。
@@ -880,6 +968,9 @@ class LangChainPocketAgent:
             else:
                 combined_message = user_message
 
+            # Markdown流式Live显示
+            stream_live = None
+
             # 使用多种stream模式同时获取消息流和执行更新
             async for chunk in self.agent.astream(
                 {"messages": [HumanMessage(content=combined_message)]},
@@ -887,6 +978,10 @@ class LangChainPocketAgent:
                 stream_mode=["messages", "updates"],
                 version="v2"
             ):
+                # 检查取消请求
+                if self._check_cancel():
+                    break
+
                 # 刷新进度时间（每次收到chunk都更新，让时间走动）
                 if progress_display:
                     progress_display.update()
@@ -911,23 +1006,30 @@ class LangChainPocketAgent:
                             if content[:30] in recent_window:
                                 continue
 
-                        # 如果是首次收到内容，先关闭进度显示
+                        # 如果是首次收到内容，先关闭进度显示并启动Markdown Live显示
                         if progress_display:
                             progress_display.__exit__(None, None, None)
                             progress_display = None
+                        if stream_live is None and self.ui:
+                            from rich.live import Live
+                            from rich.markdown import Markdown
+                            stream_live = Live(Markdown(""), console=self.ui.console, refresh_per_second=10)
+                            stream_live.__enter__()
 
-                        # 实时输出到UI
-                        if self.ui and hasattr(self.ui, 'print_stream_chunk'):
-                            self.ui.print_stream_chunk(content)
                         # 收集完整响应（增量chunk，直接追加）
                         full_response += content
+
+                        # 更新Live显示为Markdown渲染（全量重新渲染）
+                        if stream_live:
+                            # 仅在内容完整段落时渲染，避免渲染中的行
+                            stream_live.update(Markdown(full_response))
 
                         # 如果有 on_token 回调，实时推送 token 给调用方
                         if on_token is not None:
                             await on_token(content)
 
-                # 处理更新事件（用于进度显示）
-                elif chunk["type"] == "updates" and progress_display:
+                # 处理更新事件（工具调用和进度）
+                elif chunk["type"] == "updates":
                     for source, update in chunk["data"].items():
                         if source == "model":
                             # 模型正在思考或生成工具调用
@@ -952,28 +1054,28 @@ class LangChainPocketAgent:
                                             "args": tool_args
                                         })
 
-                                    # 特殊处理shell_exec，显示命令内容
-                                    if tool_name == "shell_exec" and "command" in tool_args:
-                                        command = tool_args["command"]
-                                        # 截断过长的命令
-                                        display_cmd = command[:50] + "..." if len(command) > 50 else command
-                                        if self.ui and hasattr(self.ui, 'print_info'):
-                                            self.ui.print_info(f"执行命令: {command}")
-                                        progress_display.update(f"执行: {display_cmd}")
-                                    else:
-                                        # 其他工具显示名称和参数
-                                        args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
-                                        args_text = args_text[:30] + "..." if len(args_text) > 30 else args_text
-                                        progress_display.update(f"调用: {tool_name}({args_text})")
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                    # 构建详细参数显示（截断50字符）
+                                    args_detail = self._format_tool_args(tool_name, tool_args)
+
+                                    # 如果已经进入流式文本模式，直接打印到控制台
+                                    if stream_live:
+                                        if self.ui:
+                                            self.ui.console.print(f"[cyan]🔧 调用: {tool_name}({args_detail})[/cyan]")
+                                    elif progress_display:
+                                        progress_display.update(f"调用: {tool_name}({args_detail})")
                             else:
-                                progress_display.update("思考中")
+                                if progress_display:
+                                    progress_display.update("思考中")
                                 if on_tool_event is not None:
                                     await on_tool_event({"type": "thinking"})
                         elif source == "tools":
                             # 工具执行完成
                             message = update["messages"][-1]
                             tool_name_2 = message.name if hasattr(message, 'name') else "工具"
-                            progress_display.update(f"处理 {tool_name_2} 结果")
+
                             if on_tool_event is not None:
                                 await on_tool_event({
                                     "type": "tool_end",
@@ -983,6 +1085,11 @@ class LangChainPocketAgent:
             # 关闭进度显示
             if progress_display:
                 progress_display.__exit__(None, None, None)
+
+            # 关闭Markdown Live显示
+            if stream_live:
+                stream_live.__exit__(None, None, None)
+                stream_live = None
 
             # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
             pending_tasks = consume_pending_tasks()
@@ -995,7 +1102,8 @@ class LangChainPocketAgent:
                         self.ui.console.print(
                             f"\n[bold yellow]▶ 子Agent执行: {description}[/bold yellow]"
                         )
-                    await self._run_executor_foreground(task_path, task_id)
+                    async for _event in self._run_executor_foreground(task_path, task_id):
+                        pass
 
             # ── 清理主Agent状态中的 delegate_task 相关消息 ──
             # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
@@ -1072,28 +1180,43 @@ class LangChainPocketAgent:
             return (full_response.strip(), True, tool_call_count)
 
         except asyncio.CancelledError:
-            # 任务被取消，确保进度显示被关闭
+            # 任务被取消，确保进度显示和Live被关闭
             if 'progress_display' in locals() and progress_display:
                 try:
                     progress_display.__exit__(None, None, None)
+                except:
+                    pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
                 except:
                     pass
             # 重新抛出取消异常，让上层处理
             raise
         except KeyboardInterrupt:
-            # 键盘中断，确保进度显示被关闭
+            # 键盘中断，确保进度显示和Live被关闭
             if 'progress_display' in locals() and progress_display:
                 try:
                     progress_display.__exit__(None, None, None)
                 except:
                     pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
+                except:
+                    pass
             # 重新抛出，让上层处理中断
             raise
         except Exception as e:
-            # 确保进度显示被关闭
+            # 确保进度显示和Live被关闭
             if 'progress_display' in locals() and progress_display:
                 try:
                     progress_display.__exit__(type(e), e, None)
+                except:
+                    pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
                 except:
                     pass
 
@@ -1234,12 +1357,16 @@ class LangChainPocketAgent:
                                         conv_task_id, tool_call_count,
                                         tool_name, tool_args, "[执行中]"
                                     )
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
 
-                                    # yield 工具调用开始事件
+                                    # yield 工具调用开始事件（带详细参数）
                                     yield {
                                         "type": "tool_start",
                                         "name": tool_name,
-                                        "args": tool_args
+                                        "args": tool_args,
+                                        "args_display": self._format_tool_args(tool_name, tool_args)
                                     }
                             else:
                                 # 模型思考中
@@ -1248,9 +1375,14 @@ class LangChainPocketAgent:
                             # 工具执行完成
                             message = update["messages"][-1]
                             tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            # 尝试通过 tool_call_id 获取缓存的参数
+                            tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                            tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                            args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
                             yield {
                                 "type": "tool_end",
-                                "name": tool_name_2
+                                "name": tool_name_2,
+                                "args_display": args_display_2
                             }
 
             # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
@@ -1572,8 +1704,12 @@ class LangChainPocketAgent:
                                     tool_args = tc["args"]
                                     # 记录日志
                                     self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
-                                    # yield 工具调用开始
-                                    yield {"type": "tool_start", "name": tool_name, "args": tool_args}
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                    # yield 工具调用开始（带详细参数）
+                                    args_display = self._format_tool_args(tool_name, tool_args)
+                                    yield {"type": "tool_start", "name": tool_name, "args": tool_args, "args_display": args_display}
                                     # 检测人工介入请求（tts_speak 工具 或 shell_exec 调用 termux-tts-speak）
                                     if tool_name == "tts_speak" and "text" in tool_args:
                                         had_intervention = True
@@ -1593,22 +1729,26 @@ class LangChainPocketAgent:
                                         else:
                                             display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
                                             if self.ui:
-                                                self.ui.console.print(f"\n  [dim]⚡ {display_cmd}[/dim]")
+                                                self.ui.console.print(f"[cyan]⚡ {display_cmd}[/cyan]")
                                     elif tool_name == "mcp_call" and "tool_name" in tool_args:
                                         mcp_tool = tool_args["tool_name"]
                                         if self.ui:
-                                            self.ui.console.print(f"\n  [dim]📱 MCP: {mcp_tool}[/dim]")
+                                            self.ui.console.print(f"[cyan]📱 MCP: {mcp_tool}[/cyan]")
                                     else:
-                                        args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
-                                        args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
+                                        # 使用统一的格式化方法显示详细参数
+                                        args_text = self._format_tool_args(tool_name, tool_args)
                                         if self.ui:
-                                            self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+                                            self.ui.console.print(f"[cyan]🔧 {tool_name}({args_text})[/cyan]")
                             else:
                                 yield {"type": "thinking"}
                         elif source == "tools":
                             message = update["messages"][-1]
                             tool_name_2 = message.name if hasattr(message, 'name') else "工具"
-                            yield {"type": "tool_end", "name": tool_name_2}
+                            # 尝试通过 tool_call_id 获取缓存的参数
+                            tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                            tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                            args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
+                            yield {"type": "tool_end", "name": tool_name_2, "args_display": args_display_2}
 
             # ── 重试机制：如果子Agent没有执行有效操作（仅读了task.json就停了），强制重试 ──
             # 注意：重试必须使用全新Agent实例 + 内联任务内容，不能复用原对话线程，
@@ -1682,17 +1822,26 @@ class LangChainPocketAgent:
                                         tool_name = tc["name"]
                                         tool_args = tc["args"]
                                         self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
-                                        yield {"type": "tool_start", "name": tool_name, "args": tool_args}
+                                        # 缓存工具参数，供tool_end事件使用
+                                        tool_call_id = tc.get("id", "")
+                                        self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                        # yield 工具调用开始（带详细参数）
+                                        args_display = self._format_tool_args(tool_name, tool_args)
+                                        yield {"type": "tool_start", "name": tool_name, "args": tool_args, "args_display": args_display}
                                         if self.ui:
-                                            args_text = ", ".join([f"{k}={v}" for k, v in tool_args.items()])
-                                            args_text = args_text[:40] + "..." if len(args_text) > 40 else args_text
-                                            self.ui.console.print(f"\n  [dim]🔧 {tool_name}({args_text})[/dim]")
+                                            # 使用统一的格式化方法显示详细参数
+                                            args_text = self._format_tool_args(tool_name, tool_args)
+                                            self.ui.console.print(f"[cyan]🔧 {tool_name}({args_text})[/cyan]")
                                 else:
                                     yield {"type": "thinking"}
                             elif source == "tools":
                                 message = update["messages"][-1]
                                 tool_name_2 = message.name if hasattr(message, 'name') else "工具"
-                                yield {"type": "tool_end", "name": tool_name_2}
+                                # 尝试通过 tool_call_id 获取缓存的参数
+                                tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                                tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                                args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
+                                yield {"type": "tool_end", "name": tool_name_2, "args_display": args_display_2}
                     if self._check_cancel():
                         break
 
@@ -1843,7 +1992,7 @@ class LangChainPocketAgent:
                                             _tname = _msg.name if hasattr(_msg, 'name') else "工具"
                                             yield {"type": "tool_end", "name": _tname}
                             if self.ui:
-                                self.ui.console.print(f"\n  [dim]🔧 技能格式已修正: {skill_name}[/dim]")
+                                self.ui.console.print(f"[cyan]🔧 技能格式已修正: {skill_name}[/cyan]")
                         else:
                             if self.ui:
                                 self.ui.console.print(f"\n  [dim]📝 子Agent已沉淀技能: {skill_name}[/dim]")

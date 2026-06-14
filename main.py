@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 import warnings
+import termios
 from datetime import datetime
 # 当前 langgraph 版本不支持 allowed_objects 参数，过滤未来警告
 warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
@@ -214,6 +215,20 @@ def _save_message(conversation_id: str, role: str, content: str):
             "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
             (conversation_id, role, content, now)
         )
+        # 如果是第一条用户消息，更新会话标题
+        if role == "user":
+            msg_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND role = 'user'",
+                (conversation_id,)
+            ).fetchone()[0]
+            if msg_count == 1:
+                # 用第一条用户消息的前20个字符作为标题
+                title = content[:20].replace('\n', ' ').strip()
+                if title:
+                    conn.execute(
+                        "UPDATE conversations SET title = ? WHERE id = ?",
+                        (title, conversation_id)
+                    )
         conn.commit()
     finally:
         conn.close()
@@ -422,8 +437,17 @@ async def main():
         thread_id=conversation_id,  # 使用与 conversation_id 相同的 UUID
     )
 
+    # 更新 UI 自动补全的技能列表
+    try:
+        from agent.agent_langchain import load_skills_for_completer
+        skill_names, skill_descs, skill_info = load_skills_for_completer("main")
+        ui.update_skill_completions(skill_names, skill_descs)
+    except Exception:
+        skill_info = {}
+
+    loop = asyncio.get_event_loop()
+
     # 互动式对话循环
-    tool_call_count = 0
     current_task = None  # 记录当前正在执行的任务
     is_processing = False  # 标记是否正在处理用户请求
 
@@ -467,7 +491,7 @@ async def main():
             except Exception as e:
                 push_response_event('error', {'message': str(e)})
 
-    asyncio.create_task(browser_message_loop())
+    browser_task = asyncio.create_task(browser_message_loop())
 
     while True:
         try:
@@ -482,23 +506,30 @@ async def main():
                 # 其他输入异常，继续下一轮
                 continue
 
-            if user_input.lower() in ['q', 'quit', 'exit', 'bye', '退出']:
+            # 确保 user_input 是字符串
+            if user_input is None:
+                user_input = ""
+
+            # 检查退出命令 - 处理可能的空白字符
+            user_input_stripped = user_input.strip().lower()
+            if user_input_stripped in ['q', 'quit', 'exit', 'bye', '退出']:
                 ui.print_success("再见！")
                 break
 
-            if user_input.lower() == 'help':
+            if user_input_stripped == 'help':
                 help_text = """**常用指令**:
 - 直接输入问题 → AI agent 自动调用工具回答
 - 询问技能 → 直接说"有哪些技能"或"加载XX技能"
 - `/resume` → 选择并恢复历史会话
-- `/undo` 或 `/撤回` → 撤回上一条发送的消息
+- `/undo` → 撤回上一条发送的消息
 - `q` → 退出程序
-- Ctrl+C / 直接输入新内容 → 正在思考时打断，输入新问题"""
+- **ESC** → agent 执行时按一次打断，输入阶段按清空当前输入
+- Ctrl+C → 强制退出程序"""
                 ui.print_agent_response(help_text)
                 continue
 
             # 恢复历史会话
-            if user_input.lower() == '/resume':
+            if user_input_stripped == '/resume':
                 conversations = _list_conversations()
                 new_id = await _resume_conversation(ui, agent, conversations)
                 if new_id:
@@ -506,7 +537,7 @@ async def main():
                 continue
 
             # 撤回消息功能
-            if user_input.lower() in ['/undo', '/撤回']:
+            if user_input_stripped == '/undo':
                 # LangChain版本：创建新会话，清空历史
                 agent.clear_history()
                 # 生成新的会话 ID，确保与 agent 的 thread_id 一致
@@ -516,68 +547,112 @@ async def main():
                 continue
 
             # 清空对话历史
-            if user_input.lower() == '/clear':
+            if user_input_stripped == '/clear':
                 agent.clear_history()
                 # 生成新的会话 ID，确保与 agent 的 thread_id 一致
                 conversation_id = agent._default_thread_id
                 set_current_conversation_id(conversation_id)
-                ui.print_success("✅ 已清空对话历史，你可以重新输入")
+                # 清屏并重新显示欢迎界面
+                ui.show_welcome_screen(model_name + " (LangChain)", body_url)
                 continue
 
-            if not user_input.strip():
+            if not user_input_stripped:
                 continue
+
+            # ── 拦截 /技能名 [+ 用户需求] 输入，转换为读取技能指令 ──
+            if user_input.startswith('/') and user_input_stripped not in ['/resume', '/undo', '/clear', '/help']:
+                parts = user_input.lstrip('/').strip().split(' ', 1)
+                skill_name = parts[0].strip()
+                user_request = parts[1].strip() if len(parts) > 1 else ""
+                if skill_name in skill_info:
+                    skill_path = skill_info[skill_name]['path']
+                    if user_request:
+                        user_input = f"请读取 {skill_name} 技能（{skill_path}），然后按指导执行：{user_request}"
+                    else:
+                        user_input = f"请读取 {skill_name} 技能（{skill_path}）并按指导执行"
+                    user_input_stripped = user_input.strip().lower()
 
             # ── 消息持久化（与 app.py 一致）──
             _ensure_conversation(conversation_id)
             _save_message(conversation_id, "user", user_input)
 
             # ── 真正的 agent loop ──
-            # ui.print_info("Agent 思考中...")  # 减少冗余提示
 
             try:
-                # 标记开始处理
                 is_processing = True
-                # 创建任务以便可以取消
                 current_task = asyncio.create_task(agent.run_conversation(user_input))
-                response, used_streaming, call_count = await current_task
+
+                # ── ESC 中断监听 ──
+                _esc_ref = [current_task]
+                fd = sys.stdin.fileno()
+                stdin_is_tty = sys.stdin.isatty()
+                _raw_settings = None
+                if stdin_is_tty:
+                    # 不要用 tty.setraw()——它会禁用 OPOST（输出处理），导致终端输出乱掉
+                    _raw_settings = termios.tcgetattr(fd)
+                    new_attr = list(_raw_settings)
+                    # 只改输入属性：关闭 ICANON（行缓冲）、ECHO、ISIG（信号字符）
+                    # 保留输出属性（OPOST），确保 Live/console.print 正常渲染
+                    new_attr[0] = new_attr[0] & ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
+                    new_attr[3] = new_attr[3] & ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+                    new_attr[6][termios.VMIN] = 1
+                    new_attr[6][termios.VTIME] = 0
+                    termios.tcsetattr(fd, termios.TCSADRAIN, new_attr)
+
+                def _on_stdin():
+                    t = _esc_ref[0]
+                    if t is None or t.done():
+                        return
+                    try:
+                        data = sys.stdin.buffer.read1(1024)
+                        if data and b'\x1b' in data:
+                            t.cancel()
+                    except Exception:
+                        pass
+                loop.add_reader(fd, _on_stdin)
+
+                try:
+                    response, used_streaming, call_count = await current_task
+                finally:
+                    try:
+                        loop.remove_reader(fd)
+                    except Exception:
+                        pass
+                    if _raw_settings is not None:
+                        try:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, _raw_settings)
+                        except Exception:
+                            pass
+                        try:
+                            termios.tcflush(fd, termios.TCIFLUSH)
+                        except Exception:
+                            pass
+
             except (asyncio.CancelledError, KeyboardInterrupt):
-                # 一次Ctrl+C会同时触发CancelledError和KeyboardInterrupt，
-                # 同时捕获避免后者传播到外层误触"再见！"退出
                 ui.console.print()
                 ui.print_warning("⏹️  已打断当前思考，你可以输入新的问题或指令")
-                _save_message(conversation_id, "assistant", "[已打断]")
+                try:
+                    _save_message(conversation_id, "assistant", "[已打断]")
+                except Exception:
+                    pass
                 response = None
                 used_streaming = False
             except Exception as e:
                 response = f"❌ Agent 执行错误: {str(e)}"
                 used_streaming = False
             finally:
-                # 标记处理结束
                 is_processing = False
                 current_task = None
-
-            # 显示AI回复（如果没有被打断）
-            if response is not None:
-                # 如果使用了流式输出，内容已实时显示，不需要再用Panel显示
-                if not used_streaming:
-                    ui.print_agent_response(response)
-
-                # 保存 AI 回复到 SQLite（与 app.py 一致）
-                _save_message(conversation_id, "assistant", response)
-
-                tool_call_count += call_count
-                if tool_call_count % 10 == 0 and call_count > 0:
-                    ui.print_conversation_stats(tool_call_count, len(agent.tools))
 
         except KeyboardInterrupt:
             ui.print_success("\n\n再见！")
             break
         except Exception as e:
-            if not isinstance(e, KeyboardInterrupt) and "CancelledError" not in str(type(e)):
-                ui.print_error(f"发现错误: {e}")
+            ui.print_error(f"发现错误: {e}")
             break
 
-    # ── 退出清理（body server 端口释放）──
+    # ── 退出清理（取消后台任务、释放端口）──
+    browser_task.cancel()
     try:
         from agent.tools.body_control_tool import stop_body_server
         stop_body_server()
@@ -590,7 +665,7 @@ if __name__ == "__main__":
     project_root = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, project_root)
 
-    # 强制兼容所有事件循环场景，彻底避免冲突
+    # 强制兼容所有事件循环场景
     try:
         import nest_asyncio
         nest_asyncio.apply()
@@ -598,34 +673,16 @@ if __name__ == "__main__":
         print("⚠️  请先安装依赖：pip install nest_asyncio prompt_toolkit")
         sys.exit(1)
 
-    # 全局异常处理，捕获所有可能的退出异常，确保绝对不会输出错误栈
-    exit_cleanly = False
+    # 全局异常处理，确保干净退出
     try:
-        # 统一使用get_event_loop，不使用asyncio.run
         loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
-        exit_cleanly = True
+        # nest_asyncio 不会停止事件循环，强制退出
+        os._exit(0)
     except (KeyboardInterrupt, SystemExit):
-        # 直接的键盘中断或系统退出（输入阶段）
-        print("\n再见！")
-        exit_cleanly = True
+        os._exit(0)
     except Exception as e:
-        # 检查是否是键盘中断相关的异常（包括嵌套的）
         exc_str = str(type(e)) + str(e)
-        if "KeyboardInterrupt" in exc_str or "CancelledError" in exc_str:
-            # 处理过程中的中断已经在内层输出了打断提示，不需要再输出再见
-            exit_cleanly = True
-        else:
-            # 只输出真正的异常，不输出完整栈追踪
+        if "KeyboardInterrupt" not in exc_str and "CancelledError" not in exc_str:
             print(f"\n❌ 程序异常退出: {str(e)}")
-    finally:
-        # 确保事件循环正常关闭，忽略所有关闭过程中的异常
-        try:
-            loop = asyncio.get_event_loop()
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
-        except:
-            pass
+        os._exit(1)

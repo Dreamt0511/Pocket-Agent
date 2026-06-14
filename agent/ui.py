@@ -5,8 +5,12 @@ Rich UI 组件 - 美化终端界面
 """
 
 import sys
+import os
+import time
+import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -14,18 +18,63 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.live import Live
 from rich.markdown import Markdown
-from rich.spinner import Spinner
-import time
-import asyncio
-from datetime import datetime
-
-
 from rich.rule import Rule
-from rich.text import Text
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
-import os
-import asyncio
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.styles import Style
+from prompt_toolkit.key_binding import KeyBindings
+
+
+class SlashCompleter(Completer):
+    """自动补全：/命令 和 技能名"""
+
+    def __init__(self):
+        self.slash_commands = {
+            "/resume": "恢复历史会话",
+            "/undo": "撤回上一条消息",
+            "/clear": "清空对话历史并清屏",
+        }
+        self.skills: List[str] = []
+        self.skill_descs: dict = {}
+
+    def update_skills(self, skills: List[str], descriptions: dict = None):
+        """更新技能列表"""
+        self.skills = skills
+        self.skill_descs = descriptions or {}
+
+    def _get_slash_completions(self, word: str) -> list:
+        """返回匹配的 / 命令补全"""
+        word_lower = word.lower()
+        matches = []
+        for cmd, desc in self.slash_commands.items():
+            if cmd.startswith(word_lower):
+                display_meta = f" 📋 {desc}" if desc else ""
+                matches.append(Completion(cmd, -len(word), display_meta=display_meta))
+        return matches
+
+    def _get_skill_completions(self, word: str) -> list:
+        """返回匹配的技能补全"""
+        word_lower = word.lower()
+        matches = []
+        stripped = word_lower[1:] if word_lower.startswith('/') else word_lower
+        for skill in self.skills:
+            skill_lower = skill.lower()
+            if skill_lower.startswith(stripped) or stripped in skill_lower:
+                desc = self.skill_descs.get(skill, "")
+                display_meta = f" 📖 {desc[:40]}" if desc else ""
+                matches.append(Completion(f"/{skill}", -len(word), display_meta=display_meta))
+        return matches
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith('/'):
+            return
+        yield from self._get_slash_completions(text)
+        if not any(text == cmd for cmd in self.slash_commands):
+            yield from self._get_skill_completions(text)
+
 
 class PocketUI:
     """
@@ -36,7 +85,27 @@ class PocketUI:
         self.console = Console()
         # 初始化输入会话，带历史记录
         history_path = os.path.expanduser("~/.pocket_agent_history")
-        self.prompt_session = PromptSession(history=FileHistory(history_path))
+        self._completer = SlashCompleter()
+        self._kb = KeyBindings()
+        @self._kb.add('escape')
+        def _(event):
+            event.app.exit(exception=KeyboardInterrupt())
+        self._style = Style([
+            ('completion-menu', 'bg: #000000 fg: #cccccc'),
+            ('completion-menu.completion', 'bg: #000000 fg: #cccccc'),
+            ('completion-menu.completion.current', 'bg: #333333 fg: #ffffff'),
+        ])
+        self.prompt_session = PromptSession(
+            history=FileHistory(history_path),
+            completer=self._completer,
+            complete_while_typing=True,
+            style=self._style,
+            key_bindings=self._kb,
+        )
+
+    def update_skill_completions(self, skills: List[str], descriptions: dict = None):
+        """更新技能补全列表"""
+        self._completer.update_skills(skills, descriptions)
 
     def print_banner(self, model_name: str = "", body_url: str = ""):
         """打印首页横幅"""
@@ -58,6 +127,8 @@ class PocketUI:
             border_style="blue",
             padding=(1, 2)
         ))
+        # 底部指令提示（仅一开头打印一次）
+        self.console.print("[#666666]/resume 恢复会话 | /undo 撤回 | /clear 清屏 | q 退出 | ESC打断 | Tab补全[/#666666]")
 
     def print_tool_call(self, tool_name: str, params: dict):
         """打印工具调用"""
@@ -89,11 +160,12 @@ class PocketUI:
         )
 
     def print_agent_response(self, response: str):
-        """打印AI回复 - 纯文本，不渲染Markdown"""
+        """打印AI回复 - 渲染Markdown格式"""
         # 移除首尾空白，保留结构
         response = response.strip()
-        # 纯文本直接输出，不处理Markdown
-        self.console.print(f"[cyan]{response}[/cyan]\n")
+        # 使用Rich的Markdown渲染
+        self.console.print(Markdown(response))
+        self.console.print()
 
     def print_user_input_prompt(self):
         """同步版本用户输入提示 - 捕获所有异常避免报错栈"""
@@ -138,7 +210,8 @@ class PocketUI:
             # 使用prompt_toolkit的异步输入，支持退格/方向键/历史
             # 注意：不使用patch_stdout避免CPU高占用
             user_input = await self.prompt_session.prompt_async("🪀 你: ")
-            return user_input
+            # 确保返回值被正确清理
+            return user_input.strip() if user_input else ""
         except (EOFError, KeyboardInterrupt):
             self.console.print()
             return "exit"

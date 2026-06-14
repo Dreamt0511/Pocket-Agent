@@ -245,7 +245,7 @@ def system_info(info_type: str = "all") -> str:
             result.append(_run_termux_cmd("df -h /data"))
             result.append("")
 
-        if info_type in ["all", "network"]:
+        if info_type in ["all", "network", "wifi"]:
             result.append("📶 WiFi信息:")
             result.append(_run_termux_cmd("termux-wifi-connectioninfo"))
             result.append("")
@@ -253,11 +253,6 @@ def system_info(info_type: str = "all") -> str:
         if info_type in ["all", "device"]:
             result.append("🔧 设备信息:")
             result.append(_run_termux_cmd("termux-telephony-deviceinfo"))
-            result.append("")
-
-        if info_type in ["all", "wifi"]:
-            result.append("📶 WiFi信息:")
-            result.append(_run_termux_cmd("termux-wifi-connectioninfo"))
             result.append("")
 
         if not result:

@@ -12,14 +12,14 @@ import threading
 # 部位名称 → 骨骼名称映射
 BONE_MAP = {
     "head": "head",
-    "right_arm": "right_hand",
-    "left_arm": "left_hand",
-    "right_forearm": "da_shou",
-    "right_elbow": "da_shou",
-    "left_forearm": "da_shou2",
-    "left_elbow": "da_shou2",
-    "right_ear": "you_ear",
-    "left_ear": "zuo_ear2",
+    "right_arm": "left_hand",
+    "left_arm": "right_hand",
+    "right_forearm": "da_shou2",
+    "right_elbow": "da_shou2",
+    "left_forearm": "da_shou",
+    "left_elbow": "da_shou",
+    "right_ear": "zuo_ear2",
+    "left_ear": "you_ear",
     "right_leg": "right_leg",
     "left_leg": "left_leg",
     "right_calf": "da_tui",
@@ -27,6 +27,10 @@ BONE_MAP = {
     "body": "body",
     "root": "root",
 }
+
+# 需要取反的部位（模型侧骨骼方向与API约定相反）
+Z_NEGATE_PARTS = {"left_leg", "right_arm", "left_arm", "right_forearm", "right_elbow", "left_forearm", "left_elbow"}
+Y_NEGATE_PARTS = {"right_arm", "left_arm"}
 
 # 服务器地址（可通过环境变量配置）
 BODY_SERVER_URL = os.getenv("BODY_SERVER_URL", "http://localhost:18081")
@@ -92,17 +96,23 @@ def control_body(part: str, x: float = 0, y: float = 0, z: float = 0) -> str:
     重要规则：
     - 开始新动作前，必须先调用 body_idle() 归位
     - 完成动作后，根据场景自行判断是否需要归位（如打招呼后可保持，跳舞后应归位）
+    - 做挥手、出拳、跳舞等动作时，不要忽略手肘（forearm/elbow）的弯曲配合，只动手臂不动手肘会很僵硬
+    - 做走路、跑步、踢腿等动作时，不要忽略小腿（calf）的弯曲配合，只动大腿不动小腿会不自然
+    - 做表情、卖萌、惊讶等动作时，配合头部（head）和耳朵（ear）的抖动会更生动
+    - 多部位协调才能做出自然流畅的动作，尽量组合使用
+    - 做动作时积极配合躯干（body）和全身（root）的动作，比如挥手时身体微倾、转身时配合拧腰、点头时配合身体前倾，这样会更灵活生动
+    - 头部（head）的转动和点头可以增加情绪表达，不要只局限于四肢
 
     各部位方向说明（已验证）：
     - "head": 头部。x正=低头前倾, x负=抬头后仰; y正=左转, y负=右转
-    - "right_arm": 右臂。z正=抬起, z负=放下; y负=向前伸, y正=向后收
-    - "left_arm": 左臂。z负=抬起, z正=放下; y正=向前伸, y负=向后收
-    - "right_forearm" / "right_elbow": 右前臂/手肘。z负=弯曲, z正=伸直
-    - "left_forearm" / "left_elbow": 左前臂/手肘。z正=弯曲, z负=伸直
+    - "right_arm": 右臂（可前后左右运动）。z正=抬起, z负=放下; y负=向前伸, y正=向后收
+    - "left_arm": 左臂（可前后左右运动）。z负=抬起, z正=放下; y正=向前伸, y负=向后收
+    - "right_forearm" / "right_elbow": 右前臂/手肘（可前后弯曲）。z负=弯曲, z正=伸直; y负=向前, y正=向后
+    - "left_forearm" / "left_elbow": 左前臂/手肘（可前后弯曲）。z正=弯曲, z负=伸直; y正=向前, y负=向后
     - "right_ear": 右耳天线。x正=前倾, x负=后仰
     - "left_ear": 左耳天线。x正=前倾, x负=后仰
-    - "right_leg": 右腿。x负=向前抬, x正=向后收; z正=左摆, z负=右摆
-    - "left_leg": 左腿。x负=向前抬, x正=向后收; z正=右摆, z负=左摆
+    - "right_leg": 右腿（以前后运动为主）。x负=向前抬, x正=向后收; z正=左摆, z负=右摆
+    - "left_leg": 左腿（以前后运动为主）。x负=向前抬, x正=向后收; z正=右摆, z负=左摆
     - "right_calf": 右小腿。x负=前伸, x正=后收
     - "left_calf": 左小腿。x负=前伸, x正=后收
     - "body": 躯干（上身整体，手臂和头跟着动）。x正=前倾, x负=后仰; y正=左转(拧腰), y负=右转; z正=右倾, z负=左倾
@@ -127,11 +137,15 @@ def control_body(part: str, x: float = 0, y: float = 0, z: float = 0) -> str:
     if not bone:
         return f"错误：未知部位 '{part}'，可用部位：{', '.join(BONE_MAP.keys())}"
 
+    # 轴取反（模型侧骨骼方向与API约定相反）
+    send_y = -y if part in Y_NEGATE_PARTS else y
+    send_z = -z if part in Z_NEGATE_PARTS else z
+
     # 发送HTTP请求到前端
     try:
         response = requests.post(
             f'{BODY_SERVER_URL}/api/set_bone',
-            json={'bone': bone, 'x': x, 'y': y, 'z': z},
+            json={'bone': bone, 'x': x, 'y': send_y, 'z': send_z},
             timeout=5
         )
         if response.status_code == 200:
@@ -232,8 +246,14 @@ def body_script(moves: str) -> str:
                 if not bone:
                     results.append(f"步骤{i}: 未知部位 '{part}'")
                     continue
+                y_val = step.get('y', 0)
+                z_val = step.get('z', 0)
+                if part in Y_NEGATE_PARTS:
+                    y_val = -y_val
+                if part in Z_NEGATE_PARTS:
+                    z_val = -z_val
                 requests.post(f'{BODY_SERVER_URL}/api/set_bone',
-                            json={'bone':bone,'x':step.get('x',0),'y':step.get('y',0),'z':step.get('z',0)},
+                            json={'bone':bone,'x':step.get('x',0),'y':y_val,'z':z_val},
                             timeout=5)
         except Exception as e:
             results.append(f"步骤{i}: {e}")
