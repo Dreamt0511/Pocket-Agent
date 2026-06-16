@@ -9,6 +9,9 @@ import sqlite3
 import subprocess
 import warnings
 warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
+# 必须在 import agent 模块之前加载 .env，否则 config.py 读不到环境变量
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 import time
 import contextlib
 from pathlib import Path
@@ -46,14 +49,11 @@ _last_heartbeat = time.time()
 _HEARTBEAT_TIMEOUT = 60  # 秒，超过此时间未收到心跳则自动关闭
 
 
-async def _add_to_vector_store(message_id: int, content: str, conversation_id: str, importance: int):
+async def _add_to_vector_store(message_id: int, content: str):
     """异步添加消息到向量索引"""
     try:
         if _vector_store:
-            _vector_store.add(message_id, content, {
-                "conversation_id": conversation_id,
-                "importance": importance
-            })
+            _vector_store.add(message_id, content)
     except Exception:
         logger.warning(f"向量索引添加失败: message_id={message_id}")
 
@@ -186,6 +186,49 @@ async def startup():
         _checkpoint_saver = MemorySaver()
         logger.info("MemorySaver checkpoint 已初始化（会话历史不持久化）")
 
+    # 自动拉起 llama-server embedding 服务（安卓版 bash 脚本可能已启动，检测端口避免重复）
+    from agent.config import EMBEDDING_MODEL_PATH, EMBEDDING_SERVER_URL as _EMB_URL
+    if EMBEDDING_MODEL_PATH and os.path.exists(EMBEDDING_MODEL_PATH):
+        import socket
+        _emb_port = int(_EMB_URL.split(":")[-1].split("/")[0]) if _EMB_URL else 8080
+        _port_in_use = False
+        try:
+            with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
+                _port_in_use = True
+        except (ConnectionRefusedError, OSError):
+            pass
+        if not _port_in_use:
+            # 端口未占用 → 可能 bash 脚本还在 sleep，等 3 秒再查一次
+            import asyncio
+            await asyncio.sleep(3)
+            try:
+                with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
+                    _port_in_use = True
+            except (ConnectionRefusedError, OSError):
+                pass
+        if _port_in_use:
+            logger.info(f"llama-server 已在端口 {_emb_port} 运行")
+        else:
+            try:
+                subprocess.Popen(
+                    ["llama-server", "-m", EMBEDDING_MODEL_PATH,
+                     "--embedding", "-c", "8192", "--port", str(_emb_port),
+                     "--host", "0.0.0.0", "-np", "4", "-b", "2048", "-ub", "2048", "-t", "4"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                for _ in range(30):
+                    time.sleep(0.5)
+                    try:
+                        with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
+                            break
+                    except (ConnectionRefusedError, OSError):
+                        pass
+                logger.info(f"llama-server 已启动 (port={_emb_port})")
+            except Exception as e:
+                logger.warning(f"llama-server 启动失败: {e}")
+    else:
+        logger.info("EMBEDDING_MODEL_PATH 未配置或文件不存在，跳过 embedding 服务启动")
+
     # 初始化 SQLite 向量存储（BGE-M3 本地 embedding）
     from agent.embedding import EmbeddingClient, VectorStore
     from agent.config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL, EMBEDDING_SERVER_URL
@@ -199,36 +242,26 @@ async def startup():
         db_path=DB_PATH,
         embedding_client=_embedding_client
     )
-    # embeddings FTS5 索引（与 VectorStore 共用同一个 SQLite 文件）
-    async with get_db() as db:
-        await db.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts
-            USING fts5(content, tokenize='trigram')
-        """)
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ai AFTER INSERT ON embeddings BEGIN
-                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
-            END
-        """)
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ad AFTER DELETE ON embeddings BEGIN
-                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-            END
-        """)
-        await db.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_au AFTER UPDATE ON embeddings BEGIN
-                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
-            END
-        """)
-        await db.execute("INSERT INTO embeddings_fts(embeddings_fts) VALUES('rebuild')")
-        await db.commit()
-    logger.info("embeddings FTS5 索引已初始化")
 
     # 注入引用到工具模块，避免 HTTP 自调用死锁
     from agent.tools.basic_tools import set_memory_refs
     set_memory_refs(_vector_store, DB_PATH)
     logger.info("SQLite 向量存储已初始化")
+
+    # 补录缺失的 embeddings（向量索引缺失时，从 messages 取内容生成向量）
+    if _vector_store and _vector_store.embedding_client and _vector_store.embedding_client.is_available():
+        async with get_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT id, content FROM messages WHERE role = 'memory'"
+            )
+            existing_ids = await db.execute_fetchall("SELECT id FROM embeddings")
+            existing = {str(r[0]) for r in existing_ids}
+            missing = [r for r in rows if str(r[0]) not in existing]
+            if missing:
+                logger.info(f"补录 {len(missing)} 条缺失的向量索引...")
+                for msg_id, content in missing:
+                    _vector_store.add(msg_id, content)
+                logger.info("向量索引补录完成")
 
     # 清理低重要性旧消息的 embedding（遗忘机制）
     await _cleanup_old_messages()
@@ -783,12 +816,11 @@ async def search_messages(conversation_id: str, q: str, cross_session: bool = Fa
 
 
 @app.get("/messages/vector_search")
-async def vector_search(q: str, conversation_id: str = None, limit: int = 20):
-    """向量语义搜索"""
+async def vector_search(q: str, limit: int = 20):
+    """向量语义搜索（返回 id + distance，内容需通过 /messages 接口查询）"""
     if not _vector_store:
         return []
-    where = {"conversation_id": conversation_id} if conversation_id else None
-    results = _vector_store.query(q, n_results=limit, where=where)
+    results = _vector_store.query(q, n_results=limit)
     return results
 
 
@@ -814,35 +846,24 @@ async def save_memory_endpoint(request: Request):
         if not content:
             return {"error": "content is required"}
 
-        if mem_type == "fact":
-            if _vector_store:
-                metadata = {"importance": importance, "type": "fact"}
-                _vector_store.add(
-                    message_id=hash(content) % (2**31),
-                    content=content,
-                    metadata=metadata
-                )
-            return {"ok": True, "type": "fact"}
+        if not conversation_id:
+            conversation_id = "api-memory"
 
-        elif mem_type == "episodic":
-            if not conversation_id:
-                return {"error": "conversation_id required for episodic"}
-            async with get_db() as db:
-                await db.execute(
-                    "INSERT INTO messages (conversation_id, role, content, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
-                    (conversation_id, "memory", content, int(time.time() * 1000), importance)
-                )
-                await db.commit()
-            if _vector_store:
-                metadata = {"importance": importance, "type": "episodic", "conversation_id": conversation_id}
-                _vector_store.add(
-                    message_id=hash(content) % (2**31),
-                    content=content,
-                    metadata=metadata
-                )
-            return {"ok": True, "type": "episodic"}
+        # 统一存入 messages 表
+        msg_id = None
+        async with get_db() as db:
+            cursor = await db.execute(
+                "INSERT INTO messages (conversation_id, role, content, timestamp, importance, memory_type) VALUES (?, ?, ?, ?, ?, ?)",
+                (conversation_id, "memory", content, int(time.time() * 1000), importance, mem_type)
+            )
+            await db.commit()
+            msg_id = cursor.lastrowid
 
-        return {"error": f"unknown type: {mem_type}"}
+        # 用 messages 表的自增 ID 生成向量索引
+        if _vector_store and msg_id is not None:
+            _vector_store.add(message_id=msg_id, text=content)
+
+        return {"ok": True, "type": mem_type, "id": msg_id}
     except Exception as e:
         logger.error(f"save_memory error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})

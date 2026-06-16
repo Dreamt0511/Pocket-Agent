@@ -3,10 +3,10 @@
 Embedding 模块 — 通过本地 llama-server 或远程 API 生成向量嵌入
 
 存储方案: SQLite + numpy（替代 ChromaDB，无需编译 Rust 依赖）
+embeddings 表只存向量（id + embedding BLOB），原始内容在 messages 表
 """
 
 import struct
-import math
 import json
 import sqlite3
 import requests
@@ -40,21 +40,22 @@ class EmbeddingClient:
         return self._available
 
     def embed(self, text: str) -> Optional[List[float]]:
-        """生成单条文本的 embedding"""
+        """生成单条文本的 embedding，超长时自动截断重试"""
         if not self.is_available():
             return None
-        try:
-            resp = requests.post(
-                f"{self.base_url}/embeddings",
-                json={"model": self.model, "input": text},
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=15
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["data"][0]["embedding"]
-        except Exception:
-            pass
+        # 先尝试全文，失败则截断重试（batch_size=2048 tokens，约 4000 字符）
+        for input_text in (text, text[:4000]):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/embeddings",
+                    json={"model": self.model, "input": input_text},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=15
+                )
+                if resp.status_code == 200:
+                    return resp.json()["data"][0]["embedding"]
+            except Exception:
+                pass
         return None
 
     def embed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -90,25 +91,14 @@ class EmbeddingClient:
         return list(struct.unpack(f'{count}f', blob))
 
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """计算两个向量的余弦相似度"""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
 class VectorStore:
-    """基于 SQLite + numpy 的向量存储（替代 ChromaDB）"""
+    """基于 SQLite + numpy 的向量存储（替代 ChromaDB）
+
+    只存向量索引（id + embedding），原始内容在 messages 表。
+    向量搜索通过 id 回 messages 表取原文。
+    """
 
     def __init__(self, db_path: str, embedding_client: EmbeddingClient = None):
-        """
-        Args:
-            db_path: SQLite 数据库路径（与主数据库共用）
-            embedding_client: 用于生成 embedding 的客户端
-        """
         self.db_path = db_path
         self.embedding_client = embedding_client
         self._init_table()
@@ -121,47 +111,67 @@ class VectorStore:
         return conn
 
     def _init_table(self):
-        """创建 embeddings 表"""
+        """创建 embeddings 表（只存向量，不存内容）。自动迁移旧 schema。"""
         conn = self._get_conn()
         try:
-            conn.execute("""CREATE TABLE IF NOT EXISTS embeddings (
-                id TEXT PRIMARY KEY,
-                content TEXT,
-                metadata TEXT,
-                embedding BLOB
-            )""")
-            conn.commit()
+            # 检查旧表是否有 content 列（需要迁移）
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(embeddings)").fetchall()}
+            if cols and "content" in cols:
+                conn.execute("ALTER TABLE embeddings RENAME TO embeddings_old")
+                conn.execute("""CREATE TABLE embeddings (
+                    id TEXT PRIMARY KEY,
+                    embedding BLOB
+                )""")
+                conn.execute("INSERT INTO embeddings (id, embedding) SELECT id, embedding FROM embeddings_old")
+                conn.execute("DROP TABLE embeddings_old")
+                conn.commit()
+            else:
+                conn.execute("""CREATE TABLE IF NOT EXISTS embeddings (
+                    id TEXT PRIMARY KEY,
+                    embedding BLOB
+                )""")
+                conn.commit()
         finally:
             conn.close()
 
-    def add(self, message_id: int, content: str, metadata: dict = None) -> bool:
-        """添加消息到向量索引"""
+    def add(self, message_id: int, text: str) -> bool:
+        """为消息生成向量并存储（只存向量，内容在 messages 表）
+
+        Args:
+            message_id: messages 表的 id
+            text: 用于生成 embedding 的文本（可以是内容的摘要或全文）
+        """
         if not self.embedding_client or not self.embedding_client.is_available():
             return False
-        embedding = self.embedding_client.embed(content)
+        embedding = self.embedding_client.embed(text)
         if not embedding:
             return False
         blob = EmbeddingClient.embedding_to_blob(embedding)
         conn = self._get_conn()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO embeddings (id, content, metadata, embedding) VALUES (?, ?, ?, ?)",
-                (str(message_id), content, json.dumps(metadata or {}), blob)
+                "INSERT OR REPLACE INTO embeddings (id, embedding) VALUES (?, ?)",
+                (str(message_id), blob)
             )
             conn.commit()
             return True
         finally:
             conn.close()
 
-    def query(self, text: str, n_results: int = 20, where: dict = None) -> list:
-        """语义搜索
+    def query(self, text: str, n_results: int = 20,
+              conversation_id: str = None, msg_type: str = None,
+              days: int = None, memory_type: str = None) -> list:
+        """向量语义搜索，返回 id + distance（内容由调用方回 messages 表查询）
 
         Args:
             text: 查询文本
             n_results: 返回结果数
-            where: 过滤条件（如 {"conversation_id": "xxx"}）
+            conversation_id: 过滤会话 ID
+            msg_type: 过滤消息类型 (user/assistant/memory)
+            days: 只返回最近 N 天的结果
+            memory_type: 过滤记忆类型 (fact/episodic)
         Returns:
-            [{"id": str, "document": str, "metadata": dict, "distance": float}, ...]
+            [{"id": str, "distance": float}, ...]
         """
         if not self.embedding_client or not self.embedding_client.is_available():
             return []
@@ -169,23 +179,37 @@ class VectorStore:
         if not query_embedding:
             return []
 
+        # 构建 SQL 过滤条件，下推到数据库层
+        conditions = []
+        params = []
+        if conversation_id:
+            conditions.append("m.conversation_id = ?")
+            params.append(conversation_id)
+        if msg_type:
+            conditions.append("m.role = ?")
+            params.append(msg_type)
+        if days:
+            import time
+            conditions.append("m.timestamp > ?")
+            params.append(int((time.time() - days * 86400) * 1000))
+        if memory_type:
+            conditions.append("m.memory_type = ?")
+            params.append(memory_type)
+
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+            sql = f"SELECT e.id, e.embedding FROM embeddings e JOIN messages m ON e.id = CAST(m.id AS TEXT) {where_clause}"
+        else:
+            sql = "SELECT id, embedding FROM embeddings"
+
         conn = self._get_conn()
         try:
-            rows = conn.execute("SELECT id, content, metadata, embedding FROM embeddings").fetchall()
+            rows = conn.execute(sql, params).fetchall()
         finally:
             conn.close()
 
         if not rows:
             return []
-
-        # 过滤（按 metadata 中的所有 where 条件）
-        if where:
-            filtered = []
-            for r in rows:
-                meta = json.loads(r[2])
-                if all(meta.get(k) == v for k, v in where.items()):
-                    filtered.append(r)
-            rows = filtered
 
         # numpy 批量计算余弦相似度
         query_vec = np.array(query_embedding, dtype=np.float32)
@@ -193,8 +217,8 @@ class VectorStore:
         if query_norm == 0:
             return []
 
-        ids, documents, metadatas, distances = [], [], [], []
-        for row_id, content, meta_json, blob in rows:
+        results = []
+        for row_id, blob in rows:
             try:
                 vec = np.frombuffer(blob, dtype=np.float32)
             except Exception:
@@ -204,26 +228,13 @@ class VectorStore:
                 sim = 0.0
             else:
                 sim = float(np.dot(query_vec, vec) / (query_norm * vec_norm))
-            ids.append(row_id)
-            documents.append(content)
-            metadatas.append(json.loads(meta_json))
-            # distance = 1 - similarity（与 ChromaDB 语义一致）
-            distances.append(1.0 - sim)
+            results.append({"id": row_id, "distance": 1.0 - sim})
 
-        # 按 distance 升序排序，取 top-n
-        indices = sorted(range(len(distances)), key=lambda i: distances[i])[:n_results]
-        return [
-            {
-                "id": ids[i],
-                "document": documents[i],
-                "metadata": metadatas[i],
-                "distance": distances[i],
-            }
-            for i in indices
-        ]
+        results.sort(key=lambda x: x["distance"])
+        return results[:n_results]
 
     def delete(self, message_id: int):
-        """删除消息"""
+        """删除消息的向量索引"""
         conn = self._get_conn()
         try:
             conn.execute("DELETE FROM embeddings WHERE id = ?", (str(message_id),))

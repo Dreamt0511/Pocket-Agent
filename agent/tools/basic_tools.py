@@ -9,7 +9,6 @@ import re
 import subprocess
 import sqlite3
 import time
-import uuid
 from typing import Dict, List, Optional
 from langchain_core.tools import tool
 import requests
@@ -366,6 +365,24 @@ def set_current_conversation_id(conversation_id: str):
 
 # ── 混合检索辅助函数 ──────────────────────────────────────────────
 
+def _split_chinese_query(query: str) -> list:
+    """中文查询分词：空格分割 + 无空格中文按2字切分"""
+    import re
+    tokens = []
+    for part in query.split():
+        # 检测是否含中文且无空格（连续中文≥4字则按2字切分）
+        if re.search(r'[一-鿿]{4,}', part):
+            chars = re.findall(r'[一-鿿]', part)
+            if len(chars) >= 4:
+                for i in range(len(chars) - 1):
+                    tokens.append(chars[i] + chars[i + 1])
+            else:
+                tokens.append(part)
+        else:
+            tokens.append(part)
+    return tokens
+
+
 def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None, memory_type: str = None) -> list:
     """FTS5 trigram 搜索为主，搜不到时用 LIKE 补充"""
     if not _db_path_ref:
@@ -427,19 +444,22 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
                 pass
 
         # 策略2: LIKE 补充（短词 <3字符，或 FTS 没搜到时）
+        # 中文无空格时按2字切分（如"动作舞蹈"→["动作","舞蹈"]）
         short_keywords = [k for k in keywords if len(k) < 3]
         if short_keywords or not results:
-            fallback_keywords = short_keywords if short_keywords else keywords
-            like_conditions = [f"m.content LIKE ?" for _ in fallback_keywords]
-            like_params = [f"%{k}%" for k in fallback_keywords]
-            like_clause = " OR ".join(like_conditions)
-            rows = conn.execute(
-                f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
-                    FROM messages m WHERE ({like_clause}){where_extra}
-                    ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
-                like_params + params
-            ).fetchall()
-            _add(rows)
+            fallback_keywords = short_keywords if short_keywords else _split_chinese_query(query)
+            fallback_keywords = list(dict.fromkeys(fallback_keywords))  # 去重保序
+            if fallback_keywords:
+                like_conditions = ["m.content LIKE ?" for _ in fallback_keywords]
+                like_params = [f"%{k}%" for k in fallback_keywords]
+                like_clause = " OR ".join(like_conditions)
+                rows = conn.execute(
+                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                        FROM messages m WHERE ({like_clause}){where_extra}
+                        ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
+                    like_params + params
+                ).fetchall()
+                _add(rows)
 
         return results
     except Exception:
@@ -449,124 +469,62 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             conn.close()
 
 def _vector_search(query: str, conversation_id: str = None, days: int = None, msg_type: str = None, memory_type: str = None) -> list:
-    """向量语义搜索（直接查询，避免 HTTP 自调用死锁）"""
-    if not _vector_store_ref:
+    """向量语义搜索：embeddings 表查向量 → 回 messages 表取原文"""
+    if not _vector_store_ref or not _db_path_ref:
         return []
     try:
-        where = {}
-        if conversation_id:
-            where["conversation_id"] = conversation_id
-        if msg_type:
-            where["role"] = msg_type
-        if memory_type:
-            where["type"] = memory_type
+        # 第一步：向量搜索（过滤条件下推到 SQL 层，只对匹配的向量计算相似度）
+        vec_results = _vector_store_ref.query(
+            query, n_results=20,
+            conversation_id=conversation_id,
+            msg_type=msg_type,
+            days=days,
+            memory_type=memory_type,
+        )
+        if not vec_results:
+            return []
 
-        results = _vector_store_ref.query(query, n_results=20, where=where or None)
+        # 过滤低相似度结果
+        MIN_SIMILARITY = 0.35
+        vec_results = [r for r in vec_results if (1 - r["distance"]) >= MIN_SIMILARITY]
+        if not vec_results:
+            return []
 
-        # 应用时间过滤（timestamp=0 视为无时间戳，不过滤）
-        if days:
-            cutoff_time = int((time.time() - days * 86400) * 1000)
-            results = [r for r in results if r.get("metadata", {}).get("timestamp", 0) == 0
-                       or r.get("metadata", {}).get("timestamp", 0) > cutoff_time]
+        # 第二步：用 id 回 messages 表取原文（过滤已在 query 中完成）
+        ids = [r["id"] for r in vec_results]
+        id_to_distance = {r["id"]: r["distance"] for r in vec_results}
 
-        return [{
-            "id": r.get("id", ""),
-            "role": r.get("metadata", {}).get("role", ""),
-            "content": r.get("document", ""),
-            "conversation_id": r.get("metadata", {}).get("conversation_id", ""),
-            "importance": r.get("metadata", {}).get("importance", 3),
-            "last_access_at": r.get("metadata", {}).get("last_access_at", 0),
-            "similarity": 1 - r.get("distance", 0),
-        } for r in results]
-    except Exception:
-        return []
-
-def _embeddings_keyword_search(query: str, memory_type: str = None, days: int = None) -> list:
-    """在 embeddings 表中搜索记忆内容（FTS5 trigram + LIKE 兜底），补充 messages 表搜索"""
-    if not _db_path_ref:
-        return []
-    conn = None
-    try:
         conn = sqlite3.connect(_db_path_ref, timeout=10)
         conn.execute("PRAGMA busy_timeout=5000")
-
-        keywords = query.split()
-        if not keywords:
-            keywords = [query]
+        try:
+            placeholders = ",".join(["?"] * len(ids))
+            rows = conn.execute(
+                f"SELECT id, conversation_id, role, content, importance, last_access_at, timestamp FROM messages WHERE id IN ({placeholders})",
+                ids
+            ).fetchall()
+        finally:
+            conn.close()
 
         results = []
-        seen_ids = set()
+        for row_id, conv_id, role, content, importance, last_access, ts in rows:
+            results.append({
+                "id": row_id,
+                "role": role,
+                "content": content,
+                "conversation_id": conv_id,
+                "importance": importance or 3,
+                "last_access_at": last_access or 0,
+                "similarity": 1 - id_to_distance.get(str(row_id), 0),
+            })
 
-        def _apply_filters(rows):
-            """对查询结果应用 memory_type 和 days 过滤"""
-            filtered = []
-            for row_id, content, meta_json in rows:
-                meta = json.loads(meta_json) if meta_json else {}
-                if memory_type and meta.get("type") != memory_type:
-                    continue
-                if days:
-                    ts = meta.get("timestamp", 0)
-                    if ts > 0:
-                        cutoff = int((time.time() - days * 86400) * 1000)
-                        if ts < cutoff:
-                            continue
-                if row_id not in seen_ids:
-                    seen_ids.add(row_id)
-                    filtered.append({
-                        "id": row_id,
-                        "conversation_id": meta.get("conversation_id", ""),
-                        "role": "memory",
-                        "content": content,
-                        "importance": meta.get("importance", 5),
-                        "last_access_at": meta.get("last_access_at", 0),
-                        "timestamp": meta.get("timestamp", 0),
-                    })
-            return filtered
-
-        # 策略1: FTS5 trigram（>=3字符的关键词）
-        long_keywords = [k for k in keywords if len(k) >= 3]
-        if long_keywords:
-            try:
-                fts_query = " OR ".join(long_keywords)
-                rows = conn.execute(
-                    """SELECT e.id, e.content, e.metadata
-                       FROM embeddings_fts fts JOIN embeddings e ON fts.rowid = e.rowid
-                       WHERE fts MATCH ?
-                       ORDER BY rank LIMIT 20""",
-                    [fts_query]
-                ).fetchall()
-                results.extend(_apply_filters(rows))
-            except Exception:
-                pass
-
-        # 策略2: LIKE 兜底（短词 <3字符，或 FTS 没搜到时）
-        short_keywords = [k for k in keywords if len(k) < 3]
-        if short_keywords or not results:
-            fallback_keywords = short_keywords if short_keywords else keywords
-            like_conditions = ["e.content LIKE ?" for _ in fallback_keywords]
-            like_params = [f"%{k}%" for k in fallback_keywords]
-            like_clause = " OR ".join(like_conditions)
-            rows = conn.execute(
-                f"""SELECT e.id, e.content, e.metadata
-                    FROM embeddings e WHERE ({like_clause})
-                    ORDER BY length(e.content) ASC LIMIT 20""",
-                like_params
-            ).fetchall()
-            results.extend(_apply_filters(rows))
-
-        results.sort(key=lambda x: len(x["content"]))
         return results
     except Exception:
         return []
-    finally:
-        if conn:
-            conn.close()
 
+def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 3) -> list:
+    """综合排序：RRF + 相似度加权 + 时间衰减 + 重要性微调
 
-def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3) -> list:
-    """综合排序：RRF + 时间衰减 + 重要性
-    参考 EchoMind 设计：语义相关性(0.45) > 重要性(0.3) > 时间衰减(0.25)
-    时间衰减使用指数衰减（DECAY_RATE=0.995 每小时）
+    设计原则：语义相关性是主排序信号，重要性仅作微调避免低相关结果靠高分爬上来。
     """
     current_time = time.time() * 1000  # 毫秒
     DECAY_RATE = 0.995  # 每小时衰减
@@ -579,8 +537,9 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float =
         rrf_score = 1 / (k + rank + 1)
         scores[key] = {"rrf": rrf_score, "msg": msg}
 
-    # 向量结果按 similarity 排序
-    for rank, msg in enumerate(vec_results):
+    # 向量结果按 similarity 排序（similarity 越高越靠前）
+    sorted_vec = sorted(vec_results, key=lambda x: x.get("similarity", 0), reverse=True)
+    for rank, msg in enumerate(sorted_vec):
         key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
         rrf_score = 1 / (k + rank + 1)
         if key in scores:
@@ -592,8 +551,11 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float =
     for key, data in scores.items():
         msg = data["msg"]
 
-        # 语义相关性（RRF 分数）
+        # 语义相关性：RRF 分数 × 相似度加权
         semantic_score = data["rrf"]
+        similarity = msg.get("similarity", 0.5)
+        # 向量结果有 similarity 字段，FTS 结果没有 → 用 0.5 兜底
+        weighted_semantic = semantic_score * (0.5 + similarity)
 
         # 时间相关性：指数衰减
         last_access = msg.get("last_access_at", current_time)
@@ -602,20 +564,20 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, alpha: float =
         hours_passed = (current_time - last_access) / 3600000  # 毫秒转小时
         recency_score = DECAY_RATE ** hours_passed
 
-        # 重要性
-        importance_score = msg.get("importance", 3) / 10  # 归一化到 0-1
+        # 重要性：乘法微调（0.8~1.2 范围），确保低语义相关性不会被 importance 拉上来
+        importance = msg.get("importance", 3)
+        importance_factor = 0.8 + importance * 0.04  # imp=5 → 1.0, imp=8 → 1.12, imp=3 → 0.92
 
-        # 综合分数
+        # 综合分数：语义为主（乘以 importance 微调），时间为辅
         data["final_score"] = (
-            alpha * semantic_score +
-            beta * recency_score +
-            gamma * importance_score
+            0.75 * weighted_semantic * importance_factor +
+            0.25 * recency_score
         )
 
     # 按综合分数排序
     sorted_items = sorted(scores.values(), key=lambda x: x["final_score"], reverse=True)
 
-    return [item["msg"] for item in sorted_items[:5]]
+    return [item["msg"] for item in sorted_items[:top_n]]
 
 
 @tool
@@ -769,6 +731,23 @@ async def tts_speak(text: str) -> str:
         return "⚠️ 执行失败"
 
 
+def _extract_embed_text(content: str) -> str:
+    """提取适合嵌入的文本。动作JSON数据只取名称+描述，避免超长无语义内容。"""
+    # 检测是否包含动作JSON数组（以 [{"action": 开头的JSON块）
+    json_start = content.find('[{"action":')
+    if json_start == -1:
+        json_start = content.find("[{'action':")
+    if json_start > 0:
+        # 取JSON之前的文字描述部分
+        desc = content[:json_start].strip().rstrip("：:，,\n")
+        if desc:
+            return desc
+    # 非动作数据，正常返回（过长时截断到2000字符）
+    if len(content) > 2000:
+        return content[:2000]
+    return content
+
+
 @tool
 def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
     """保存重要信息到记忆系统。只在值得记的内容时调用，不要每条对话都存。
@@ -801,7 +780,6 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
     t0 = time.monotonic()
     try:
         current_timestamp = int(time.time() * 1000)
-        msg_id = str(uuid.uuid4().int % (2**31))
 
         if type not in ("fact", "episodic"):
             return "type 必须是 'fact' 或 'episodic'"
@@ -809,34 +787,30 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
         if not _current_conversation_id:
             return "保存失败: 需要 conversation_id（请在会话中调用）"
 
-        # 存入 messages 表（两种类型都存，带 memory_type 标记）
+        # 存入 messages 表，用 lastrowid 作为关联 ID
         _notify_progress("正在写入数据库...")
+        msg_id = None
         if _current_conversation_id and _db_path_ref:
             conn = None
             try:
                 conn = sqlite3.connect(_db_path_ref, timeout=30)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=30000")
-                conn.execute(
+                cursor = conn.execute(
                     "INSERT INTO messages (conversation_id, role, content, timestamp, importance, memory_type) VALUES (?, ?, ?, ?, ?, ?)",
                     (_current_conversation_id, "memory", content, current_timestamp, importance, type)
                 )
                 conn.commit()
+                msg_id = cursor.lastrowid
             finally:
                 if conn:
                     conn.close()
 
-        # 存入向量数据库
+        # 存入向量索引（用 messages 表的自增 ID 作为关联）
         _notify_progress("正在更新向量索引...")
-        if _vector_store_ref:
-            metadata = {"importance": importance, "type": type, "timestamp": current_timestamp}
-            if type == "episodic":
-                metadata["conversation_id"] = _current_conversation_id
-            _vector_store_ref.add(
-                message_id=msg_id,
-                content=content,
-                metadata=metadata
-            )
+        if _vector_store_ref and msg_id is not None:
+            embed_text = _extract_embed_text(content)
+            _vector_store_ref.add(message_id=msg_id, text=embed_text)
 
         elapsed = round(time.monotonic() - t0, 2)
         label = "事实记忆" if type == "fact" else "事件记忆"
@@ -849,12 +823,15 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 
 @tool
 def search_memory(query: str, scope: str = "memory", memory_type: str = None, days: int = None) -> str:
-    """搜索历史消息和跨会话记忆，找回遗忘的细节。
+    """深度搜索历史记忆，找回上下文中没有的细节。
 
-    何时调用：
-    - 用户提到"之前""上次""记得"等回忆性词汇
-    - 不确定某个信息，需要回忆之前的对话内容
-    - 查找用户之前提到过的决定、偏好、事件结果
+    系统已自动为你注入了 top 3 相关记忆到上下文中（标记为 [相关记忆]）。
+    以下情况需要你主动调用本工具深入搜索：
+    - 上下文中的 [相关记忆] 不够用，需要更多记忆
+    - 用户明确提到"之前""上次""记得"，需要精准回溯
+    - 需要按类型过滤（只搜事实/只搜事件）
+    - 需要按时间过滤（最近 7 天）
+    - 搜索当前会话的原始对话（scope="session"）
 
     参数选择：
     - scope="session": 回溯本轮对话细节，确认用户刚说过什么。5 条结果。
@@ -879,24 +856,13 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             results = _fts_search(query, conversation_id=_current_conversation_id, days=days)
             results = [r for r in results if r.get("role") != "memory"][:5]
         elif scope == "memory":
-            # 搜跨会话记忆：messages FTS + embeddings LIKE + 向量语义
+            # 搜跨会话记忆：messages FTS5 关键词 + 向量语义 → RRF 融合
             _notify_progress("正在搜索关键词...")
             fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
-            _notify_progress("正在搜索嵌入表...")
-            emb_results = _embeddings_keyword_search(query, memory_type=memory_type, days=days)
             _notify_progress("正在语义搜索...")
-            # embeddings 表只存记忆，不传 msg_type（metadata 无 role 字段）
-            vec_results = _vector_search(query, days=days, memory_type=memory_type)
-            # 合并 FTS 和 embeddings 搜索结果（按 content 去重，因为两张表 id 类型不同）
-            merged_keyword = list(fts_results)
-            seen_contents = {r.get("content", "")[:100] for r in fts_results}
-            for r in emb_results:
-                key = r.get("content", "")[:100]
-                if key not in seen_contents:
-                    merged_keyword.append(r)
-                    seen_contents.add(key)
+            vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
             _notify_progress("正在合并排序...")
-            results = _rrf_merge(merged_keyword, vec_results)
+            results = _rrf_merge(fts_results, vec_results, top_n=5)
         else:
             return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"
 

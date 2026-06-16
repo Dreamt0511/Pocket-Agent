@@ -9,16 +9,19 @@ import sys
 import os
 import sqlite3
 import time
+import subprocess
 import warnings
 import termios
 from datetime import datetime
-# 当前 langgraph 版本不支持 allowed_objects 参数，过滤未来警告
-warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
+# 过滤 langgraph/langchain 的版本兼容警告
+warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+warnings.filterwarnings("ignore", message=".*serde.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
+# 必须在 import agent 模块之前加载 .env，否则 config.py 读不到环境变量
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 from agent.ui import PocketUI
 from agent.agent_langchain import LangChainPocketAgent
-from dotenv import load_dotenv
-# 从脚本所在目录加载.env，override=True确保覆盖已有环境变量
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 from agent.config import (
     MAX_ITERATIONS, PROJECT_ROOT,
     EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL, EMBEDDING_SERVER_URL,
@@ -103,44 +106,11 @@ def _init_db():
 
 
 def _init_vector_store():
-    """初始化 EmbeddingClient + VectorStore + embeddings FTS5 索引（与 app.py 一致）"""
+    """初始化 EmbeddingClient + VectorStore（只存向量索引，内容在 messages 表）"""
     base_url = EMBEDDING_SERVER_URL or EMBEDDING_BASE_URL
     api_key = EMBEDDING_API_KEY
-
     embedding_client = EmbeddingClient(base_url, api_key, EMBEDDING_MODEL)
-    vector_store = VectorStore(db_path=DB_PATH, embedding_client=embedding_client)
-
-    # embeddings FTS5 索引
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    try:
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_fts
-            USING fts5(content, tokenize='trigram')
-        """)
-        conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ai AFTER INSERT ON embeddings BEGIN
-                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
-            END
-        """)
-        conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_ad AFTER DELETE ON embeddings BEGIN
-                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-            END
-        """)
-        conn.execute("""
-            CREATE TRIGGER IF NOT EXISTS embeddings_fts_au AFTER UPDATE ON embeddings BEGIN
-                INSERT INTO embeddings_fts(embeddings_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                INSERT INTO embeddings_fts(rowid, content) VALUES (new.rowid, new.content);
-            END
-        """)
-        conn.execute("INSERT INTO embeddings_fts(embeddings_fts) VALUES('rebuild')")
-        conn.commit()
-    finally:
-        conn.close()
-
-    return vector_store
+    return VectorStore(db_path=DB_PATH, embedding_client=embedding_client)
 
 
 async def _init_checkpointer():
@@ -389,16 +359,83 @@ async def main():
     # 新版LangChain Agent实现
     model_name = os.getenv("LLM_MODEL", "gelab-zero-4b-preview")
 
-    # 启动身体控制服务器
-    body_url = ""
-    try:
-        from agent.tools.body_control_tool import start_body_server
-        start_body_server()
-        body_url = "http://localhost:18081"
-    except Exception as e:
-        print(f"3D身体控制启动失败: {e}")
+    # ── 后台服务异步启动（不阻塞主循环）──
+    import socket
+    EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "")
 
-    ui.show_welcome_screen(model_name + " (LangChain)", body_url)  # 展示欢迎界面
+    async def _start_embedding_server():
+        """异步启动 llama-server，返回是否就绪"""
+        if not EMBEDDING_MODEL_PATH or not os.path.exists(EMBEDDING_MODEL_PATH):
+            return False
+        _emb_port = 8080
+        try:
+            with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
+                return True
+        except (ConnectionRefusedError, OSError):
+            pass
+        try:
+            subprocess.Popen(
+                ["llama-server", "-m", EMBEDDING_MODEL_PATH,
+                 "--embedding", "-c", "8192", "--port", str(_emb_port),
+                 "--host", "0.0.0.0", "-np", "4", "-b", "2048", "-ub", "2048", "-t", "4"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return False
+        loop = asyncio.get_event_loop()
+        for _ in range(40):
+            await asyncio.sleep(0.5)
+            try:
+                def _check():
+                    with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
+                        return True
+                if await loop.run_in_executor(None, _check):
+                    return True
+            except (ConnectionRefusedError, OSError):
+                pass
+        return False
+
+    async def _start_body_server():
+        """异步启动 3D 服务，返回 URL 或空串"""
+        loop = asyncio.get_event_loop()
+        try:
+            from agent.tools.body_control_tool import start_body_server
+            await loop.run_in_executor(None, start_body_server)
+            return "http://localhost:18081"
+        except Exception:
+            return ""
+
+    # 并行启动两个服务（最多等 20 秒，不阻塞则立即返回）
+    embedding_ok, body_url = await asyncio.gather(
+        _start_embedding_server(),
+        _start_body_server(),
+    )
+
+    # 服务状态在 banner 上方显示
+    if embedding_ok:
+        ui.console.print("[dim green]✅ 语义记忆已就绪[/dim green]")
+    else:
+        ui.console.print("[dim yellow]⚠️  语义记忆未启动（记忆仅支持关键词匹配）[/dim yellow]")
+    if body_url:
+        ui.console.print(f"[dim green]✅ 3D 交互服务已就绪: {body_url}[/dim green]")
+
+    # 补录缺失的向量索引
+    if embedding_ok and vector_store.embedding_client and vector_store.embedding_client.is_available():
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            rows = conn.execute("SELECT id, content FROM messages WHERE role='memory'").fetchall()
+            existing = {str(r[0]) for r in conn.execute("SELECT id FROM embeddings").fetchall()}
+            missing = [r for r in rows if str(r[0]) not in existing]
+            if missing:
+                ui.console.print(f"[dim]补录 {len(missing)} 条缺失的向量索引...[/dim]")
+                for msg_id, content in missing:
+                    vector_store.add(msg_id, content)
+                ui.console.print("[dim green]向量索引补录完成[/dim green]")
+        finally:
+            conn.close()
+
+    # 显示欢迎界面（banner）
+    ui.show_welcome_screen(model_name + " (LangChain)", body_url, embedding_ok=embedding_ok)
 
     # 系统提示词直接从prompts模块导入
     base_system_prompt = system_base_prompt
@@ -553,7 +590,8 @@ async def main():
                 conversation_id = agent._default_thread_id
                 set_current_conversation_id(conversation_id)
                 # 清屏并重新显示欢迎界面
-                ui.show_welcome_screen(model_name + " (LangChain)", body_url)
+                _emb_ok = vector_store.embedding_client.is_available() if vector_store.embedding_client else False
+                ui.show_welcome_screen(model_name + " (LangChain)", body_url, embedding_ok=_emb_ok)
                 continue
 
             if not user_input_stripped:

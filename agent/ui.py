@@ -107,10 +107,11 @@ class PocketUI:
         """更新技能补全列表"""
         self._completer.update_skills(skills, descriptions)
 
-    def print_banner(self, model_name: str = "", body_url: str = ""):
+    def print_banner(self, model_name: str = "", body_url: str = "", embedding_ok: bool = False):
         """打印首页横幅"""
         model_line = f"\n{model_name}" if model_name else ""
         body_line = f"\n前往 {body_url} 与机器人交互" if body_url else ""
+        embed_icon = "✅ 语义记忆已就绪" if embedding_ok else "⚠️  语义记忆未启动（记忆仅支持关键词匹配）"
         banner = f"""
 
   █▀█ █▀█ █▀▀ █ █ █▀▀ ▀█▀   █▀█ █▀▀ █▀▀ █▀█ ▀█▀
@@ -120,6 +121,7 @@ class PocketUI:
   Pocket-Agent — 移动端AI代理帮手
 
   轻量、快速、智能{model_line}{body_line}
+  {embed_icon}
         """
 
         self.console.print(Panel(
@@ -302,10 +304,10 @@ class PocketUI:
         """
         return ascii_art.strip()
 
-    def show_welcome_screen(self, model_name: str = "", body_url: str = ""):
+    def show_welcome_screen(self, model_name: str = "", body_url: str = "", embedding_ok: bool = False):
         """显示欢迎界面 — 只保留蓝框横幅"""
         self.console.clear()
-        self.print_banner(model_name, body_url)
+        self.print_banner(model_name, body_url, embedding_ok=embedding_ok)
 
     def create_progress_display(self):
         """创建实时进度显示，使用Live组件实现单行更新"""

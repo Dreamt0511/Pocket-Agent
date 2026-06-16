@@ -46,7 +46,7 @@ from .config import (
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
 from .logger import AgentLogger
-from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id, _fts_search, _vector_search, _rrf_merge
 from .prompts.executor_system import executor_system_prompt
 from .prompts.executor_enhance import prompt as executor_enhance_prompt
 
@@ -708,6 +708,28 @@ class LangChainPocketAgent:
             if tag:
                 self._cached_env_tag = tag
 
+    async def _search_relevant_memories(self, query: str, top_n: int = 3) -> str:
+        """主动搜索与用户消息相关的记忆，返回格式化文本（供注入上下文）"""
+        try:
+            loop = asyncio.get_event_loop()
+            # 在线程池中执行搜索（避免阻塞事件循环）
+            def _do_search():
+                fts_results = _fts_search(query, msg_type="memory")
+                vec_results = _vector_search(query, msg_type="memory")
+                return _rrf_merge(fts_results, vec_results, top_n=top_n)
+            results = await loop.run_in_executor(None, _do_search)
+            if not results:
+                return ""
+            lines = []
+            for r in results:
+                content = r["content"]
+                if len(content) > 150:
+                    content = content[:150] + "..."
+                lines.append(f"- {content}")
+            return "[相关记忆]\n" + "\n".join(lines)
+        except Exception:
+            return ""
+
     def _init_llm(self) -> None:
         """初始化LLM客户端"""
         default_config = {
@@ -957,12 +979,13 @@ class LangChainPocketAgent:
             # 首次对话无缓存时跳过，后续由后台任务自动刷新
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            # 主动搜索相关记忆（后台执行，不阻塞对话）
+            memory_text = await self._search_relevant_memories(user_message)
+
+            # 构建消息列表：用户画像 + 环境感知 + 相关记忆合并到用户消息中
             profile_text = f"{self._user_profile}" if self._user_profile else ""
-            # 语音由系统自动处理，不需要模型干预
             env_text = env_tag if env_tag else ""
-            env_text = env_tag if env_tag else ""
-            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text, memory_text]))
             if combined_context:
                 combined_message = f"{combined_context}\n\n---\n{user_message}"
             else:
@@ -1274,10 +1297,13 @@ class LangChainPocketAgent:
             # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
             env_tag = getattr(self, '_cached_env_tag', None)
 
-            # 构建消息列表：用户画像 + 环境感知合并到用户消息中
+            # 主动搜索相关记忆
+            memory_text = await self._search_relevant_memories(user_message)
+
+            # 构建消息列表：用户画像 + 环境感知 + 相关记忆合并到用户消息中
             profile_text = f"{self._user_profile}" if self._user_profile else ""
             env_text = env_tag if env_tag else ""
-            combined_context = "\n\n".join(filter(None, [profile_text, env_text]))
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text, memory_text]))
             if combined_context:
                 combined_message = f"{combined_context}\n\n---\n{user_message}"
             else:
