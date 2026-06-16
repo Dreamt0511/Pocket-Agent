@@ -75,14 +75,18 @@ def _init_db():
         existing_fts = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
         ).fetchall()
+        fts_was_created = False
         if existing_fts and "trigram" not in (existing_fts[0][0] or ""):
             conn.execute("DROP TABLE IF EXISTS messages_fts")
             conn.execute("DROP TRIGGER IF EXISTS messages_fts_ai")
             conn.execute("DROP TRIGGER IF EXISTS messages_fts_ad")
             conn.execute("DROP TRIGGER IF EXISTS messages_fts_au")
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
-        """)
+            existing_fts = []  # 强制重建
+        if not existing_fts:
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
+            """)
+            fts_was_created = True
         conn.execute("""
             CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
@@ -99,7 +103,9 @@ def _init_db():
                 INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
             END
         """)
-        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        # 只有首次建表时才需要全量重建，后续由 trigger 增量维护
+        if fts_was_created:
+            conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         conn.commit()
     finally:
         conn.close()
@@ -356,45 +362,6 @@ async def main():
     conversation_id = str(uuid.uuid4())
     set_current_conversation_id(conversation_id)
 
-    # 新版LangChain Agent实现
-    model_name = os.getenv("LLM_MODEL", "gelab-zero-4b-preview")
-
-    # ── 后台服务异步启动（不阻塞主循环）──
-    import socket
-    EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "")
-
-    async def _start_embedding_server():
-        """异步启动 llama-server，返回是否就绪"""
-        if not EMBEDDING_MODEL_PATH or not os.path.exists(EMBEDDING_MODEL_PATH):
-            return False
-        _emb_port = 8080
-        try:
-            with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
-                return True
-        except (ConnectionRefusedError, OSError):
-            pass
-        try:
-            subprocess.Popen(
-                ["llama-server", "-m", EMBEDDING_MODEL_PATH,
-                 "--embedding", "-c", "8192", "--port", str(_emb_port),
-                 "--host", "0.0.0.0", "-np", "4", "-b", "2048", "-ub", "2048", "-t", "4"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            return False
-        loop = asyncio.get_event_loop()
-        for _ in range(40):
-            await asyncio.sleep(0.5)
-            try:
-                def _check():
-                    with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
-                        return True
-                if await loop.run_in_executor(None, _check):
-                    return True
-            except (ConnectionRefusedError, OSError):
-                pass
-        return False
-
     async def _start_body_server():
         """异步启动 3D 服务，返回 URL 或空串"""
         loop = asyncio.get_event_loop()
@@ -405,37 +372,32 @@ async def main():
         except Exception:
             return ""
 
-    # 并行启动两个服务（最多等 20 秒，不阻塞则立即返回）
-    embedding_ok, body_url = await asyncio.gather(
-        _start_embedding_server(),
-        _start_body_server(),
-    )
+    loop = asyncio.get_event_loop()
 
-    # 服务状态在 banner 上方显示
-    if embedding_ok:
-        ui.console.print("[dim green]✅ 语义记忆已就绪[/dim green]")
-    else:
-        ui.console.print("[dim yellow]⚠️  语义记忆未启动（记忆仅支持关键词匹配）[/dim yellow]")
-    if body_url:
-        ui.console.print(f"[dim green]✅ 3D 交互服务已就绪: {body_url}[/dim green]")
+    # 并行启动两个后台服务
+    from agent.embedding import start_embedding_server
+    embed_task = asyncio.ensure_future(asyncio.to_thread(start_embedding_server))
+    body_task = asyncio.ensure_future(_start_body_server())
+    await asyncio.gather(embed_task, body_task)
+    body_url = body_task.result()
 
-    # 补录缺失的向量索引
-    if embedding_ok and vector_store.embedding_client and vector_store.embedding_client.is_available():
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        try:
-            rows = conn.execute("SELECT id, content FROM messages WHERE role='memory'").fetchall()
-            existing = {str(r[0]) for r in conn.execute("SELECT id FROM embeddings").fetchall()}
-            missing = [r for r in rows if str(r[0]) not in existing]
-            if missing:
-                ui.console.print(f"[dim]补录 {len(missing)} 条缺失的向量索引...[/dim]")
-                for msg_id, content in missing:
-                    vector_store.add(msg_id, content)
-                ui.console.print("[dim green]向量索引补录完成[/dim green]")
-        finally:
-            conn.close()
+    # 显示 banner
+    model_name = os.getenv("LLM_MODEL", "gelab-zero-4b-preview")
+    ui.show_welcome_screen(model_name + " (LangChain)", body_url)
 
-    # 显示欢迎界面（banner）
-    ui.show_welcome_screen(model_name + " (LangChain)", body_url, embedding_ok=embedding_ok)
+    # 嵌入状态检测（语义检索为可选项，无模型直接跳过）
+    _emb_ok = False
+    _emb_enabled = embed_task.result()  # start_embedding_server 返回 True 表示有模型且已启动
+    if _emb_enabled and vector_store.embedding_client:
+        delay = 1
+        for i in range(4):  # 0s, 1s, 3s, 7s 指数退避
+            if i > 0:
+                await asyncio.sleep(delay)
+                delay *= 2
+            if await loop.run_in_executor(None, vector_store.embedding_client.is_available):
+                _emb_ok = True
+                break
+    ui.print_embed_status(_emb_ok)
 
     # 系统提示词直接从prompts模块导入
     base_system_prompt = system_base_prompt
@@ -590,8 +552,10 @@ async def main():
                 conversation_id = agent._default_thread_id
                 set_current_conversation_id(conversation_id)
                 # 清屏并重新显示欢迎界面
-                _emb_ok = vector_store.embedding_client.is_available() if vector_store.embedding_client else False
-                ui.show_welcome_screen(model_name + " (LangChain)", body_url, embedding_ok=_emb_ok)
+                ui.show_welcome_screen(model_name + " (LangChain)", body_url)
+                if vector_store.embedding_client:
+                    _emb_ok = await loop.run_in_executor(None, vector_store.embedding_client.is_available)
+                    ui.print_embed_status(_emb_ok)
                 continue
 
             if not user_input_stripped:
@@ -696,6 +660,8 @@ async def main():
         stop_body_server()
     except Exception:
         pass
+    from agent.embedding import stop_embedding_server
+    stop_embedding_server()
 
 
 if __name__ == "__main__":

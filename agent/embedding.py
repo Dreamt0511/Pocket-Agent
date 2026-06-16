@@ -8,10 +8,18 @@ embeddings 表只存向量（id + embedding BLOB），原始内容在 messages �
 
 import struct
 import json
+import os
+import time
+import socket
+import shutil
+import subprocess
 import sqlite3
 import requests
 import numpy as np
 from typing import List, Optional
+
+# 嵌入服务子进程引用（与 body server 的 _server_thread/_server_instance 模式一致）
+_embedding_process = None
 
 
 class EmbeddingClient:
@@ -21,23 +29,19 @@ class EmbeddingClient:
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.model = model
-        self._available: Optional[bool] = None
 
     def is_available(self) -> bool:
-        """检测 API 是否支持 embeddings（结果缓存）"""
-        if self._available is not None:
-            return self._available
+        """检测 API 是否支持 embeddings（本地服务，无缓存，每次直接检测）"""
         try:
             resp = requests.post(
                 f"{self.base_url}/embeddings",
                 json={"model": self.model, "input": "test"},
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=10
+                timeout=3
             )
-            self._available = resp.status_code == 200
+            return resp.status_code == 200
         except Exception:
-            self._available = False
-        return self._available
+            return False
 
     def embed(self, text: str) -> Optional[List[float]]:
         """生成单条文本的 embedding，超长时自动截断重试"""
@@ -169,7 +173,7 @@ class VectorStore:
             conversation_id: 过滤会话 ID
             msg_type: 过滤消息类型 (user/assistant/memory)
             days: 只返回最近 N 天的结果
-            memory_type: 过滤记忆类型 (fact/episodic)
+            memory_type: 过滤记忆类型 (fact/episodic/dance)
         Returns:
             [{"id": str, "distance": float}, ...]
         """
@@ -241,3 +245,71 @@ class VectorStore:
             conn.commit()
         finally:
             conn.close()
+
+
+# ── 嵌入服务启动/停止（与 body_control_tool 的 start/stop 模式一致）──
+
+def start_embedding_server(port: int = 8080) -> bool:
+    """启动 llama-server 嵌入服务。已运行则跳过，否则杀旧启新。
+
+    与 start_body_server() 模式一致：
+    - 检查是否已在运行 → 跳过
+    - 清理旧进程 → 启动新进程（带重试）
+    """
+    global _embedding_process
+
+    # 检查子进程是否还活着
+    if _embedding_process is not None and _embedding_process.poll() is None:
+        return True
+
+    emb_path = os.getenv("EMBEDDING_MODEL_PATH")
+    if not emb_path or not os.path.exists(emb_path):
+        return False
+    if not shutil.which("llama-server"):
+        return False
+
+    # 端口已被占用 → 说明有服务在跑，直接复用
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            _embedding_process = None  # 不是我们启动的，不管理生命周期
+            return True
+    except (ConnectionRefusedError, OSError):
+        pass
+
+    # 清理旧进程
+    stop_embedding_server()
+
+    # 启动新进程（若端口冲突则等 0.3s 重试一次，与 body server 的 OSError 重试一致）
+    for attempt in range(2):
+        try:
+            _embedding_process = subprocess.Popen(
+                ["llama-server", "-m", emb_path,
+                 "--embedding", "-c", "8192", "--port", str(port),
+                 "--host", "0.0.0.0", "-np", "4", "-b", "2048", "-ub", "2048", "-t", "4"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.3)
+    return False
+
+
+def stop_embedding_server():
+    """停止嵌入服务，释放端口"""
+    global _embedding_process
+    proc = _embedding_process
+    _embedding_process = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+    # 兜底：清理任何残留的 llama-server 进程
+    subprocess.run(["pkill", "-f", "llama-server.*8080"],
+                   timeout=2, stderr=subprocess.DEVNULL)

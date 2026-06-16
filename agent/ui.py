@@ -107,21 +107,17 @@ class PocketUI:
         """更新技能补全列表"""
         self._completer.update_skills(skills, descriptions)
 
-    def print_banner(self, model_name: str = "", body_url: str = "", embedding_ok: bool = False):
-        """打印首页横幅"""
-        model_line = f"\n{model_name}" if model_name else ""
-        body_line = f"\n前往 {body_url} 与机器人交互" if body_url else ""
-        embed_icon = "✅ 语义记忆已就绪" if embedding_ok else "⚠️  语义记忆未启动（记忆仅支持关键词匹配）"
+    def print_banner(self, model_name: str = "", body_url: str = ""):
+        """打印首页横幅（服务状态在外部单独打印，方便后台更新）"""
+        body_line = f"\n  3D交互: {body_url}" if body_url else ""
         banner = f"""
-
   █▀█ █▀█ █▀▀ █ █ █▀▀ ▀█▀   █▀█ █▀▀ █▀▀ █▀█ ▀█▀
- █▀▀ █ █ █   █▀▄ █▀▀  █    █▀█ █ █ █▀▀ █ █  █
- ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀  ▀    ▀ ▀ ▀▀▀ ▀▀▀ ▀ ▀  ▀
+  █▀▀ █ █ █   █▀▄ █▀▀  █    █▀█ █ █ █▀▀ █ █  █
+  ▀   ▀▀▀ ▀▀▀ ▀ ▀ ▀▀▀  ▀    ▀ ▀ ▀▀▀ ▀▀▀ ▀ ▀  ▀
+  轻量、快速、智能
 
   Pocket-Agent — 移动端AI代理帮手
-
-  轻量、快速、智能{model_line}{body_line}
-  {embed_icon}
+  {model_name}{body_line}
         """
 
         self.console.print(Panel(
@@ -129,8 +125,15 @@ class PocketUI:
             border_style="blue",
             padding=(1, 2)
         ))
-        # 底部指令提示（仅一开头打印一次）
+        # 底部指令提示
         self.console.print("[#666666]/resume 恢复会话 | /undo 撤回 | /clear 清屏 | q 退出 | ESC打断 | Tab补全[/#666666]")
+
+    def print_embed_status(self, ok: bool):
+        """打印嵌入服务状态行（暗灰色）"""
+        if ok:
+            self.console.print("[dim]  语义记忆就绪[/dim]")
+        else:
+            self.console.print("[dim]  语义记忆未就绪，仅关键词检索[/dim]")
 
     def print_tool_call(self, tool_name: str, params: dict):
         """打印工具调用"""
@@ -304,10 +307,10 @@ class PocketUI:
         """
         return ascii_art.strip()
 
-    def show_welcome_screen(self, model_name: str = "", body_url: str = "", embedding_ok: bool = False):
-        """显示欢迎界面 — 只保留蓝框横幅"""
+    def show_welcome_screen(self, model_name: str = "", body_url: str = ""):
+        """显示欢迎界面 — 蓝框横幅（嵌入状态由后台检测完成后单独打印）"""
         self.console.clear()
-        self.print_banner(model_name, body_url, embedding_ok=embedding_ok)
+        self.print_banner(model_name, body_url)
 
     def create_progress_display(self):
         """创建实时进度显示，使用Live组件实现单行更新"""

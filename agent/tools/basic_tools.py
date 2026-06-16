@@ -425,7 +425,7 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             for r in rows:
                 if r[0] not in seen_ids:
                     seen_ids.add(r[0])
-                    results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6]})
+                    results.append({"id": r[0], "conversation_id": r[1], "role": r[2], "content": r[3], "importance": r[4], "last_access_at": r[5], "timestamp": r[6], "memory_type": r[7] if len(r) > 7 else None})
 
         # 策略1: FTS5 trigram 搜索（>=3字符的关键词）
         long_keywords = [k for k in keywords if len(k) >= 3]
@@ -433,7 +433,7 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
             try:
                 fts_query = " OR ".join(long_keywords)
                 fts_rows = conn.execute(
-                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp, m.memory_type
                         FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
                         WHERE fts MATCH ?{fts_where_extra}
                         ORDER BY rank LIMIT 20""",
@@ -454,7 +454,7 @@ def _fts_search(query: str, conversation_id: str = None, days: int = None, msg_t
                 like_params = [f"%{k}%" for k in fallback_keywords]
                 like_clause = " OR ".join(like_conditions)
                 rows = conn.execute(
-                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp
+                    f"""SELECT m.id, m.conversation_id, m.role, m.content, m.importance, m.last_access_at, m.timestamp, m.memory_type
                         FROM messages m WHERE ({like_clause}){where_extra}
                         ORDER BY length(m.content) ASC, m.timestamp DESC LIMIT 20""",
                     like_params + params
@@ -499,14 +499,14 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
         try:
             placeholders = ",".join(["?"] * len(ids))
             rows = conn.execute(
-                f"SELECT id, conversation_id, role, content, importance, last_access_at, timestamp FROM messages WHERE id IN ({placeholders})",
+                f"SELECT id, conversation_id, role, content, importance, last_access_at, timestamp, memory_type FROM messages WHERE id IN ({placeholders})",
                 ids
             ).fetchall()
         finally:
             conn.close()
 
         results = []
-        for row_id, conv_id, role, content, importance, last_access, ts in rows:
+        for row_id, conv_id, role, content, importance, last_access, ts, mem_type in rows:
             results.append({
                 "id": row_id,
                 "role": role,
@@ -514,6 +514,7 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
                 "conversation_id": conv_id,
                 "importance": importance or 3,
                 "last_access_at": last_access or 0,
+                "memory_type": mem_type,
                 "similarity": 1 - id_to_distance.get(str(row_id), 0),
             })
 
@@ -533,14 +534,14 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 3
 
     # FTS5 结果按 rank 排序
     for rank, msg in enumerate(fts_results):
-        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        key = msg.get("id")
         rrf_score = 1 / (k + rank + 1)
         scores[key] = {"rrf": rrf_score, "msg": msg}
 
     # 向量结果按 similarity 排序（similarity 越高越靠前）
     sorted_vec = sorted(vec_results, key=lambda x: x.get("similarity", 0), reverse=True)
     for rank, msg in enumerate(sorted_vec):
-        key = (msg.get("conversation_id", ""), msg.get("content", "")[:50])
+        key = msg.get("id")
         rrf_score = 1 / (k + rank + 1)
         if key in scores:
             scores[key]["rrf"] += rrf_score
@@ -765,7 +766,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 
     Args:
         content: 要记忆的内容，简洁明确
-        type: "fact" 事实记忆（用户偏好、技术决定、知识性信息），"episodic" 事件记忆（操作结果、问题解决方案、时间相关事件）。两者都同时存入消息表（支持关键词搜索）和向量数据库（支持语义搜索）。
+        type: "fact" 事实记忆（用户偏好、技术决定、知识性信息），"episodic" 事件记忆（操作结果、问题解决方案、时间相关事件），"dance" 舞蹈动作记忆（编舞数据、动作序列、姿态信息）。三者都同时存入消息表（支持关键词搜索）和向量数据库（支持语义搜索）。
         importance: 重要性 1-10，自行判断打分。大多数记忆应在 3-5 分，只有真正影响后续决策的才值得 7 分以上。
 
         打分参考（仅供大致参考，不必死板遵守）：
@@ -781,8 +782,8 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
     try:
         current_timestamp = int(time.time() * 1000)
 
-        if type not in ("fact", "episodic"):
-            return "type 必须是 'fact' 或 'episodic'"
+        if type not in ("fact", "episodic", "dance"):
+            return "type 必须是 'fact'、'episodic' 或 'dance'"
 
         if not _current_conversation_id:
             return "保存失败: 需要 conversation_id（请在会话中调用）"
@@ -813,7 +814,7 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
             _vector_store_ref.add(message_id=msg_id, text=embed_text)
 
         elapsed = round(time.monotonic() - t0, 2)
-        label = "事实记忆" if type == "fact" else "事件记忆"
+        label = {"fact": "事实记忆", "episodic": "事件记忆", "dance": "舞蹈动作记忆"}.get(type, "记忆")
         return f"已保存{label}: {content[:50]}... (耗时 {elapsed}s)"
 
     except Exception as e:
@@ -825,11 +826,11 @@ def save_memory(content: str, type: str = "fact", importance: int = 5) -> str:
 def search_memory(query: str, scope: str = "memory", memory_type: str = None, days: int = None) -> str:
     """深度搜索历史记忆，找回上下文中没有的细节。
 
-    系统已自动为你注入了 top 3 相关记忆到上下文中（标记为 [相关记忆]）。
+    系统已自动为你注入了 top 3 相关记忆到上下文中（标记为 [相关记忆]），**但不包含舞蹈类记忆（dance）**，防止 token 浪费。
     以下情况需要你主动调用本工具深入搜索：
     - 上下文中的 [相关记忆] 不够用，需要更多记忆
     - 用户明确提到"之前""上次""记得"，需要精准回溯
-    - 需要按类型过滤（只搜事实/只搜事件）
+    - 需要按类型过滤（只搜事实/只搜事件/只搜舞蹈动作）
     - 需要按时间过滤（最近 7 天）
     - 搜索当前会话的原始对话（scope="session"）
 
@@ -839,12 +840,13 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
       - memory_type=None: 不限类型，搜全部记忆
       - memory_type="fact": 只搜事实记忆（用户偏好、技术决定、知识性信息）
       - memory_type="episodic": 只搜事件记忆（操作结果、问题解决方案、时间相关事件）
+      - memory_type="dance": 只搜舞蹈动作记忆（编舞数据、动作序列、姿态信息）
     - days=7: 只返回过去 7 天内的结果
 
     Args:
         query: 搜索内容。优先用完整句子（如"用户之前提到的实习安排"），保留语义信息搜索更准。
         scope: "memory"（默认）搜跨会话记忆，"session" 搜当前会话原始对话。
-        memory_type: 记忆类型过滤，仅 scope="memory" 时生效。"fact" 只搜事实，"episodic" 只搜事件，不传则全部。
+        memory_type: 记忆类型过滤，仅 scope="memory" 时生效。"fact"/"episodic"/"dance"，不传则全部。
         days: 时间过滤，只返回过去 N 天内的结果。
     """
     # 容错：清理 scope 参数中的引号和空格

@@ -720,12 +720,17 @@ class LangChainPocketAgent:
             results = await loop.run_in_executor(None, _do_search)
             if not results:
                 return ""
+            # 过滤舞蹈类记忆（数据量大，浪费 token；agent 可用 search_memory 显式检索）
             lines = []
             for r in results:
+                if r.get("memory_type") == "dance":
+                    continue
                 content = r["content"]
                 if len(content) > 150:
                     content = content[:150] + "..."
                 lines.append(f"- {content}")
+            if not lines:
+                return ""
             return "[相关记忆]\n" + "\n".join(lines)
         except Exception:
             return ""

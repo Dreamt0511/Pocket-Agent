@@ -13,6 +13,7 @@ warnings.filterwarnings("ignore", message=".*allowed_objects will change.*")
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 import time
+import asyncio
 import contextlib
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -106,15 +107,19 @@ async def _init_db():
         existing_fts = await db.execute_fetchall(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
         )
+        fts_was_created = False
         if existing_fts and "trigram" not in (existing_fts[0][0] or ""):
             # 旧表需要重建
             await db.execute("DROP TABLE IF EXISTS messages_fts")
             await db.execute("DROP TRIGGER IF EXISTS messages_fts_ai")
             await db.execute("DROP TRIGGER IF EXISTS messages_fts_ad")
             await db.execute("DROP TRIGGER IF EXISTS messages_fts_au")
-        await db.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
-        """)
+            existing_fts = []  # 标记为不存在，重新建表
+        if not existing_fts:
+            await db.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id, tokenize='trigram')
+            """)
+            fts_was_created = True
         # INSERT 同步触发器
         await db.execute("""
             CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
@@ -134,8 +139,9 @@ async def _init_db():
                 INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
             END
         """)
-        # 重建 FTS 索引（确保数据一致）
-        await db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        # 只有首次建表才需要全量重建，后续由 trigger 增量维护
+        if fts_was_created:
+            await db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
 
         await db.commit()
 
@@ -186,48 +192,9 @@ async def startup():
         _checkpoint_saver = MemorySaver()
         logger.info("MemorySaver checkpoint 已初始化（会话历史不持久化）")
 
-    # 自动拉起 llama-server embedding 服务（安卓版 bash 脚本可能已启动，检测端口避免重复）
-    from agent.config import EMBEDDING_MODEL_PATH, EMBEDDING_SERVER_URL as _EMB_URL
-    if EMBEDDING_MODEL_PATH and os.path.exists(EMBEDDING_MODEL_PATH):
-        import socket
-        _emb_port = int(_EMB_URL.split(":")[-1].split("/")[0]) if _EMB_URL else 8080
-        _port_in_use = False
-        try:
-            with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
-                _port_in_use = True
-        except (ConnectionRefusedError, OSError):
-            pass
-        if not _port_in_use:
-            # 端口未占用 → 可能 bash 脚本还在 sleep，等 3 秒再查一次
-            import asyncio
-            await asyncio.sleep(3)
-            try:
-                with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
-                    _port_in_use = True
-            except (ConnectionRefusedError, OSError):
-                pass
-        if _port_in_use:
-            logger.info(f"llama-server 已在端口 {_emb_port} 运行")
-        else:
-            try:
-                subprocess.Popen(
-                    ["llama-server", "-m", EMBEDDING_MODEL_PATH,
-                     "--embedding", "-c", "8192", "--port", str(_emb_port),
-                     "--host", "0.0.0.0", "-np", "4", "-b", "2048", "-ub", "2048", "-t", "4"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                for _ in range(30):
-                    time.sleep(0.5)
-                    try:
-                        with socket.create_connection(("127.0.0.1", _emb_port), timeout=1):
-                            break
-                    except (ConnectionRefusedError, OSError):
-                        pass
-                logger.info(f"llama-server 已启动 (port={_emb_port})")
-            except Exception as e:
-                logger.warning(f"llama-server 启动失败: {e}")
-    else:
-        logger.info("EMBEDDING_MODEL_PATH 未配置或文件不存在，跳过 embedding 服务启动")
+    # 启动嵌入服务（与 body server 模式一致）
+    from agent.embedding import start_embedding_server
+    asyncio.ensure_future(asyncio.to_thread(start_embedding_server))
 
     # 初始化 SQLite 向量存储（BGE-M3 本地 embedding）
     from agent.embedding import EmbeddingClient, VectorStore
@@ -248,9 +215,8 @@ async def startup():
     set_memory_refs(_vector_store, DB_PATH)
     logger.info("SQLite 向量存储已初始化")
 
-    # 补录缺失的 embeddings（向量索引缺失时，从 messages 取内容生成向量）
-    if _vector_store and _vector_store.embedding_client and _vector_store.embedding_client.is_available():
-        async with get_db() as db:
+    # 补录缺失的 embeddings（add() 内部会检查嵌入服务是否就绪，没就绪自动跳过）
+    async with get_db() as db:
             rows = await db.execute_fetchall(
                 "SELECT id, content FROM messages WHERE role = 'memory'"
             )
@@ -275,7 +241,8 @@ async def startup():
                 logger.info(f"心跳超时 {_HEARTBEAT_TIMEOUT}s，自动关闭服务")
                 # 停止 llama-server embedding 服务
                 try:
-                    subprocess.run(["sh", "-c", "pkill -f 'llama-server.*8080' 2>/dev/null || kill $(pgrep -f 'llama-server.*8080') 2>/dev/null"], timeout=3)
+                    from agent.embedding import stop_embedding_server
+                    stop_embedding_server()
                 except Exception:
                     pass
                 os.kill(os.getpid(), signal.SIGTERM)
@@ -1081,7 +1048,8 @@ async def shutdown():
             pass
     # 停止 llama-server embedding 服务
     try:
-        subprocess.run(["pkill", "-f", "llama-server.*8080"], timeout=3)
+        from agent.embedding import stop_embedding_server
+        stop_embedding_server()
     except Exception:
         pass
     async def _die():
