@@ -1,6 +1,6 @@
 # Pocket-Agent
 
-**[在线文档](https://Dreamt0511.github.io/Pocket-Agent/)** | 轻量级移动端 AI Agent，支持在手机（Termux/Android）和服务器上运行。基于 LangChain + LangGraph 构建，支持手机自动化控制、3D 虚拟身体交互、工具调用、子 Agent 委托、技能系统、分层记忆和语音播报。
+轻量级移动端 AI Agent，支持在手机（Termux/Android）和服务器上运行。基于 LangChain + LangGraph 构建，支持手机自动化控制、3D 虚拟身体交互、工具调用、子 Agent 委托、技能系统、分层记忆和语音播报。
 
 <p align="center">
   <img src="docs/screenshot-terminal.jpg" width="32%" alt="Termux 终端 UI" />
@@ -11,12 +11,14 @@
   <em>终端交互模式 &nbsp;|&nbsp; 3D 网页界面 &nbsp;|&nbsp; Agent 自主 3D 动作演示</em>
 </p>
 
+**[在线文档](https://Dreamt0511.github.io/Pocket-Agent/)**
+
 ## 特性
 
 - **手机自动化控制**：通过 NeuralBridge 协议直接操控安卓设备——点击、滑动、输入、截图、获取 UI 树，可自动执行复杂的多步手机操作任务
 - **3D 虚拟身体控制**：Agent 可自主控制 3D 身体模型（挥手、跳舞、点头等），通过提示词实时编排动作，无需预设；配套 Three.js 网页端实时渲染
 - **浏览器双向交互**：Agent 通过 SSE 与浏览器页面实时通信，Web 页面可发送消息给 Agent 并接收回复，3D 模型页面也集成聊天入口
-- **子 Agent 系统**：主 Agent 可将复杂手机操作任务委托给子 Agent 同步接管执行，子 Agent 获得完整操作权限后自主完成多步任务，执行结果返回主 Agent
+- **子 Agent 系统**：主 Agent 可将复杂手机操作任务委托给子 Agent，页面由子 Agent 同步接管执行，子 Agent 获得完整操作权限后自主完成多步任务
 - **分层记忆系统**：用户画像 + 事实记忆 + 事件记忆，基于 FTS5 + 向量搜索 + RRF 融合排序，跨会话持久化
 - **技能系统**：自动发现 SKILL.md 知识文档，Agent 按需阅读并按指南执行任务，支持主 Agent、子 Agent、自动沉淀三种技能类型
 - **LangChain Agent**：基于官方 `create_agent` 构建，支持中间件链（上下文压缩、模型调用限制等），支持 OpenAI / Ollama / 本地模型
@@ -40,11 +42,24 @@ pip install -r requirements.txt
 DEFAULT_LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o
+LLM_TEMPERATURE=0.7
+LLM_MAX_TOKENS=8000
+
+# 子 Agent 配置（可选，默认与主 Agent 共用模型）
+# EXECUTOR_LLM_BASE_URL=http://127.0.0.1:11434/v1
+# EXECUTOR_API_KEY=ollama
+# EXECUTOR_MODEL=qwen2.5:7b
+# EXECUTOR_TEMPERATURE=0.3
+# EXECUTOR_MAX_TOKENS=8192
 
 # Embedding 配置（本地 llama-server）
 EMBEDDING_SERVER_URL=http://127.0.0.1:8080/v1
 EMBEDDING_MODEL=bge-m3
 EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
+
+# Embedding 远程 API（可选，使用远程服务时填写）
+# EMBEDDING_BASE_URL=https://api.openai.com/v1
+# EMBEDDING_API_KEY=sk-xxx
 
 # MCP 服务
 MCP_SERVER_URL=http://127.0.0.1:7474/mcp
@@ -117,7 +132,7 @@ cd ~/llama.cpp && ./build/bin/llama-server \
 
 1. `main.py` 加载 `.env` → 创建 `LangChainPocketAgent`（内部初始化 LLM + `create_agent` + 中间件链 + MemorySaver）→ 启动对话循环
 2. 用户输入 → `agent.run_conversation()` → LangGraph astream 处理 → 工具调用 / 流式输出 → 返回结果
-3. 主 Agent 调用 `delegate_task` 后，任务进入待执行队列 → 主 Agent 流结束后，**子 Agent 前台同步接管**，执行完所有步骤后返回主 Agent
+3. 主 Agent 调用 `delegate_task` 后，任务进入待执行队列 → 主 Agent 流结束后，**子 Agent 前台同步接管**页面，自主执行完所有步骤
 4. 对话历史通过 LangGraph AsyncSqliteSaver 持久化
 
 ### 中间件链
@@ -188,12 +203,12 @@ update_user_profile(section="偏好设置", content="喜欢简洁的回答风格
 
 ## 子 Agent 系统
 
-主 Agent 可通过 `delegate_task` 将复杂手机操作任务委托给子 Agent 执行。子 Agent 会同步接管任务，自主完成所有操作步骤后返回结果给主 Agent。
+主 Agent 可通过 `delegate_task` 将复杂手机操作任务委托给子 Agent 执行。任务交接后页面由子 Agent 同步接管，子 Agent 自主完成所有操作步骤。
 
 - 子 Agent 拥有独立的系统提示词和执行权限，可完整操作手机（点击、滑动、输入等）
 - 子 Agent 默认与主 Agent 共用模型，也可通过环境变量独立配置（`EXECUTOR_LLM_BASE_URL` 等）
 - 子 Agent 技能存放在 `agent/skills/executor-skills/`，主 Agent 技能存放在 `agent/skills/main-skills/`
-- 子 Agent 执行结果自动返回主 Agent，执行过程通过任务文件（`/tmp/agent_task_*.json`）管理
+- 子 Agent 执行过程通过任务文件（`/tmp/agent_task_*.json`）管理
 
 ## 3D 身体控制
 
@@ -317,6 +332,8 @@ curl -X DELETE "http://localhost:8000/messages/{message_id}"
 | `EXECUTOR_LLM_BASE_URL` | 子 Agent LLM 地址（可选，默认与主 Agent 共用） |
 | `EXECUTOR_API_KEY` | 子 Agent API 密钥 |
 | `EXECUTOR_MODEL` | 子 Agent 模型名称 |
+| `EXECUTOR_TEMPERATURE` | 子 Agent 生成温度（默认 0.3） |
+| `EXECUTOR_MAX_TOKENS` | 子 Agent 单次生成最大 token 数（默认 8192） |
 | `EMBEDDING_SERVER_URL` | 本地 embedding 服务地址（默认 localhost:8080） |
 | `EMBEDDING_MODEL` | Embedding 模型名称 |
 | `EMBEDDING_MODEL_PATH` | GGUF 模型文件绝对路径，App 据此自动拉起 llama-server |
