@@ -1,0 +1,241 @@
+对话会话的管理和流式输出是 Pocket-Agent 面向用户交互的核心设计。系统以对话会话（Conversation）为基本单位，将一次完整的用户-AI 交互抽象为从创建、上下文恢复、流式执行到持久化的全生命周期流程。本文聚焦于两个并行运行模式（终端交互与 HTTP API）中对话生命周期的统一管理，以及贯穿其中的结构化流式输出机制。
+
+## 架构全景：终端与 API 的双模对话管理
+
+Pocket-Agent 支持两种交互模式——终端模式（`main.py`）和 HTTP API 模式（`app.py`），两者共用同一套对话管理基础设施：`pocket_agent.db`（SQLite）作为持久化层，`agent/agent_langchain.py` 中的 `LangChainPocketAgent` 作为核心引擎。
+
+```mermaid
+flowchart TB
+    subgraph "终端模式 main.py"
+        TUI[Rich UI + prompt_toolkit]
+        TLOOP[主循环: 等待输入→执行→显示]
+    end
+
+    subgraph "API 模式 app.py"
+        FAST[FastAPI /chat 端点]
+        SSE[SSE Stream: text/event-stream]
+    end
+
+    subgraph "核心引擎 agent/agent_langchain.py"
+        AGENT[LangChainPocketAgent]
+        RUN[run_conversation]
+        STREAM[stream_conversation]
+        CHECK[Checkpointer: AsyncSqliteSaver/MemorySaver]
+    end
+
+    subgraph "持久化层 pocket_agent.db"
+        CONV[(conversations 表)]
+        MSG[(messages 表)]
+        CKPT[(checkpoints / writes 表)]
+        FTS[FTS5 全文索引]
+    end
+
+    subgraph "上下文注入"
+        PROFILE[用户画像]
+        ENV[环境感知缓存]
+        MEM[记忆检索 RRF 融合]
+    end
+
+    TUI --> TLOOP --> RUN
+    FAST --> SSE --> STREAM
+    RUN --> AGENT
+    STREAM --> AGENT
+    AGENT --> CHECK --> CKPT
+    AGENT --> CONV
+    AGENT --> MSG
+    AGENT --> PROFILE
+    AGENT --> ENV
+    AGENT --> MEM --> FTS
+```
+
+该架构的核心在于**对话会话（conversation_id）即 LangGraph thread_id**——两者语义等价，通过同一个 UUID 关联 SQLite 中的消息记录与 LangGraph Checkpoint 中的执行状态。这种设计使得终端模式和 API 模式可以无缝切换：终端中创建的会话可以在 API 中通过相同的 `conversation_id` 继续对话。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L524-L560), [main.py](main.py#L349-L437), [app.py](app.py#L465-L506)
+
+## 对话生命周期五阶段
+
+### 第一阶段：会话创建与标识统一
+
+会话的创建发生在用户发送第一条消息时。`main.py` 每次启动生成一个 UUID v4 作为 `conversation_id`，同时将其传递给 `LangChainPocketAgent` 的 `thread_id` 参数，确保两个系统的标识一致：
+
+```python
+conversation_id = str(uuid.uuid4())
+set_current_conversation_id(conversation_id)
+agent = LangChainPocketAgent(
+    thread_id=conversation_id,  # 与 conversation_id 相同
+    ...
+)
+```
+
+API 模式下，`conversation_id` 由客户端传入 `/chat` 请求体，默认为 `"default-session"`。两种模式下，会话记录都通过 `_ensure_conversation()` 写入 `conversations` 表（含 `id`、`title`、`created_at`、`updated_at` 字段），其中标题使用第一条用户消息的前 20 个字符自动生成。
+
+Sources: [main.py](main.py#L160-L180), [main.py](main.py#L361-L363), [app.py](app.py#L483-L506)
+
+### 第二阶段：上下文重建与环境注入
+
+每次对话执行前，系统会从三个维度重建上下文：
+
+**（1）对话历史加载**：终端模式通过 `_load_history()` 从 SQLite 按时间戳顺序加载历史消息；API 模式在每次 `/chat` 请求中将历史消息注入到 `stream_conversation` 的 `history` 参数中。两种方式最终都构建为 `HumanMessage` / `AIMessage` 列表，作为 LangGraph 的初始消息输入。
+
+**（2）三层上下文注入**：在 `stream_conversation` 和 `run_conversation` 中，用户消息会与三类上下文合并——用户画像（`self._user_profile`，从 `LongTermMemory` 加载）、环境感知标签（`_cached_env_tag`，通过 Termux API 采集的光照、加速度、电量、位置等传感器数据）、相关记忆（`_search_relevant_memories`，通过 RRF 融合 FTS5 全文搜索与向量余弦相似度检索）。合并后的消息格式为：
+
+```
+{用户画像}
+
+{环境感知标签}
+
+{相关记忆}
+
+---
+{用户原始消息}
+```
+
+**（3）Checkpoint 状态恢复**：LangGraph 的 Checkpoint 机制会在每次执行后保存完整的消息历史和 agent 状态。当 `AsyncSqliteSaver` 可用时（默认），下次对话通过相同的 `thread_id`（即 `conversation_id`）自动恢复上一次的执行状态，确保多轮对话的连续性。若 `AsyncSqliteSaver` 初始化失败，降级为 `MemorySaver`（内存级，重启后丢失）。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1299-L1325), [agent/agent_langchain.py](agent/agent_langchain.py#L711-L720), [app.py](app.py#L179-L193), [main.py](main.py#L213-L238)
+
+### 第三阶段：流式执行与去重机制
+
+执行阶段的核心是 `agent.astream(stream_mode=["messages", "updates", "custom"])`，它同时返回三种事件流：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Agent as LangChainPocketAgent
+    participant LLM as 大语言模型
+    participant Tools as 工具系统
+    participant DB as SQLite
+
+    User->>Agent: 发送消息
+    Agent->>Agent: 三层上下文注入
+    Agent->>LLM: astream(stream_mode=["messages","updates","custom"])
+    
+    alt 生成文本（node == "model"）
+        LLM-->>Agent: AIMessageChunk（增量文本）
+        Agent->>Agent: 去重检测
+        Agent-->>User: yield {"type": "token", "content": str}
+    end
+    
+    alt 工具调用（source == "model"）
+        LLM-->>Agent: tool_calls 检出
+        Agent-->>User: yield {"type": "tool_start", "name", "args"}
+        Agent->>Tools: 执行工具
+        Tools-->>Agent: ToolMessage
+        Agent-->>User: yield {"type": "tool_end", "name"}
+    end
+    
+    alt 子Agent委托
+        Agent->>Agent: consume_pending_tasks()
+        Agent->>SubAgent: _run_executor_foreground()
+        SubAgent-->>User: yield 子Agent事件
+    end
+    
+    Agent->>Agent: 后处理去重（检测重复前缀）
+    Agent->>DB: 保存完整响应
+    Agent-->>User: yield {"type": "done", "response", "elapsed"}
+```
+
+流式执行中包含两层去重机制：
+
+- **运行时去重**：当 `full_response` 积累超过 100 字符且当前 chunk >= 15 字符时，检查 chunk 的前 30 字符是否在最近 400 字符窗口中出现过。若命中则跳过该 chunk，防止工具调用后模型重复生成相同内容。
+- **后处理去重**：完整响应生成后，取前 80 字符在后续文本中查找第二次出现位置，若有则截断。这处理了模型在工具调用（如 `tts_speak`）后重新生成全部内容的场景。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1327-L1471), [agent/agent_langchain.py](agent/agent_langchain.py#L1362-L1367), [agent/agent_langchain.py](agent/agent_langchain.py#L1464-L1471)
+
+### 第四阶段：子 Agent 前台执行
+
+主 Agent 调用 `delegate_task` 工具后，产生的任务描述文件会被 `consume_pending_tasks()` 消费。在主流程结束后（流式生成完成之后），如果有待处理的子 Agent 任务，系统会立即**同步前台执行**——调用 `_run_executor_foreground()` 创建一个新的子 Agent（使用独立的 `executor` 配置和技能列表），并将子 Agent 的执行进度（状态、工具调用、输出）同样以结构化事件形式 yield 给调用方。
+
+子 Agent 执行完成后，主 Agent 会清理与 `delegate_task` 相关的工具调用消息（通过 `RemoveMessage`），避免下次对话时因格式问题导致 API 400 错误。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1419-L1462), [agent/agent_langchain.py](agent/agent_langchain.py#L1595-L1600)
+
+### 第五阶段：持久化与状态清理
+
+对话完成后，系统执行以下持久化操作：
+
+- **AI 响应持久化**：完整响应（含工具调用标记）写入 `messages` 表，`role` 为 `"assistant"`。终端模式在 `run_conversation` 结束后由主循环调用 `_save_message()` 保存；API 模式在 SSE generate 函数的 finally 块中保存。
+- **日志记录**：通过 `AgentLogger` 记录对话的 `conv_task_id`、工具调用次数、总耗时等信息到按天归档的日志文件。
+- **环境缓存刷新**：通过 `asyncio.create_task` 后台异步刷新环境感知缓存，为下一次对话做准备。
+- **会话时间更新**：更新 `conversations` 表的 `updated_at` 字段为当前时间戳。
+
+```mermaid
+flowchart LR
+    A[AI 回复完成] --> B{响应内容?}
+    B -->|有内容| C[保存到 messages 表\nrole='assistant']
+    C --> D[更新 conversations.updated_at]
+    B -->|空内容| E[跳过保存]
+    D --> F[记录结构化日志]
+    F --> G[后台刷新环境缓存]
+    G --> H[清理 delegate_task 消息]
+```
+
+Sources: [main.py](main.py#L578-L579), [app.py](app.py#L573-L586), [agent/agent_langchain.py](agent/agent_langchain.py#L1490-L1501)
+
+## 双模式流式输出架构
+
+### 终端模式：Rich Live Markdown 流式渲染
+
+`run_conversation()` 方法专为终端场景设计，提供 Markdown 实时渲染能力：
+
+- **进度动画**：执行开始时，通过 `Rich Progress` 显示 `SpinnerColumn + TextColumn` 的"思考中"动画，每次收到 chunk 自动刷新动画时间。
+- **Live Markdown**：首次收到内容 token 时，关闭 Progress，启动 `Live(Markdown(""))` 实时渲染面板。每次增量更新后将 `full_response` 作为 Markdown 全量重新渲染，刷新率 10fps。
+- **工具调用行内显示**：工具调用发生时，直接在终端打印 `[cyan]🔧 调用: tool_name(args)[/cyan]`。
+- **ESC 中断**：通过 `termios` 设置原始输入模式，配合 `loop.add_reader` 监听终端输入中的 `\x1b`（ESC 键），检测到后调用 `current_task.cancel()` 触发 `asyncio.CancelledError`，干净退出。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L977-L1120), [main.py](main.py#L586-L631)
+
+### API 模式：SSE 结构化事件流
+
+`stream_conversation()` 方法专为 HTTP API 设计，返回 `AsyncGenerator[dict, None]`，生成的结构化事件字典直接映射为 SSE 数据帧：
+
+| 事件类型 | 触发时机 | 数据格式 |
+|---------|---------|---------|
+| `token` | AI 生成文本时（增量） | `{"type": "token", "content": str}` |
+| `tool_start` | 模型决定调用工具时 | `{"type": "tool_start", "name": str, "args": dict, "args_display": str}` |
+| `tool_end` | 工具执行完成时 | `{"type": "tool_end", "name": str, "args_display": str}` |
+| `thinking` | 模型思考或正在推理时 | `{"type": "thinking"}` |
+| `progress` | 工具执行进度推送 | `{"type": "progress", "message": str}` |
+| `done` | 完整响应完成时 | `{"type": "done", "response": str, "success": bool, "tool_calls": int, "elapsed": int}` |
+| `error` | 执行出错或超时时 | `{"type": "error", "message": str}` |
+
+SSE 响应头配置为 `text/event-stream`，带有 `Cache-Control: no-cache`、`X-Accel-Buffering: no` 等关键标头以禁用代理缓冲。生成器开始时强制发送 `":ok\n\n"` 和 `"retry: 1000\n\n"` 两个 SSE comment 以触发响应头立即发送，避免客户端超时。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1269-L1522), [app.py](app.py#L512-L596)
+
+### 3D 身体浏览器流式推送
+
+浏览器交互模式（通过浏览器 3D 界面输入）使用独立的流式推送通道——`push_response_event`。主循环中的 `browser_message_loop()` 监听浏览器事件，收到消息后调用 `agent.stream_conversation()`，并将每个事件类型映射为 `push_response_event(type, data)` 调用，通过全局事件队列推送到前端 Three.js 渲染页面的 SSE 连接。
+
+Sources: [main.py](main.py#L454-L491)
+
+## 会话切换与历史管理
+
+`LangChainPocketAgent` 提供了三种会话操作原语：
+
+- **`switch_conversation(thread_id)`**：切换到指定会话。使用 `_thread_id_map` 记录旧会话的映射关系，确保新会话的 thread_id 不会指向已清空的历史。这用于 `main.py` 中的 `/resume` 命令，用户选择历史会话后，agent 切换到对应 thread_id，后续对话自动从 checkpoint 恢复上下文。
+- **`clear_history(thread_id)`**：清空指定会话的历史。实际通过为会话生成新的 UUID 来替代旧的 thread_id，旧历史因线程 ID 失效而自动不被 LangGraph 加载。用于 `/undo` 和 `/clear` 命令。
+- **`cancel()`**：设置 `_cancel_requested = True`，`stream_conversation` 和 `run_conversation` 中的 `_check_cancel()` 在每次 chunk 处理前检查该标志，若为 True 则中断循环。API 模式通过 `/cancel` 端点触发此方法。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1524-L1562), [main.py](main.py#L321-L346), [app.py](app.py#L1017-L1031)
+
+## 设计要点总结
+
+| 维度 | 终端模式 (main.py) | API 模式 (app.py) |
+|------|-------------------|-------------------|
+| 流式引擎 | `run_conversation()` | `stream_conversation()` |
+| 前端渲染 | Rich Live Markdown（10fps） | SSE 事件流 → 客户端自定义渲染 |
+| 进度反馈 | Progress 动画 + 行内工具日志 | `[TOOL]` 前缀的 SSE 事件 |
+| 中断机制 | ESC 键 → termios 原始模式 → task.cancel() | `/cancel` HTTP 端点 |
+| 历史加载 | `_load_history()` 同步 SQLite 查询 | `stream_conversation(history=...)` 传入 |
+| 响应持久化 | 主循环中 `_save_message()` | SSE generate() finally 块中保存 |
+| 错误处理 | 异常捕获 → 打印错误 → 继续循环 | SSE `[ERROR]` 事件 → `[DONE]` 结束 |
+| 会话切换 | `/resume` 命令 → `switch_conversation()` | `/clear_history` API → `clear_history()` |
+
+这一双模式架构的核心优势在于：**`stream_conversation()` 作为统一的流式事件生成器**，终端和 API 仅是在该事件流上挂载不同的"渲染器"——终端渲染器将 token 事件渲染为 Markdown 面板，而 API 渲染器将事件序列化为 SSE 数据帧。子 Agent 执行、工具调用进度、记忆检索等所有扩展功能都复用同一套事件模型，确保两种模式下用户体验一致。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L941-L1008), [agent/agent_langchain.py](agent/agent_langchain.py#L1269-L1327), [main.py](main.py#L583-L647), [app.py](app.py#L512-L596)
+
+---
+
+> **下一步阅读**：继续了解对话持久化的底层实现，请参阅 [LangGraph Checkpoint 持久化（AsyncSqliteSaver）](14-langgraph-checkpoint-chi-jiu-hua-asyncsqlitesaver)；若想深入了解上下文压缩与重复检测的中间件机制，参阅 [中间件链深度解析](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi)。

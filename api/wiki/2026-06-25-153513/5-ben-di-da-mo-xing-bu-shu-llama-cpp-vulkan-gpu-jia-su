@@ -1,0 +1,435 @@
+> 本页详述如何在 Android Termux 环境中编译部署 llama.cpp，启用 Vulkan GPU 加速，并与 Pocket-Agent 集成。这是实现**完全离线、隐私安全**的本地 AI 助手的核心基础设施。
+
+## 架构概览：llama.cpp 在 Pocket-Agent 中的定位
+
+Pocket-Agent 的 LLM 后端采用**分层可替换**架构：上层 Agent 逻辑通过 OpenAI 兼容的 HTTP API 消费模型能力，下层可自由切换云端 API 或本地 llama.cpp 服务。这种解耦设计使得在手机端部署大模型时，代码层面无需任何改动——只需将 `.env` 中的 API Base URL 指向本地 `llama-server` 即可。
+
+```mermaid
+flowchart TB
+    subgraph "Pocket-Agent 应用层"
+        A[main.py / app.py]
+        B[agent_langchain.py<br/>LangChain Agent]
+        C[prompts + memory + tools]
+    end
+
+    subgraph "LLM 接口层"
+        D[OpenAI 兼容 HTTP API]
+        E[base_url + api_key + model<br/>配置于 .env]
+    end
+
+    subgraph "后端实现"
+        F["云端 API<br/>(DeepSeek / LongCat / ...)"]
+        G["本地 llama-server<br/>(llama.cpp Vulkan)"]
+    end
+
+    subgraph "硬件层"
+        H[Adreno GPU / Vulkan]
+        I[CPU / RAM]
+    end
+
+    A --> B --> C
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    G --> H
+    G --> I
+```
+
+**核心设计原则**：Agent 代码与 LLM 实现完全解耦。本地模型仅通过 `llama-server` 暴露 HTTP 端点，对 Agent 层透明。这意味着同一套代码、提示词和工具系统，在本地模型和云端 API 之间切换仅需修改 `.env` 的三行配置。
+
+Sources: [agent/config.py](agent/config.py#L1-L107), [docs/00-运行说明.md](docs/00-运行说明.md#L1-L111), [.env.example](.env.example#L1-L38)
+
+---
+
+## 前置条件
+
+在开始编译部署之前，请确认你的设备满足以下要求：
+
+| 项目 | 最低要求 | 推荐配置 |
+|------|----------|----------|
+| 芯片 | 骁龙 8 系列（Adreno GPU） | 骁龙 8 至尊版 / 骁龙 8 Gen 3+ |
+| RAM | 8GB | 12GB+（16GB 最优） |
+| 系统 | Android 10+ | Android 13+ |
+| Termux | F-Droid 版本 | 最新版 |
+| 存储空间 | 5GB（模型 + 编译） | 10GB+（多模型切换） |
+| 网络 | 下载模型依赖 | 稳定 WiFi |
+
+**Termux 安装须知**：务必从 **[F-Droid](https://f-droid.org/packages/com.termux/)** 安装 Termux，Google Play 版本已停止维护，无法正常使用包管理器和权限功能。
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L1-L36)
+
+---
+
+## 第一步：验证 Vulkan 驱动
+
+在编译 llama.cpp 之前，**必须先确认 Vulkan 驱动是否正常工作**。如果你的设备使用 Adreno GPU（骁龙系列），需要安装正确的 Vulkan ICD（Installable Client Driver）：
+
+```bash
+# 安装 Vulkan 工具
+apt update && apt upgrade -y
+apt install vulkan-loader-generic vulkan-tools
+```
+
+验证 GPU 识别情况：
+
+```bash
+vulkaninfo | grep -E "(deviceName|driverVersion)"
+```
+
+**正确輸出示例**：
+```
+driverVersion     = 26.0.6 (109051910)
+deviceName        = Adreno (TM) 840
+```
+
+**如果出现 `llvmpipe`**（代表软渲染，即 GPU 加速未生效），需要更换驱动：
+```bash
+apt remove mesa-vulkan-icd-swrast
+apt install mesa-vulkan-icd-freedreno
+```
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L38-L63)
+
+---
+
+## 第二步：编译 llama.cpp（Vulkan 后端）
+
+确认 Vulkan 驱动正常后，安装编译工具链并构建带 Vulkan 支持的 llama.cpp：
+
+```mermaid
+flowchart LR
+    A[安装编译工具] --> B[克隆 llama.cpp]
+    B --> C[cmake 配置<br/>-DGGML_VULKAN=ON]
+    C --> D[cmake --build 编译]
+    D --> E[验证可执行文件]
+    E --> F{使用场景}
+    F --> G[llama-server<br/>HTTP API 服务]
+    F --> H[llama-completion<br/>命令行推理]
+    F --> I[llama-mtmd-cli<br/>多模态推理]
+```
+
+### 安装编译工具
+
+```bash
+apt install git cmake clang ninja spirv-headers spirv-tools glslang
+```
+
+### 克隆并编译
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+
+# 关键：开启 Vulkan 后端
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j$(nproc)
+```
+
+编译通常耗时 15-30 分钟，取决于手机 CPU 性能。编译完成后，核心可执行文件位于 `~/llama.cpp/build/bin/` 目录下。
+
+### 可执行文件清单
+
+| 文件名 | 用途 | 在 Pocket-Agent 中的角色 |
+|--------|------|------------------------|
+| `llama-server` | HTTP API 服务（OpenAI 兼容） | **主入口** — Agent 通过此服务调用模型 |
+| `llama-completion` | 命令行文本补全 | 测试模型基础能力 |
+| `llama-mtmd-cli` | 多模态（视觉）命令行推理 | GUI 自动化场景中分析截屏 |
+| `llama-cli` | 旧版通用命令行接口 | 部分版本已重命名为 `llama-completion` |
+
+**注意**：llama.cpp 新版本（2025 年后）已将旧版 `llama-cli` 更名为 `llama-completion`，编译后请检查 `build/bin/` 目录下的实际文件名。
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L64-L86)
+
+---
+
+## 第三步：准备模型文件
+
+### 选择 GGUF 格式模型
+
+llama.cpp 使用 GGUF（GPT-Generated Unified Format）格式的量化模型。推荐从以下来源下载：
+
+- **[Hugging Face](https://huggingface.co/models?library=gguf)** — 最全的 GGUF 模型仓库
+- **[HF Mirror](https://hf-mirror.com/)** — 国内镜像，下载更快速
+
+### 下载与存放
+
+以本项目实际使用的模型为例，将 GGUF 文件下载到手机共享存储：
+
+```
+/storage/emulated/0/本地模型/
+├── Qwen3-4B-Instruct-2507.Q4_K_M.gguf       # 纯文本模型
+├── GELab-Zero-4B-preview-q4_k_m.gguf         # 多模态模型
+└── GELab-Zero-4B-preview-f16.mmproj          # 多模态投影器（CLIP 图像编码）
+```
+
+**推荐模型**（经本项目实际验证）：
+| 模型 | 大小 | 类型 | 用途 | 上下文 |
+|------|------|------|------|--------|
+| Qwen3-4B-Instruct (Q4_K_M) | ~2.3 GB | 纯文本 | 日常对话、任务执行 | 32K |
+| GELab-Zero-4B-preview (Q4_K_M) | ~2.4 GB | 多模态视觉 | GUI 分析、截图理解 | 200K |
+
+**存储权限**：Termux 默认无法访问 `/storage/emulated/0/`，需执行 `termux-setup-storage` 授权。之后模型文件路径以 `/storage/emulated/0/本地模型/xxx.gguf` 格式访问。
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L88-L96), [docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md](docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md#L1-L30)
+
+---
+
+## 第四步：启动 llama-server（与 Pocket-Agent 集成）
+
+llama.cpp 提供了两种运行模式，Pocket-Agent 主要使用 **llama-server 模式** 以 HTTP API 形式对外提供服务。
+
+### 基础启动命令（纯文本模型）
+
+```bash
+cd ~/llama.cpp
+./build/bin/llama-server \
+  -m "/storage/emulated/0/本地模型/Qwen3-4B-Instruct-2507.Q4_K_M.gguf" \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -ngl 37 \
+  -t 6 \
+  -c 4096 \
+  --temp 0.7 \
+  --fit off
+```
+
+### 多模态模型启动（GUI 自动化场景）
+
+```bash
+cd ~/llama.cpp
+./build/bin/llama-server \
+  -m "/storage/emulated/0/本地模型/GELab-Zero-4B-preview-q4_k_m.gguf" \
+  --mmproj "/storage/emulated/0/本地模型/GELab-Zero-4B-preview-f16.mmproj" \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -ngl 40 \
+  -t 8 \
+  -c 8192 \
+  --temp 0.3 \
+  --no-mmproj-offload
+```
+
+### 配置 .env 指向本地服务
+
+启动 `llama-server` 后，在 Pocket-Agent 项目根目录的 `.env` 文件中配置：
+
+```env
+# ==================== 本地 llama-server 配置 ====================
+DEFAULT_LLM_BASE_URL=http://127.0.0.1:8080/v1
+LLM_API_KEY=dummy                        # 本地服务不需要真实 API Key
+LLM_MODEL=gelab-zero-4b-preview          # 仅用于日志记录，不影响实际模型
+LLM_TEMPERATURE=0.7
+LLM_MAX_TOKENS=8000
+```
+
+切换回云端 API 时，仅需将 `DEFAULT_LLM_BASE_URL` 改为云端地址，代码无需任何其他更改。
+
+### 启动参数详解
+
+| 参数 | 作用 | 推荐值 | 风险/说明 |
+|------|------|--------|----------|
+| `-m` | 模型文件路径 | 完整绝对路径 | 路径含空格需加引号 |
+| `--mmproj` | 多模态投影器 | `.mmproj` 文件路径 | 只有多模态模型需要 |
+| `-ngl N` | 卸载 N 层到 GPU | 37（全部）/ 40 | Adreno 驱动不稳时设为 0 |
+| `-c N` | 上下文窗口大小 | **4096（安全）** | 默认 262144 会导致 OOM 闪退 |
+| `-t N` | CPU 线程数 | 6-8 | 留 2 核给系统 |
+| `--temp` | 采样温度 | 0.7（通用） | GUI 场景可降至 0.3-0.5 |
+| `--fit off` | 禁用自动内存适配 | **必须加** | 避免新版 scheduler bug |
+| `--no-mmproj-offload` | 图像编码走 CPU | 多模态必加 | 绕过 Adreno Vulkan CLIP 驱动 bug |
+| `--no-warmup` | 跳过预热 | 可选 | 减少启动时间 |
+| `--image-max-tokens N` | 图像编码 token 上限 | 128（甜点值） | 64 精度过低，1024 内存过高 |
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L96-L134), [docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md](docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md#L30-L130), [.env.example](.env.example#L1-L38)
+
+---
+
+## 第五步：嵌入模型服务（BGE-M3）
+
+Pocket-Agent 的记忆系统需要 Embedding 模型为对话内容生成向量语义索引。本项目使用 `llama-server` 同时承载 LLM 推理和嵌入生成两个角色——同一个 `llama-server` 进程的 HTTP API 天然支持 `/v1/embeddings` 端点。
+
+### 配置嵌入模型路径
+
+在 `.env` 中设置 `EMBEDDING_MODEL_PATH`，指向下载好的 BGE-M3 GGUF 文件：
+
+```env
+# Embedding 配置（本地 llama-server）
+EMBEDDING_SERVER_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL=bge-m3
+EMBEDDING_MODEL_PATH=/storage/emulated/0/本地模型/bge-m3-Q4_K_M.gguf
+```
+
+### 自动启动机制
+
+`agent/embedding.py` 中的 `start_embedding_server()` 函数会在 Agent 启动时自动检测并拉起 `llama-server` 嵌入服务：
+
+```python
+# 检测逻辑（agent/embedding.py:258-285）
+# 1. 检查 EMBEDDING_MODEL_PATH 是否存在
+# 2. 检查端口 8080 是否已被占用（已运行则复用）
+# 3. 清理旧进程后启动新进程
+# 4. 启动参数：-c 8192, --embedding, -np 4, -b 2048
+```
+
+**核心**：LLM 推理和 Embedding 生成可以共用同一个 `llama-server` 进程，无需分别启动两个服务。但如果 LLM 和 Embedding 使用不同的模型，则需要分别启动两个 `llama-server` 实例（不同端口）。
+
+Sources: [agent/embedding.py](agent/embedding.py#L240-L285), [.env.example](.env.example#L28-L38), [agent/config.py](agent/config.py#L48-L53)
+
+---
+
+## 性能调优与内存管理
+
+### GPU vs CPU 的实际表现
+
+对于**小参数模型（4B 级别）**，Vulkan GPU 加速在移动端存在一个反直觉的现实：
+
+| 配置 | 速度 | 稳定性 | 说明 |
+|------|------|--------|------|
+| GPU 全卸载（-ngl 37） | ~12 tok/s | ⚠️ 可运行 | Vulkan 驱动开销大 |
+| 纯 CPU（-ngl 0, -t 8） | ~12-15 tok/s | ✅ 最稳定 | 小模型 CPU 推理效率有优势 |
+| GPU 部分卸载（-ngl 8） | < 12 tok/s | ❌ 不稳定 | CPU-GPU 通信开销抵消加速收益 |
+
+**核心结论**：对于 4B 级别的量化小模型，纯 CPU 推理可能更快更稳定。GPU 的价值体现在 **7B 以上** 的大模型，或 **多模态视觉模型** 的文本推理部分。
+
+### 内存：闪退的罪魁祸首
+
+安卓系统的 OOM Killer 是无情的。控制内存占用的关键在于**限制上下文窗口大小（`-c`）**：
+
+| `-c` 值 | KV Cache 大小 | 16GB RAM 能否承受 |
+|---------|--------------|------------------|
+| 262144（默认，模型原生最大） | ~36 GB | ❌ 闪退 |
+| 20000 | ~2.8 GB | ✅ 但需配合低图像精度 |
+| 8192 | ~1.1 GB | ✅ 安全 |
+| 4096 | ~576 MB | ✅ 推荐 |
+| 2048 | ~288 MB | ✅ 极致安全 |
+
+**内存计算公式**（近似值）：
+```
+总内存 ≈ 模型文件大小 + KV Cache (≈ N_layers × d_model × 2 × -c × 2 bytes) + 系统占用
+```
+
+### 多模态模型的甜点参数
+
+多模态场景下，`--image-max-tokens` 参数在精度与内存/速度之间需要权衡：
+
+| `--image-max-tokens` | CPU 内存 | 编码时间 | 识别精度 | 适用场景 |
+|---------------------|---------|---------|---------|---------|
+| 64 | 9 MiB | 2.1 s | ❌ 极低（猫变企鹅） | 极限内存 |
+| **128** | **18 MiB** | **5.3 s** | **✅ 良好** | **日常 + GUI 操控（推荐）** |
+| 256 | ~36 MiB | ~9 s | ✅ 高（可识别按钮文字） | 需详细文字识别 |
+| 1024 | 322 MiB | 18.3 s | ✅ 很高 | 极致精度 |
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L146-L195), [docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md](docs/经验/3.llama.cpp多模态模型在手机上的部署经验.md#L130-L200)
+
+---
+
+## 一键启动脚本与自动化
+
+在 Termux 中创建启动脚本，将上述参数固化，避免每次手动输入：
+
+```bash
+#!/bin/bash
+# ~/run-local-model.sh — Pocket-Agent 本地模型一键启动
+
+MODEL_PATH="/storage/emulated/0/本地模型/GELab-Zero-4B-preview-q4_k_m.gguf"
+MMPROJ_PATH="/storage/emulated/0/本地模型/GELab-Zero-4B-preview-f16.mmproj"
+cd ~/llama.cpp
+
+./build/bin/llama-server \
+  -m "$MODEL_PATH" \
+  --mmproj "$MMPROJ_PATH" \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -ngl 40 \
+  -t 8 \
+  -c 8192 \
+  --temp 0.3 \
+  --no-mmproj-offload \
+  --no-warmup
+```
+
+```bash
+chmod +x ~/run-local-model.sh
+~/run-local-model.sh
+```
+
+**推荐工作流**：在一个 Termux 会话中运行 `llama-server`（后台服务），在另一个会话中运行 `python main.py`（前端交互），两者通过 localhost:8080 通信。
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L185-L195)
+
+---
+
+## 常见问题排查
+
+### Q1：`vk::DeviceLostError` 崩溃
+
+**原因**：多模态模型的 CLIP 图像编码器尝试走 Vulkan GPU，但 Adreno 840 驱动不兼容。
+
+**解决**：添加 `--no-mmproj-offload` 参数，强制图像编码走 CPU 后端，主模型推理仍保留 GPU 加速。
+
+```
+错误路径：图像 → GPU(CLIP编码崩了) → 模型推理(无法执行)
+正确路径：图像 → CPU(CLIP编码) → tokens → GPU(模型推理加速)
+```
+
+Sources: [docs/经验/4.--no-mmproj-offload的说明.md](docs/经验/4.--no-mmproj-offload的说明.md#L1-L38)
+
+### Q2：`cache_k_l0` 错误 / 预分配张量崩溃
+
+**原因**：新版 llama.cpp scheduler 的自动内存适配 bug。
+
+**解决**：添加 `--fit off` 参数，或限制上下文 `-c 4096`。
+
+### Q3：手机黑屏/闪退/被 Killed
+
+**原因**：KV Cache 按模型最大上下文（262K）分配内存，远超物理 RAM。
+
+**解决**：**必须加 `-c 4096`** 限制上下文窗口。对于多模态模型，先降低 `--image-max-tokens`，再逐步调高 `-c`。
+
+### Q4：模型文件找不到
+
+**原因**：Termux 无存储权限，或路径拼写错误。
+
+**解决**：
+```bash
+termux-setup-storage   # 授权
+ls /storage/emulated/0/本地模型/   # 确认文件存在
+```
+
+### Q5：GPU 反而比 CPU 慢
+
+**原因**：移动端 GPU 小批次推理效率低，Vulkan 驱动开销大。
+
+**解决**：对于 4B 小模型，尝试纯 CPU 运行 `-ngl 0 -t 8`，速度可能持平甚至更快。
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L126-L145)
+
+### Q6：`encoding image slice...` 后长时间无输出
+
+**原因**：正常现象。CPU 编码图像需要 5-35 秒（取决于 `--image-max-tokens` 值），耐心等待即可。
+
+---
+
+## 进阶方向
+
+当 llama.cpp Vulkan 不能满足需求时，可探索以下替代框架：
+
+| 框架 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------|
+| **MLC-LLM** | 专为移动端设计，自动利用 GPU/NPU | 需编译模型（较复杂） | 追求极致推理速度 |
+| **MediaPipe** | Google 官方，零门槛 | 模型选择受限 | 快速原型验证 |
+| **QNN (Qualcomm)** | 高通官方 NPU 加速 | 仅骁龙芯片，开发环境要求高 | 生产级部署 |
+| **llama.cpp (CPU only)** | 最稳定，无驱动兼容问题 | 大模型推理慢 | 小模型日常使用 |
+
+Sources: [docs/经验/1.手机本地大模型GPU加速部署Skill.md](docs/经验/1.手机本地大模型GPU加速部署Skill.md#L170-L184)
+
+---
+
+## 下一步阅读
+
+成功部署本地模型后，建议按以下路径深入：
+
+- **[环境搭建 — Embedding 模型配置（BGE-M3 语义检索）](6-embedding-mo-xing-pei-zhi-bge-m3-yu-yi-jian-suo)**：配置记忆系统的向量引擎，让 Agent 具备长期记忆能力
+- **[运行模式 — 终端交互模式（main.py）](7-zhong-duan-jiao-hu-mo-shi-main-py)**：掌握在 Termux 中与本地 Agent 交互的操作流程
+- **[核心架构 — 整体架构与设计哲学](9-zheng-ti-jia-gou-yu-she-ji-zhe-xue)**：从全局理解各组件如何协同工作
+- **[运行模式 — HTTP API 模式（FastAPI + SSE 流式）](8-http-api-mo-shi-fastapi-sse-liu-shi)**：将 Agent 暴露为 HTTP 服务，供 Android App 调用

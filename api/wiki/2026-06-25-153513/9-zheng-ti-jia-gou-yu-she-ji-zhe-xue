@@ -1,0 +1,292 @@
+Pocket-Agent 是一个运行在 Android Termux 环境中的轻量级 AI 代理系统。其设计哲学围绕 **移动端优先**、**零外部依赖**（除 LLM API）、**自我进化的技能体系** 三大核心原则展开。本文从全局视角剖析系统的分层架构、模块间协作关系以及驱动设计选择的根本理念。
+
+---
+
+## 一、系统架构总览
+
+Pocket-Agent 的架构可以划分为七个横向层次和一个纵向贯穿的持久化层。下图展示了各层之间的调用关系和生命周期依赖：
+
+```mermaid
+flowchart TB
+    subgraph Interface["接口层"]
+        CLI["Terminal CLI (main.py)<br/>Rich UI + prompt_toolkit"]
+        API["FastAPI HTTP (app.py)<br/>SSE Streaming + REST"]
+    end
+
+    subgraph Agent["Agent 引擎层"]
+        LC["LangChain Agent<br/>(agent_langchain.py)"]
+        MW["中间件链<br/>模型限制 | 上下文压缩 | 重复检测"]
+        EXEC["子Agent执行器<br/>(Executor)"]
+    end
+
+    subgraph Memory["记忆层"]
+        LM["长期记忆<br/>(LongTermMemory)"]
+        VS["向量存储<br/>(EmbeddingClient + VectorStore)"]
+        FTS["FTS5全文搜索<br/>(trigram tokenizer)"]
+    end
+
+    subgraph Tools["工具层"]
+        BT["基础工具<br/>file_read/write/shell_exec"]
+        MCP["MCP工具<br/>NeuralBridge手机操控"]
+        BODY["3D身体控制<br/>control_body/move_body"]
+    end
+
+    subgraph Skills["技能层"]
+        MS["main-skills<br/>主Agent知识"]
+        ES["executor-skills<br/>子Agent操作指南"]
+        AS["auto-skills<br/>自动沉淀经验"]
+    end
+
+    subgraph Prompts["提示词工程层"]
+        SB["system_base.py<br/>基础人设"]
+        AE["agent_enhance.py<br/>增强规则"]
+        ESYS["executor_system.py<br/>子Agent人设"]
+    end
+
+    subgraph Infra["基础设施层"]
+        LOG["AgentLogger<br/>结构化审计日志"]
+        CFG["config.py<br/>统一配置"]
+        UI["PocketUI<br/>Rich终端渲染"]
+    end
+
+    subgraph Persist["持久化层 (pocket_agent.db)"]
+        CONV["conversations<br/>会话表"]
+        MSG["messages<br/>消息表 + FTS5索引"]
+        EMB["embeddings<br/>向量BLOB表"]
+    end
+
+    CLI --> LC
+    API --> LC
+    LC --> MW
+    LC --> EXEC
+    LC --> BT
+    LC --> BODY
+    EXEC --> MCP
+    EXEC --> BT
+    LC --> LM
+    LC --> VS
+    LC --> FTS
+    LC --> MS
+    EXEC --> ES
+    EXEC --> AS
+    LC --> SB
+    LC --> AE
+    EXEC --> ESYS
+    LC --> LOG
+    LC --> CFG
+    CLI --> UI
+
+    LM --> Persist
+    VS --> Persist
+    FTS --> Persist
+    CONV --> MSG
+    MSG --> EMB
+```
+
+**核心理解**：整个系统以 Agent 引擎层为枢纽，向上为两种运行模式提供统一接口，向下协调工具、记忆、技能三大子系统。LangGraph 的 Checkpoint 机制在持久化层保持会话状态，使得两种入口（终端和 HTTP API）共享同一个对话历史数据库。
+
+Sources: [main.py](main.py#L1-L50), [app.py](app.py#L1-L40), [agent_langchain.py](agent/agent_langchain.py#L1-L50)
+
+---
+
+## 二、两层运行模式：同源异构
+
+Pocket-Agent 提供两种运行入口，它们共享同一套 Agent 引擎和持久化存储，区别仅在于交互界面：
+
+| 特性 | 终端模式 (main.py) | HTTP API 模式 (app.py) |
+|------|-------------------|----------------------|
+| 启动方式 | `python main.py` | `uvicorn app:app --host 0.0.0.0 --port 8000` |
+| 交互方式 | 命令行 Rich UI + prompt_toolkit | SSE 流式 + RESTful API |
+| 适用场景 | 直接在 Termux 中操作 | 集成到 Android App 或远程访问 |
+| 会话管理 | 单会话 /resume 恢复 | 多会话通过 conversation_id 区分 |
+| 工具进度反馈 | Rich Panel 实时渲染 | SSE stream 推送 progress 事件 |
+| 底层 checkpointer | AsyncSqliteSaver（失败降级 MemorySaver） | 同左 |
+
+两种模式在初始化阶段的代码路径几乎一致：都是在启动时调用 `_init_db()` 创建 SQLite 表结构和 FTS5 索引，初始化 `EmbeddingClient` + `VectorStore`，以及创建 `AsyncSqliteSaver` 用于 LangGraph 持久化。区别在于终端模式下多了一层 `PocketUI` 的 Rich 界面渲染，以及通过 `_init_vector_store()` 同步初始化的向量存储。APP 模式下则通过 FastAPI 的 `startup` 事件异步完成初始化。
+
+这种设计使得开发者只需维护一套 Agent 核心逻辑，即可同时支持两种部署形态——这是**接口与实现分离**原则在架构层面的体现。
+
+Sources: [main.py](main.py#L52-L130), [app.py](app.py#L15-L110), [ui.py](agent/ui.py#L125-L200)
+
+---
+
+## 三、Agent 引擎：LangChain create_agent + 中间件链
+
+Agent 引擎是整个系统的大脑，其设计选择了 LangChain 官方 `create_agent` API + 自定义中间件链的方案。代码中明确注释"参考 EchoMind 架构"，表明这是对已有成功架构的演进式继承。
+
+### 3.1 三层防护机制
+
+引擎内置了三道防护层应对 Agent 常见的失控问题：
+
+- **ModelCallLimitMiddleware**：限制单次对话中的模型调用次数。来自 LangChain 中间件体系，当 Agent 陷入工具调用循环时强制截断。
+- **SummarizationMiddleware**：上下文压缩。当累积 token 数接近 `MAX_CONTEXT_TOKENS`（默认 128K）时，自动对早期对话进行摘要压缩，确保 Agent 不会因超出上下文窗口而丢失关键信息。
+- **Loop Detection**：重复检测。通过分析工具调用序列识别出循环模式，触发中断并引导 Agent 换方案。
+
+这三层中间件以链式顺序包装在 Agent 的执行流程中，形成了一个**安全漏斗**——从外到内逐层过滤异常行为。
+
+### 3.2 DeepSeek 兼容性补丁
+
+项目中有一个值得关注的架构设计决策：由于 LangChain 的 `ChatOpenAI` 类在设计上遵循 OpenAI API 规范，而 DeepSeek 的 API 返回了非标准字段 `reasoning_content`（推理过程），导致流式响应中该字段被丢弃。解决方案是两处 monkey-patch：
+
+1. 流式响应处：`_convert_delta_to_message_chunk` 被替换，将 `reasoning_content` 捕获到 `additional_kwargs` 中
+2. 请求序列化处：`_convert_message_to_dict` 被替换，确保 `reasoning_content` 在后续 API 调用中能被传回
+
+这种**补丁而非重写**的方式，体现了最小侵入原则——以最低成本兼容多模型生态，而不必 Fork 整个 LangChain 库。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L110-L200), [config.py](agent/config.py#L12-L20)
+
+---
+
+## 四、记忆分层架构：从易失到永久的四层阶梯
+
+记忆系统的设计是整个项目中最具架构深度的部分。它构建了一个从**会话上下文**到**永久画像**的四层递进结构：
+
+```mermaid
+flowchart LR
+    subgraph Session["易失 ← 范围递增 → 永久"]
+        S1["会话上下文<br/>(LangGraph State)<br/>当前对话窗口"]
+        S2["事件记忆<br/>(episodic)<br/>跨会话结果存储"]
+        S3["事实记忆<br/>(fact)<br/>技术选型/项目上下文"]
+        S4["用户画像<br/>(user_profile.md)<br/>永久个人信息"]
+    end
+
+    subgraph Storage["存储介质"]
+        D1["LangGraph State<br/>内存中"]
+        D2["messages 表<br/>SQLite"]
+        D3["messages 表<br/>+ embeddings 表"]
+        D4["user_profile.md<br/>文件系统"]
+    end
+
+    subgraph Access["检索方式"]
+        A1["State.get()<br/>零延迟"]
+        A2["FTS5 全文搜索<br/>(trigram)"]
+        A3["向量语义搜索<br/>(numpy 余弦相似度)"]
+        A4["直接读文件<br/>注入系统提示"]
+    end
+
+    S1 --> D1 --> A1
+    S2 --> D2 --> A2
+    S3 --> D3 --> A3
+    S4 --> D4 --> A4
+```
+
+存储策略背后的设计原则：
+
+- **写入门禁**：所有记忆写入必须通过 `save_memory` 工具，禁止 Agent 用 `file_write` 绕过。这一约束在提示词中通过强制规则（「绝对禁止用 file_write 创建/写入任何记忆文件」）和系统校验双重保障。
+- **分层存储**：用户画像存文件（手动可编辑），事实/事件记忆存 SQLite + 向量索引，舞蹈动作记单独分类（dance）以避免浪费上下文 token。
+- **自动清理**：30 天 + importance ≤ 2 的旧记忆自动释放向量索引，保留关键词搜索能力但去除语义检索的存储开销。
+- **RRF 融合排序**：FTS5 全文搜索和向量语义搜索的结果通过倒数排序融合（Reciprocal Rank Fusion）合并，兼顾关键词精确匹配和语义相似度。
+
+向量存储的选型尤为巧妙：项目没有引入 ChromaDB（需要编译 Rust 依赖，在 Termux 中难以部署），而是使用 SQLite 存储序列化的 numpy float32 数组，查询时通过 numpy 计算余弦相似度。这是**移动端约束下的工程智慧**——用 SQLite 已有的基础设施完成向量检索，避免引入额外的编译依赖。
+
+Sources: [memory.py](agent/memory.py#L1-L64), [embedding.py](agent/embedding.py#L1-L80), [basic_tools.py](agent/tools/basic_tools.py#L550-L750)
+
+---
+
+## 五、技能体系：知识文档驱动而非代码驱动
+
+技能系统是 Pocket-Agent 区别于传统 Agent 框架的关键创新。技能不是可执行代码，而是 Markdown 文档（SKILL.md），通过文件读取方式提供给 Agent 作为上下文知识。
+
+### 5.1 三类技能目录
+
+| 目录 | 用途 | 数据来源 | 生命周期 |
+|------|------|----------|----------|
+| `main-skills/` | 主 Agent 专业知识（开发、手机操控等） | 开发者编写 | 静态维护 |
+| `executor-skills/` | 子 Agent 操作指南（界面操控规范等） | 开发者编写 | 静态维护 |
+| `auto-skills/` | 执行经验的自动沉淀 | 子 Agent 执行完成后自动生成 | 动态增长 |
+
+### 5.2 自动沉淀机制
+
+当子 Agent（Executor）成功完成一项复杂任务后，系统会调用 **skill-creator** 技能（位于 `executor-skills/` 中），指导子 Agent 将本次执行的关键步骤和经验写入 `auto-skills/executor/` 目录。沉淀出的技能文件在下次遇到类似任务时自动被 `load_skills_list()` 扫描并加入技能列表。
+
+这种设计形成了一个**闭环学习系统**：执行 → 沉淀 → 复用 → 再执行。随着使用时间的增长，`auto-skills/` 目录会积累越来越丰富的领域知识，系统对特定任务的执行效率也随之提升。
+
+### 5.3 技能发现机制
+
+`_scan_skills()` 函数支持两种目录结构：
+
+- **Flat 模式**：技能直接在技能目录下（如 `main-skills/code-review/SKILL.md`）
+- **分类模式**：技能在分类子目录下（如 `main-skills/development/code-review/SKILL.md`）
+
+扫描结果按分类分组输出到系统提示词中，Agent 通过 `file_read` 读取具体的 SKILL.md 获取操作指导——技能本质上是一种**即时注入的上下文知识**，而非预编译的功能模块。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L55-L135), [config.py](agent/config.py#L30-L50), [prompts/agent_enhance.py](agent/prompts/agent_enhance.py#L70-L95)
+
+---
+
+## 六、子 Agent 委托机制：任务分解与隔离执行
+
+对于涉及 UI 交互的复杂手机操控任务，主 Agent 不直接操作，而是通过 `delegate_task()` 工具将任务派发给子 Agent（Executor）。这是**关注点分离**原则的体现。
+
+### 6.1 委托流程
+
+```
+主Agent 判断任务类型
+  ├─ 简单操作（Termux API、查信息）→ 直接 shell_exec 执行
+  └─ 复杂操作（点击、输入、多步交互）
+       └─ delegate_task(description, tasks_json) → 立即返回
+            ├─ task_manager.py 创建 task.json
+            ├─ 子Agent 异步执行：
+            │   1. 读取 task.json
+            │   2. 读取相关 SKILL.md
+            │   3. 逐步骤执行（UI树分析→点击→验证）
+            │   4. 每步完成更新 task.json
+            └─ 主Agent 可随时 file_read 查看进度
+```
+
+### 6.2 隔离设计
+
+子 Agent 拥有独立的系统提示词（`executor_system.py` + `executor_enhance.py`）、独立的技能目录（`executor-skills/`）和独立的 LLM 配置（`EXECUTOR_LLM_CONFIG`，可从 `.env` 中指定不同的模型和参数）。这种隔离确保子 Agent 的执行不会污染主 Agent 的上下文，同时也允许为子 Agent 配置更轻量的模型（如 7B 参数级别）以降低成本。
+
+### 6.3 任务门禁
+
+`file_write` 工具内置了一道任务完成门禁：当写入 `task.json` 并将 `all_completed` 标记为 `true` 时，系统会自动检查是否所有步骤的 `status` 都是 `completed`，如果有未完成的步骤则拦截并提示继续执行。这防止了子 Agent 过早结束任务。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L600-L750), [task_manager.py](agent/task_manager.py#L1-L53), [basic_tools.py](agent/tools/basic_tools.py#L50-L80)
+
+---
+
+## 七、持久化策略：单一数据库 + 复合查询
+
+整个系统只用一个 SQLite 数据库文件 `pocket_agent.db`，承载五种不同的数据角色：
+
+| 数据角色 | 存储方案 | 查询方式 |
+|----------|----------|----------|
+| 会话元信息 | `conversations` 表 | SQL 直接查询 |
+| 消息历史 | `messages` 表 | SQL + FTS5 全文搜索 |
+| 长期记忆 | `messages` 表（role=memory） | FTS5 + 向量语义 + RRF 融合 |
+| 向量索引 | `embeddings` 表（BLOB） | numpy 余弦相似度 |
+| Checkpoint | LangGraph AsyncSqliteSaver | LangGraph 内部管理 |
+
+核心设计决策：
+
+- **WAL 模式**：两个进程（`main.py` 和 `app.py`）可能同时访问同一 SQLite 文件，WAL（Write-Ahead Logging）模式允许多个读事务与一个写事务并发，避免了 "database is locked" 的问题。
+- **busy_timeout=30000**：当写冲突发生时，SQLite 最多等待 30 秒而非立即报错，给竞争事务足够时间完成。
+- **消息回溯兼容**：`ALTER TABLE` 的 try/except 模式体现了对数据库 schema 演进的优雅处理——新增字段不会破坏旧数据库。
+
+Sources: [main.py](main.py#L52-L110), [app.py](app.py#L60-L120), [embedding.py](agent/embedding.py#L100-L180)
+
+---
+
+## 八、设计哲学总结
+
+回顾整个架构，可以提炼出六条贯穿始终的设计原则：
+
+1. **最小外部依赖**：不用 ChromaDB（用 SQLite + numpy）、不用 Redis（用 SQLite WAL）、不用复杂的消息队列（用 SQLite + 文件系统）。每个引入的依赖都必须回答"为什么不用已有的基础设施实现"。
+2. **单向数据流**：用户输入 → Agent 引擎 → 工具调用 → 结果回写 → 持久化。没有环形依赖或跨层跳转。
+3. **知识外置**：技能是文档不是代码。系统行为可以通过添加 SKILL.md 来扩展，无需修改 Python 代码。这使得非技术用户也能通过编写 Markdown 来教会 Agent 新技能。
+4. **渐进式复杂度**：简单操作走快路径（直接 shell_exec），复杂操作走慢路径（子 Agent 委托）。系统不会为简单的文件读取请求加载完整的手机操控工具链。
+5. **优雅降级**：AsyncSqliteSaver 初始化失败 → 降级 MemorySaver；Embedding 服务不可用 → 仅使用 FTS5 关键词检索；Termux API 未安装 → 友好的提示信息。
+6. **自我进化**：auto-skills 的自动沉淀机制使得系统从第一天使用开始就在积累领域经验，具备随时间推移而变得"更聪明"的能力。
+
+---
+
+## 下一步阅读
+
+理解了整体架构后，建议按以下路径深入各个子系统：
+
+- **[LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian)** → 深入 Agent 引擎的 `create_agent` 实现细节
+- **[中间件链深度解析](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi)** → 了解 ModelCallLimit / Summarization 的具体策略
+- **[分层记忆架构](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi)** → 深入记忆系统的四层结构和检索策略
+- **[技能系统概述](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)** → 理解技能文档的编写规范和自动发现机制
+- **[子 Agent 委托机制](29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa)** → 掌握任务分解与子 Agent 隔离执行

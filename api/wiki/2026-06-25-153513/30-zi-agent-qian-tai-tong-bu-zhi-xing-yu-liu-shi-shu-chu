@@ -1,0 +1,240 @@
+子 Agent 的前台同步执行是 Pocket-Agent 中主 Agent 与子 Agent（Executor）之间**最核心的执行协调模式**。当主 Agent 通过 `delegate_task` 工具将任务派发给子 Agent 后，子 Agent 并不会立即启动——而是采用**延迟消费 + 前台同步执行**的策略：主 Agent 的 `delegate_task` 调用仅将任务描述和结构化步骤写入磁盘文件，同时将任务元信息追加到全局队列 `_pending_background_tasks` 中；主 Agent 的完整流式对话结束（所有 token 和工具调用事件推送完毕）后，才**在同一协程上下文中同步消费该队列**，依次前台执行每个子 Agent 任务，并将执行过程中的结构化事件实时 yield 给调用方。这种设计确保子 Agent 的执行不会干扰主 Agent 的推理流程，同时又能让用户在同一对话上下文中实时看到子 Agent 的执行进展。
+
+## 架构定位：延迟消费与前台同步
+
+子 Agent 前台同步执行的架构位于 `agent_langchain.py` 中 `AgentEngine` 类的两个流式入口方法内：`run_conversation`（终端模式）和 `stream_conversation`（HTTP API / SSE 模式）。两者的执行路径完全一致，仅在事件输出方式上有所区别——前者通过 `self.ui.console.print` 直接在终端渲染 Rich 组件，后者通过 `yield` 结构化事件字典由 `app.py` 的 SSE 端点转发给前端。核心的执行引擎统一由 `_run_executor_foreground` 方法承载。
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Main as 主Agent (AgentEngine)
+    participant Queue as _pending_background_tasks
+    participant Executor as 子Agent (Executor)
+    participant TaskFile as task.json
+    participant Tools as 工具集 (shell/mcp/file)
+
+    User->>Main: 发送消息
+    Main->>Main: 流式推理（token / tool events）
+    Main->>Queue: delegate_task() 写入队列
+    Main-->>User: 主Agent流结束
+
+    Note over Main: 消费队列中的待处理任务
+    Main->>Queue: consume_pending_tasks()
+    loop 每个待处理任务
+        Main->>TaskFile: 读取 task.json
+        Main->>Executor: _run_executor_foreground(task_path)
+        Executor->>TaskFile: file_read task.json
+        Executor->>Tools: shell_exec / mcp_call / file_write
+        Tools-->>Executor: 执行结果
+        Executor->>TaskFile: file_write 更新步骤状态
+        Executor-->>Main: yield 结构化事件
+        Main->>Executor: 技能沉淀阶段
+        Executor->>Executor: file_write auto-skills/SKILL.md
+    end
+    Main-->>User: 全部子Agent完成
+```
+
+**延迟消费的核心意义**在于：主 Agent 的推理流（包括 token 生成和工具调用）是一个有状态的 LangGraph 图执行过程，如果在主 Agent 推理中途插入子 Agent 执行，会导致 `astream` 的事件流混乱，且 LangGraph 的 checkpoint 状态管理可能被破坏（子 Agent 的对话消息会污染主 Agent 的对话历史）。先完成主 Agent 的完整推理，再将子 Agent 执行作为一个独立阶段来处理，是架构层面的刻意设计。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1122-L1136), [basic_tools.py](agent/tools/basic_tools.py#L905-L918)
+
+## 执行流程分解：从派发到完成
+
+子 Agent 前台同步执行可分解为四个阶段：**任务派发与暂存**、**主 Agent 流结束后的队列消费**、**子 Agent 前台执行**、**技能沉淀与清理**。
+
+### 阶段一：任务派发与暂存
+
+当主 Agent 调用 `delegate_task` 工具时，`basic_tools.py` 中的 `delegate_task` 函数执行以下操作：解析 `tasks_json` 参数（JSON 格式的 `objective` + `steps` + `guidance`），生成唯一 `task_id`（格式 `task_YYYYMMDD_HHMMSS`），在 `tasks/<task_id>/` 目录下创建 `task.json` 文件，然后将任务元信息（`task_id`、`task_path`、`description`、`subagent_type`）追加到模块级全局列表 `_pending_background_tasks` 中。该函数**同步返回**给主 Agent 一条确认消息（`"✅ 任务已派发到后台执行"`），主 Agent 不知道子 Agent 尚未真正执行——这种"伪异步"返回是保证主 Agent 推理流程不中断的关键。
+
+```python
+# basic_tools.py - delegate_task 工具的核心逻辑
+_pending_background_tasks.append({
+    "task_id": task_id,
+    "task_path": task_file,    # tasks/<task_id>/task.json
+    "description": description,
+    "subagent_type": "executor",
+})
+return f"✅ 任务已派发到后台执行 (task_id: {task_id})。..."
+```
+
+`task.json` 文件内容结构如下：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task_id` | string | 唯一任务标识 |
+| `objective` | string | 任务目标描述 |
+| `created_at` | string | ISO 格式创建时间 |
+| `steps` | array[{id, desc, status}] | 原子步骤列表 |
+| `guidance` | string | 可选的注意事项 |
+| `all_completed` | boolean | 全部完成标记 |
+| `voice_notify` | boolean | 是否语音通知 |
+
+每个步骤的 `status` 初始为 `"pending"`，子 Agent 在完成每一步后通过 `file_write` 更新为 `"completed"`。所有步骤完成后将 `all_completed` 设为 `true`。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L905-L950), [task_manager.py](agent/task_manager.py#L28-L48)
+
+### 阶段二：队列消费与子 Agent 启动
+
+主 Agent 的流式对话方法（`run_conversation` 或 `stream_conversation`）在 `astream` 循环结束后，立即调用 `consume_pending_tasks()` 消费全局队列。该函数做了一次**原子性取出**（复制后清空），确保同一个任务不会被重复消费。然后对每个待处理任务，调用 `_run_executor_foreground(task_path, task_id)`——这是一个 `async generator`，在 `stream_conversation` 路径下会逐层 `yield` 事件给 SSE 端点；在 `run_conversation` 路径下则迭代但不 yield（通过 `async for _event ... pass` 只消费不传递）。
+
+```python
+pending_tasks = consume_pending_tasks()
+for pt in pending_tasks:
+    task_path, task_id, description = pt["task_path"], pt["task_id"], pt["description"]
+    if task_path and os.path.exists(task_path):
+        if self.ui:
+            self.ui.console.print(f"\n[bold yellow]▶ 子Agent执行: {description}[/bold yellow]")
+        # 终端模式：静默消费
+        async for _event in self._run_executor_foreground(task_path, task_id):
+            pass
+```
+
+在 `stream_conversation` 路径下，还有额外的**取消支持**：将当前协程存入 `self._executor_task`，供 `/cancel` 命令中断子 Agent 执行。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1122-L1136), [agent_langchain.py](agent/agent_langchain.py#L1420-L1434)
+
+### 阶段三：子 Agent 前台执行引擎
+
+`_run_executor_foreground` 是子 Agent 执行的核心方法，涵盖以下关键环节：
+
+**1. 子 Agent 的独立实例化**：每次调用都创建一个全新的 LangChain Agent 实例，包含独立的 LLM 模型、工具集、系统提示词和 MemorySaver checkpointer。子 Agent 的 LLM 配置优先从 `.env` 环境变量读取（`EXECUTOR_LLM_BASE_URL`、`EXECUTOR_API_KEY`、`EXECUTOR_MODEL`、`EXECUTOR_TEMPERATURE`、`EXECUTOR_MAX_TOKENS`），未设置的字段自动继承主 Agent 的对应配置。工具集限制为 `{shell_exec, file_read, file_write, file_search, mcp_call, system_info, tts_speak}` 7 个——不包含 `delegate_task` 自身，防止子 Agent 递归派发。超时设置为 30 秒（主 Agent 为 10 秒），因为手机操控任务中的 MCP 调用和 Shell 命令通常需要更长的等待时间。
+
+**2. 系统提示词注入**：子 Agent 的系统提示词由 `executor_system_prompt` + `executor_enhance_prompt` 拼接而成。`executor_enhance_prompt` 中通过 `{tool_names}` 和 `{skills_list}` 占位符在运行时注入可用工具名称和执行器技能列表（包括 `executor-skills/` 目录和 `auto-skills/executor/` 目录中的自动沉淀技能），确保子 Agent 知道自己可以调用哪些工具、有哪些操作指南可以参考。
+
+**3. 流式执行与事件泵送**：子 Agent 使用 `astream` 方法并指定 `stream_mode=["messages", "updates"]` 来同时获取文本 token 流和工具调用更新。执行引擎将这两类事件转换为统一的结构化字典格式：
+- **`token`**：文本增量内容（payload 在 `content` 字段）
+- **`thinking`**：模型思考中（包括 DeepSeek 等模型的 `reasoning_content` 触发）
+- **`tool_start`**：工具调用开始（含 `name`、`args`、`args_display`）
+- **`tool_end`**：工具调用完成（含 `name`、`args_display`）
+- **`executor_start`**：子 Agent 启动（含 `task_id`、`objective`）
+- **`executor_done`**：子 Agent 完成（含 `task_id`、`status`、`elapsed`、`tokens`）
+
+这些事件在 `stream_conversation` 路径下逐层向上 yield，最终在 `app.py` 的 SSE 端点中转换为 `data: [TOOL] {...}\n\n` 格式推送。在 `run_conversation` 路径下则通过 `self.ui.console.print` 直接渲染到终端。
+
+**4. 工具参数缓存与格式化**：为了在 `tool_start` 和 `tool_end` 事件之间保持参数一致性，引擎维护了一个 `_last_tool_args_cache` 字典，以 `tool_call_id` 为键缓存每次工具调用的参数。`_format_tool_args` 方法对不同类型的工具进行差异化的参数截断和展示优化——例如 `shell_exec` 显示命令前 50 字符，`file_read` 显示父目录/文件名，`mcp_call` 显示工具名和参数预览。
+
+```python
+# 事件流示例（SSE 路径）
+{"type": "executor_start", "task_id": "task_20240315_143022", "objective": "在拼多多搜索树莓派"}
+{"type": "token", "content": "正在读取任务文件..."}
+{"type": "tool_start", "name": "mcp_call", "args": {"tool_name": "android_get_ui_tree"}, "args_display": "android_get_ui_tree"}
+{"type": "tool_end", "name": "mcp_call", "args_display": "android_get_ui_tree"}
+{"type": "executor_done", "task_id": "task_20240315_143022", "status": "completed", "elapsed": 45, "tokens": "≈3200"}
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1595-L1790), [executor_system.py](agent/prompts/executor_system.py#L1-L23), [executor_enhance.py](agent/prompts/executor_enhance.py#L1-L35)
+
+### 阶段四：重试机制与异常处理
+
+子 Agent 执行引擎内置了**智能重试触发器**：如果在首次执行中，子 Agent 的**有效工具调用步数**（`executor_step`）不超过 2 步（意味着它可能只读了 `task.json` 就停止了），引擎会自动触发最多 2 次重试。每次重试创建一个全新的 Agent 实例（避免历史消息中的 `tool_call`/`ToolMessage` 配对问题导致 DashScope 等 API 的 400 错误），并将任务内容以内联方式写入指令（"不用再读 task.json 了"），强制子 Agent 开始执行操作。
+
+```python
+# 重试逻辑的核心判断
+while executor_step <= 2 and retry_count < 2:
+    retry_count += 1
+    # 创建全新 Agent 实例 + 内联任务内容
+    fresh_agent = create_agent(
+        model=executor_llm,
+        tools=executor_tools,
+        system_prompt=system_content,
+        checkpointer=MemorySaver(),
+        middleware=executor_middleware,
+    )
+    async for chunk in fresh_agent.astream(...):
+        ...  # 重新流式执行
+```
+
+异常处理涵盖三个层面：**`asyncio.CancelledError`** 处理用户主动取消（记日志、yield `status: "cancelled"`）；**通用异常**捕获调用栈并提取关键错误行（去掉冗长的文件路径和 Traceback 信息），标记 `task.json` 为失败状态，语音通知用户失败原因；**人工介入检测**——当子 Agent 调用 `tts_speak` 工具或通过 `shell_exec` 调用 `termux-tts-speak` 时，引擎记录介入请求并在终端显示 `🆘 子Agent申请人工介入`，等待 30 秒后继续执行。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1790-L1850), [agent_langchain.py](agent/agent_langchain.py#L2010-L2093)
+
+### 阶段五：技能沉淀
+
+子 Agent 前台执行完成后，引擎会触发**自动技能沉淀**。条件为：步骤数 ≥ 3、有目标描述、且没有失败的步骤。引擎先生成技能名称（从 `objective` 中提取字母数字字符），然后让子 Agent 在**同一对话上下文**中继续执行——不重新创建 Agent 实例，而是追加一条 `HumanMessage` 指示子 Agent 使用 `file_read`/`file_write` 将执行经验沉淀为 `auto-skills/executor/<skill_name>/SKILL.md`。引擎还会进行**格式合规性检查**：读取写入的 SKILL.md 文件，验证其是否包含合法的 frontmatter（`---` 开头）、`name:` 和 `description:` 字段。格式不合规时，让子 Agent 读取 `skill-creator/SKILL.md` 模板后重写。
+
+```mermaid
+flowchart TD
+    A[子Agent执行完成] --> B{步骤≥3且无失败?}
+    B -->|否| C[跳过技能沉淀]
+    B -->|是| D[生成技能名称]
+    D --> E[子Agent追加执行: file_write SKILL.md]
+    E --> F{格式合规?}
+    F -->|是| G[✅ 技能沉淀完成]
+    F -->|否| H[读取 skill-creator 模板]
+    H --> I[子Agent重写 SKILL.md]
+    I --> G
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1920-L2020)
+
+## 双路径适配：终端 UI vs HTTP SSE
+
+子 Agent 执行的事件流经过两个不同的输出路径，但共享同一个 `_run_executor_foreground` 引擎：
+
+| 特性 | 终端模式 (run_conversation) | HTTP API 模式 (stream_conversation) |
+|------|---------------------------|-------------------------------------|
+| 入口方法 | `run_conversation` (第 941 行) | `stream_conversation` (第 1269 行) |
+| 事件消费方式 | `async for _event ... pass`（静默迭代） | `async for event ... yield event`（逐层传递） |
+| 输出渲染 | `self.ui.console.print()` Rich UI | `app.py` SSE 端点转为 `data: [...]\n\n` |
+| 取消支持 | 无（终端中通过 `KeyboardInterrupt` 打断） | `self._executor_task` 协程引用 + `/cancel` |
+| 进度显示 | Rich `Live(Markdown(...))` 实时渲染 | 前端自行渲染 token 流 |
+| 后台结果通知 | 下次对话前通过 `_background_task_results` 显示 | 通过 SSE `done_stats` 事件通知 |
+
+在终端模式下，子 Agent 执行前会显示 `▶ 子Agent执行: <description>` 黄色标题，执行中的工具调用以 `🔧 tool_name(args)` 彩色格式逐行输出，完成时显示 `✅ 子Agent任务完成` 或 `⚠️ 子Agent完成（N个步骤失败）`，附带耗时和 token 消耗统计。
+
+在 SSE 模式下，`app.py` 的 `/chat` 端点对 `executor_start`、`executor_done`、`skill_condense` 等事件类型统一使用 `data: [TOOL] {json}\n\n` 格式推送，前端根据 `event["type"]` 字段区分事件类型并分别渲染。`token` 类型的事件则独立推送为 `data: "content"\n\n`，与前端的文本流式渲染管线对接。
+
+Sources: [app.py](app.py#L463-L590), [agent_langchain.py](agent/agent_langchain.py#L941-L1136), [agent_langchain.py](agent/agent_langchain.py#L1269-L1434)
+
+## delegate_task 消息的自动清理
+
+子 Agent 前台执行完成后，引擎会执行一个**关键的状态清理步骤**：从 LangGraph checkpoint 中移除所有 `delegate_task` 相关的消息（包括 `AIMessage` 中的 `tool_calls` 和对应的 `ToolMessage`）。原因是某些 API（如 DashScope）在后续对话中会校验工具调用消息的格式完整性——残留的 `delegate_task` 调用记录会与子 Agent 执行后追加的消息产生格式冲突，导致 400 错误。清理通过 `RemoveMessage` 操作更新 checkpoint 状态，确保下一次对话时消息历史中不包含已处理的 `delegate_task` 记录。
+
+```python
+# 清理逻辑核心
+delegate_tc_ids = set()
+to_remove_ids = set()
+for m in msgs:
+    if hasattr(m, 'tool_calls') and m.tool_calls:
+        for tc in m.tool_calls:
+            if tc.get('name') == 'delegate_task':
+                to_remove_ids.add(m.id)
+                delegate_tc_ids.add(tc.get('id', ''))
+for m in msgs:
+    if isinstance(m, ToolMessage) and m.tool_call_id in delegate_tc_ids:
+        to_remove_ids.add(m.id)
+if to_remove_ids:
+    removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
+    await self.agent.update_state(config, {"messages": removals})
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1136-L1170), [agent_langchain.py](agent/agent_langchain.py#L1436-L1460)
+
+## 关键设计决策与技术权衡
+
+**1. 为什么不在主 Agent 推理中直接执行子 Agent？** 如果 `delegate_task` 工具调用时直接启动子 Agent，会阻塞主 Agent 的 LangGraph `astream` 事件循环，导致 token 推送停顿，用户体验急剧下降。延迟到主 Agent 流结束后执行，既能保证两个 Agent 的对话状态完全隔离（各自的 checkpoint 不互相污染），又能让用户在同一个交互上下文中看到完整的执行进展。
+
+**2. 为什么每次子 Agent 执行都创建全新 Agent 实例？** 子 Agent 的任务执行具有**无状态一次性**特性——每个任务都是独立的上下文，不需要跨任务的状态持久化。使用 `MemorySaver()` 作为 checkpointer（而非 `AsyncSqliteSaver`）也体现了这一设计：子 Agent 的对话状态在进程内存中存活，随任务结束而自动释放，不需要写入磁盘。这对于手机端有限的内存资源尤为重要。
+
+**3. 子 Agent 的工具限制策略**：子 Agent 的工具集限制为 7 个，排除 `delegate_task`（防止递归）、`save_memory`/`search_memory`（记忆管理归主 Agent）、`control_body`/`move_body` 等 3D 身体工具（物理世界交互归主 Agent）。这种"最小权限原则"确保子 Agent 专注于手机操控任务，不会越权访问系统记忆或启动无关功能。
+
+**4. 重试机制的边界条件**：重试仅在 `executor_step <= 2` 时触发，意味着子 Agent 如果已经执行了至少 3 步有效工具调用，即使最终失败也不会重试——因为 3 步以上说明子 Agent 已经进入了正确的执行路径，失败原因可能是操作本身的问题而非模型未能理解任务。这种启发式规则在实践中有效平衡了"给予二次机会"和"避免无限重试"。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1595-L1630), [agent_langchain.py](agent/agent_langchain.py#L1790-L1850)
+
+## 与相关模块的协作关系
+
+子 Agent 前台同步执行涉及多个模块的协同工作：
+
+| 模块 | 角色 | 关键交互 |
+|------|------|----------|
+| `basic_tools.py` | 任务派发入口 | `delegate_task` 工具写入队列和 `task.json` |
+| `task_manager.py` | 任务文件管理 | `init_task` 创建目录和 JSON 文件 |
+| `agent_langchain.py` | 执行引擎 | `_run_executor_foreground` 承载完整执行逻辑 |
+| `executor_system.py` | 子 Agent 系统提示词 | 人设 + 强制规则 + 执行流程约束 |
+| `executor_enhance.py` | 增强规则注入 | 工具说明、技能列表、执行三阶段指引 |
+| `config.py` | 配置中心 | `EXECUTOR_LLM_CONFIG` 提供模型配置 |
+| `app.py` | SSE 推送网关 | 将结构化事件转为 SSE 协议格式 |
+| `logger.py` | 全链路审计 | `log_executor_start/step/end/reasoning` 日志记录 |
+
+建议继续阅读 [子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi) 了解子 Agent 的 LLM 配置机制和技能目录隔离策略，以及 [任务文件管理与进度追踪](32-ren-wu-wen-jian-guan-li-yu-jin-du-zhui-zong) 了解 `task.json` 的完整生命周期管理。

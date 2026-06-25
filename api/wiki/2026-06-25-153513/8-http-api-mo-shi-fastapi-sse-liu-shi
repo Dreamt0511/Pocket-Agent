@@ -1,0 +1,203 @@
+Pocket-Agent 提供基于 FastAPI 的 HTTP 服务端，通过 Server-Sent Events（SSE）实现流式对话输出，供 Android App、3D 浏览器前端等外部客户端调用。该模式与终端交互模式（main.py）共享同一套 Agent 引擎、SQLite 持久化层和记忆系统，但以无头服务的形式运行，依赖心跳机制实现生命周期管理。
+
+## 核心架构：双服务器 + 单 Agent 单例
+
+HTTP API 模式下，Pocket-Agent 在 Termux 中同时运行两个独立的 HTTP 服务器，各自承载不同的职责：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Termux 运行环境                         │
+│                                                          │
+│  ┌──────────────┐    ┌──────────────────────────────┐   │
+│  │  FastAPI 服务  │    │  3D 身体控制服务器 (HTTP)     │   │
+│  │  (uvicorn)    │    │  (ThreadingHTTPServer)       │   │
+│  │  端口 :8000    │    │  端口 :18081                 │   │
+│  │               │    │                              │   │
+│  │  POST /chat   │    │  GET /api/events (SSE)      │   │
+│  │  (SSE 流式)    │    │  GET /api/response_stream   │   │
+│  │               │    │  POST /api/set_bone          │   │
+│  │  /conversations│   │  POST /api/send_message      │   │
+│  │  /health       │   │  GET /body_viewer.html       │   │
+│  │  /skills       │   └──────────┬───────────────────┘   │
+│  └──────┬────────┘              │                         │
+│         │                       │                         │
+│         ▼                       ▼                         │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │            共享基础设施层                          │    │
+│  │  ┌─────────────┐  ┌──────────┐  ┌───────────┐   │    │
+│  │  │ LangChain   │  │ SQLite   │  │Embedding  │   │    │
+│  │  │ Agent 单例  │  │ 持久化   │  │服务(本地) │   │    │
+│  │  └─────────────┘  └──────────┘  └───────────┘   │    │
+│  └──────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
+
+FastAPI 服务（app.py）作为主 API 入口，处理智能对话、会话管理、技能管理等核心业务逻辑；3D 身体控制服务器（body_server.py）以独立线程运行，提供骨骼操控、姿态动画和浏览器 SSE 推送，两者通过共享的 SQLite 数据库和 Agent 单例协同工作。这种分离设计确保了聊天的流式响应与身体动画的实时推送互不阻塞。
+
+Sources: [app.py](app.py#L1-L30), [body_server.py](agent/tools/body_server.py#L1-L30)
+
+## 启动方式与配置加载
+
+HTTP 服务通过 uvicorn 启动，入口文件为项目根目录的 `app.py`：
+
+```bash
+cd /sdcard/Pocket-Agent && source .venv/bin/activate && uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+启动时遵循严格的环境变量加载顺序：**必须在导入 `agent` 模块之前加载 `.env` 文件**，否则 `agent/config.py` 中的配置项将读取不到环境变量。这一约束通过 `load_dotenv(override=True)` 在 `app.py` 文件顶部实现——在所有 import 语句之前执行。
+
+配置采用双层合并策略：基础配置来自 `.env` 文件（通过 `_load_env_config()` 函数解析），请求参数（如 `POST /chat` 的 `config` 字段）可覆盖前者。`_load_env_config()` 函数将环境变量名映射为 Agent 内部使用的 key 格式，例如 `LLM_BASE_URL` → `base_url`、`LLM_API_KEY` → `api_key`、`LLM_MODEL` → `model`、`LLM_TEMPERATURE` → `temperature`。
+
+Sources: [app.py](app.py#L15-L20), [app.py](app.py#L312-L337)
+
+## Agent 单例模式与会话隔离
+
+HTTP API 模式采用 **Agent 单例 + 多会话** 架构，而非每个请求创建新 Agent。`_get_or_create_agent()` 函数以 `llm_config` 的 JSON 序列化摘要为缓存键，仅在 LLM 配置变化时销毁旧实例并重建。这意味着：
+
+- 同一配置下的所有聊天请求共享一个 `LangChainPocketAgent` 实例
+- 不同会话通过 `thread_id`（即 `conversation_id`）隔离对话历史
+- 配置变更（如切换模型）自动触发 Agent 重建，旧实例异步清理
+
+Agent 单例的另一关键设计是持久化 checkpointer 的降级机制：启动时优先初始化 `AsyncSqliteSaver`（基于 `aiosqlite`），将 LangGraph 的对话状态持久化到 `pocket_agent.db`；若失败则静默降级为 `MemorySaver`（纯内存，重启后历史丢失）。这种弹性设计使服务能在缺乏某些系统依赖的 Android/Termux 环境中依然可用。
+
+Sources: [app.py](app.py#L95-L116), [app.py](app.py#L56-L63)
+
+## SSE 流式对话协议：事件类型与数据格式
+
+`POST /chat` 是核心端点，接收用户消息并返回 SSE 流。其请求体格式如下：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `message` | string | 是 | 用户输入文本 |
+| `conversation_id` | string | 否 | 会话ID，默认 `"default-session"` |
+| `config` | object | 否 | LLM 配置覆盖（base_url, api_key, model 等） |
+
+SSE 流以 `:ok\n\n`（SSE 注释）和 `retry: 1000\n\n` 两个前缀消息作为握手，强制触发 HTTP 响应头发送，确保客户端尽早收到 `Content-Type: text/event-stream`。后续所有事件均遵循 `data: <json>\n\n` 格式，客户端按行解析 SSE 协议即可。
+
+事件类型分为以下几类：
+
+### 文本输出事件
+
+| 类型 | data 格式 | 说明 |
+|------|-----------|------|
+| `token` | 纯文本字符串（JSON 编码） | Agent 生成的逐 token 增量文本，客户端应连续拼接 |
+| `[DONE]` | 字面量 `[DONE]` | 流结束信号，客户端收到后应关闭 SSE 连接 |
+
+`token` 事件承载的是文本的**增量片段**（从 `AIMessageChunk.content` 直接抽取），而非完整回复。客户端需要累积拼接所有 `token` 事件以还原完整响应。
+
+### 工具调用事件
+
+所有工具相关事件均以 `data: [TOOL] <json>\n\n` 格式传输，其中 JSON 对象的 `type` 字段进一步区分子类型：
+
+| 子类型 | 关键字段 | 触发时机 |
+|--------|----------|----------|
+| `tool_start` | `name`, `args`, `args_display` | Agent 调用工具的瞬间 |
+| `tool_end` | `name`, `args_display` | 工具执行完成 |
+| `progress` | `message` | 工具执行中的进度消息 |
+| `thinking` | 无额外字段 | 模型内部推理中（DeepSeek 等模型） |
+| `executor_start` / `executor_done` | 子Agent相关 | 子 Agent 任务开始/结束 |
+| `skill_condense` / `skill_verify` | 技能相关 | 技能沉淀/验证流程 |
+| `done_stats` | `elapsed` | 执行耗时统计（跟随 `[DONE]` 前发送） |
+
+### 错误事件
+
+```
+data: [ERROR] <错误消息文本>
+data: [DONE]
+```
+
+错误事件后立即跟随 `[DONE]`。错误消息针对不同场景提供中文友好提示：
+- **超时错误**：「⏱️ 请求超时，请检查网络连接或稍后再试…」
+- **网络错误**：「🔌 网络连接失败，请检查LLM服务是否正常运行…」
+- **其他异常**：显示原始错误栈（截取前800字符）
+
+Sources: [app.py](app.py#L465-L598), [agent/agent_langchain.py](agent/agent_langchain.py#L1269-L1550)
+
+## 会话生命周期管理
+
+### 会话与消息持久化
+
+`POST /chat` 端点启动时自动完成三件工作：确保 `conversations` 表存在该会话记录（无则新建，有则更新 `updated_at`）；保存用户消息到 `messages` 表；返回 SSE 流。Agent 完成回复后，异步保存 AI 消息到数据库。
+
+两个重要的字段兼容性处理值得注意：`messages` 表通过 `ALTER TABLE ADD COLUMN` 的 try-except 模式渐进式迁移 `importance`、`last_access_at`、`memory_type` 三个字段，确保旧数据库不会被新版本代码破坏。
+
+### 心跳看门狗
+
+HTTP 服务启动时独立创建一个看门狗线程，每 30 秒检查 `_last_heartbeat` 是否在 60 秒内被更新。若超时，自动执行以下操作：
+
+1. 停止 `llama-server` embedding 子进程
+2. 向自身发送 `SIGTERM` 信号关闭 uvicorn
+
+移动端 App 应定期调用 `POST /heartbeat`（建议间隔 30 秒），App 被系统杀死后心跳中断，服务自动退出，避免 Termux 中残留孤儿进程。
+
+### 打断与关闭
+
+`POST /cancel` 设置全局 `_cancel_requested` 标志，Agent 的 `stream_conversation` 方法在每次循环中检查该标志并在检测到时提前终止流，同时尝试取消子 Agent 的异步任务。`POST /shutdown` 则执行完整的清理流程：清理 Agent 实例、停止 embedding 服务，然后发送 `SIGTERM`。
+
+Sources: [app.py](app.py#L75-L90), [app.py](app.py#L119-L128), [app.py](app.py#L1019-L1053)
+
+## 3D 身体控制服务器：独立的 SSE 实时推送
+
+除 FastAPI 外，`agent/tools/body_server.py` 实现了第二个 HTTP 服务器（ThreadingHTTPServer），运行在端口 18081，提供 3D 虚拟身体的实时渲染与控制。它拥有**独立的 SSE 端点**：
+
+- `/api/events`：推送骨骼姿态命令（`set_bone`、`set_position`、`idle` 等），驱动 Three.js 前端的骨骼动画
+- `/api/response_stream`：推送 AI 回复事件，供 3D 身体浏览器界面显示对话内容
+- `/api/send_message`：接收浏览器前端输入的用户消息（通过共享的线程安全消息队列传递给主 Agent）
+
+两个服务器间的通信通过线程安全的数据结构和 asyncio 事件桥接：`body_server` 维护线程安全的 `message_queue`（带 `asyncio.Event` 通知机制），`main.py` 的异步主循环通过 `get_browser_message()` 获取浏览器输入并传给 Agent。`push_response_event()` 函数则负责将 Agent 的输出反向推送到浏览器的 SSE 流。
+
+Sources: [body_server.py](agent/tools/body_server.py#L1-L271)
+
+## 并发安全设计
+
+由于 FastAPI（asyncio）和 body_server（threading）运行在不同的并发模型中，Pocket-Agent 在三个层面确保线程安全：
+
+1. **数据库连接隔离**：`get_db()` 上下文管理器每次调用创建新的 `aiosqlite` 连接，配合 WAL 模式（`PRAGMA journal_mode=WAL`）和忙等待超时（`PRAGMA busy_timeout=30000`），允许多线程并发读写
+2. **Checkpointer 单连接复用**：AsyncSqliteSaver 使用独立的持久化连接，与应用层数据库操作互不干扰
+3. **工具模块引用注入**：`set_memory_refs()` 通过全局变量传递 `_vector_store_ref` 和 `_db_path_ref`，避免 HTTP 自调用导致的死锁
+
+Sources: [app.py](app.py#L28-L45), [basic_tools.py](agent/tools/basic_tools.py#L1-L30)
+
+## 完整 API 一览
+
+| 端点 | 方法 | 说明 | 典型用途 |
+|------|------|------|----------|
+| `/chat` | POST | SSE 流式对话 | 核心聊天入口 |
+| `/health` | GET | 服务健康检查 | 启动就绪检测 |
+| `/heartbeat` | POST | 更新心跳时间戳 | 保活（App 端定时调用） |
+| `/uptime` | GET | 服务运行时长 | 监控 |
+| `/cancel` | POST | 中断当前推理 | 用户点击停止 |
+| `/shutdown` | POST | 关闭服务 | 安全退出 |
+| `/conversations` | GET | 会话列表 | 历史展示 |
+| `/conversations/{id}/messages` | GET | 会话消息 | 历史加载 |
+| `/conversations/{id}/search` | GET | FTS5 全文搜索 | 消息检索 |
+| `/messages/vector_search` | GET | 向量语义搜索 | 记忆检索 |
+| `/memory/save` | POST | 保存记忆 | 记忆持久化 |
+| `/clear_history` | POST | 清空会话历史 | 重置会话 |
+| `/config` | GET/POST | 配置读写 | App 端配置管理 |
+| `/skills` | GET/POST/PUT/DELETE | 技能 CRUD | 技能管理 |
+| `/version` / `/version/history` | GET | 版本信息 | 版本管理 |
+| `/sync` | POST | git pull 同步 | OTA 更新 |
+| `/setup` | POST | 安装依赖 | 环境初始化 |
+
+## 阅读进阶
+
+理解 HTTP API 模式后，建议按以下路径深入：
+
+```mermaid
+graph LR
+    A[HTTP API 模式] --> B[核心架构与设计哲学]
+    A --> C[LangChain Agent 核心实现]
+    A --> D[对话生命周期与流式输出]
+    A --> E[FastAPI 服务启动与心跳机制]
+    B --> F[Termux 安装与配置]
+    C --> G[中间件链深度解析]
+    D --> H[LangGraph Checkpoint 持久化]
+    E --> I[Android App 客户端集成指南]
+```
+
+- [整体架构与设计哲学](9-zheng-ti-jia-gou-yu-she-ji-zhe-xue) — 理解 Agent 引擎、记忆系统、工具系统如何在此模式下协作
+- [LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian) — 深入了解 `stream_conversation` 如何驱动 LangGraph 的 astream
+- [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu) — SSE 事件在 Agent 内部的完整生成链路
+- [FastAPI 服务启动与心跳机制](45-fastapi-http-fu-wu-qi-dong-yu-xin-tiao-ji-zhi) — 部署运维视角的详细说明
+- [Android App 客户端集成指南](46-android-app-ke-hu-duan-ji-cheng-zhi-nan) — 如何在 Android App 中接入 SSE 流

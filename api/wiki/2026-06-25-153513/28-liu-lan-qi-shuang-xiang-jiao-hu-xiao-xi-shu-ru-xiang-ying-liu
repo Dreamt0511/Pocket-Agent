@@ -1,0 +1,179 @@
+Pocket-Agent 的 3D 身体控制页面（`body_viewer.html`）不仅是 Three.js 渲染的虚拟化身展示窗口，更是一个**完整的双向交互终端**——用户可以直接在浏览器底部的输入框中给 Agent 发送消息，Agent 的思考过程、文字回复、工具调用状态会通过 SSE 实时推送到页面上。这一机制的核心挑战在于：HTTP 服务器运行在独立线程中，Agent 主循环运行在 asyncio 事件循环中，两者需要以**线程安全 + 零轮询**的方式交换数据。
+
+```mermaid
+sequenceDiagram
+    participant Browser as 浏览器 (body_viewer.html)
+    participant Server as HTTP Server (body_server.py, 线程)
+    participant Bridge as main.py (asyncio 事件循环)
+    participant Agent as LangChain Agent
+
+    Browser->>Server: POST /api/send_message {"text":"你好"}
+    Server->>Server: 写入 message_queue
+    Server->>Bridge: call_soon_threadsafe(event.set)
+    Bridge->>Bridge: await browser_message_loop()
+    Bridge->>Agent: stream_conversation("你好")
+    loop 流式生成
+        Agent-->>Bridge: yield {"type": "token", "content": "..."}
+        Agent-->>Bridge: yield {"type": "tool_start", "name": "..."}
+        Bridge->>Server: push_response_event(type, data)
+        Server-->>Browser: SSE data: {...}
+    end
+    Agent-->>Bridge: yield {"type": "done", "response": "..."}
+    Bridge->>Server: push_response_event('done', {...})
+    Server-->>Browser: SSE data: {"type":"done",...}
+```
+
+## 前端消息输入：从输入框到 Agent 主循环
+
+浏览器底部的聊天栏由三个元素组成：文本输入框（`#chat-input`）、发送按钮（`#chat-send`）和消息气泡容器（`#chat-log`）。用户输入文字后，`sendMessage()` 函数会立即在聊天记录中插入一条用户气泡（`.chat-user`），然后**异步 POST** 到 `/api/send_message` 端点，请求体为 `{"text": "..."}`。
+
+```html
+<!-- body_viewer.html 第96-102行 -->
+<div id="chat-bar">
+  <input id="chat-input" type="text" placeholder="给Agent发消息..." autocomplete="off">
+  <button id="chat-send">&#10148;</button>
+</div>
+```
+
+发送按钮在请求发出后置灰并显示 `"..."`，直到后端响应（无论成功失败）才恢复。这种设计避免了用户在等待过程中重复发送。如果网络异常（如服务器未启动），前端会在短暂延时后移除错误提示气泡。
+
+> Sources: 前端聊天栏与 sendMessage 函数定义，参见 [body_viewer.html](agent/tools/body_viewer.html#L86-L102) 和 [body_viewer.html](agent/tools/body_viewer.html#L328-L366)
+
+`/api/send_message` 端点的处理逻辑（位于 `body_server.py`）非常简单——它将文本推入线程安全的消息队列，然后通过 `_async_loop.call_soon_threadsafe(_async_browser_event.set)` 唤醒主协程。这一设计的关键在于：**HTTP 请求运行在线程中，而 Agent 运行在 asyncio 事件循环中，两者通过 asyncio.Event 实现零轮询的通知机制**。
+
+```python
+# body_server.py 第239-253行
+elif self.path == '/api/send_message':
+    content_length = int(self.headers.get('Content-Length', 0))
+    body = self.rfile.read(content_length)
+    data = json.loads(body)
+    text = data.get('text', '').strip()
+    if text:
+        with msg_lock:
+            message_queue.append(text)
+        if _async_browser_event is not None and _async_loop is not None:
+            _async_loop.call_soon_threadsafe(_async_browser_event.set)
+```
+
+> Sources: 消息接收与事件通知机制，参见 [body_server.py](agent/tools/body_server.py#L239-L253)
+
+## 桥接层：browser_message_loop 的设计与执行
+
+`browser_message_loop()` 是 `main.py` 中定义的一个**后台 asyncio 任务（Task）**，作为浏览器消息到 Agent 的桥接器。其工作流程极为精妙：
+
+1. 初始化 asyncio.Event 实例（通过 `init_browser_event()`），并将事件对象暴露给 HTTP 服务器线程
+2. 进入无限循环：先尝试从消息队列非阻塞获取一条消息（`get_browser_message()`）
+3. 如果队列为空，**先 clear 再 double-check**——这是经典的多线程竞态防护模式：防止在 clear 之后、wait 之前，服务器线程恰好推送了一条消息
+4. 如果仍无消息，`await ev.wait()` 阻塞直到服务器线程通知
+5. 收到消息后，检查 `is_processing` 标志——如果 Agent 正在处理上一次请求，**丢弃当前消息**，确保不会并发处理
+
+```python
+# main.py 第475-497行
+async def browser_message_loop():
+    from agent.tools.body_server import (init_browser_event,
+        get_browser_event, get_browser_message, push_response_event)
+    init_browser_event(asyncio.get_event_loop())
+    ev = get_browser_event()
+    while True:
+        msg = get_browser_message()
+        if not msg:
+            ev.clear()
+            msg = get_browser_message()  # double-check
+            if not msg:
+                await ev.wait()
+                msg = get_browser_message()
+        if is_processing or not msg:
+            continue
+```
+
+收到消息后的处理序列为：持久化用户消息到 SQLite → 推送 `thinking` 事件到 SSE → 调用 `agent.stream_conversation(msg)` 获取异步生成器 → 遍历事件类型（`token` / `tool_start` / `tool_end` / `done` / `error`）→ 逐个调用 `push_response_event()` 推送到 SSE 广播队列。
+
+> Sources: 后台消息循环完整实现，参见 [main.py](main.py#L475-L530)
+
+## 响应流推送：push_response_event 与 SSE 端点
+
+`push_response_event()` 是连接 Agent 生成器与浏览器的关键函数。它接收事件类型（如 `"token"`、`"tool_start"`）和附加数据，将其包装为带自增 ID 的结构化事件，追加到 `response_events` 列表中。该列表是线程安全的——通过 `resp_lock` 互斥锁保护。
+
+```python
+# body_server.py 第49-56行
+def push_response_event(event_type, data):
+    global response_event_id
+    with resp_lock:
+        response_event_id += 1
+        response_events.append({
+            'id': response_event_id,
+            'type': event_type,
+            **data
+        })
+```
+
+SSE 端点 `/api/response_stream` 的轮询机制与 3D 命令 SSE 端点 `/api/events` 完全一致：在 `while True` 循环中，每次取出 `id > last_id` 的新事件，序列化为 JSON 后通过 `wfile.write(f'data: {data}\n\n')` 推送。两者共享相同的 `time.sleep(0.05)` 轮询间隔（20Hz），但**数据源不同**—— `/api/events` 读取 `commands` 队列（来自 `body_control_tool.py` 的 HTTP 请求），而 `/api/response_stream` 读取 `response_events` 队列（来自 Agent 的流式输出）。
+
+| 特性 | `/api/events` | `/api/response_stream` |
+|------|---------------|------------------------|
+| **数据源** | `commands` 列表 | `response_events` 列表 |
+| **写入者** | `body_control_tool.py` 工具函数 | `main.py` 的 `browser_message_loop` |
+| **事件类型** | `set_bone`, `set_position`, `idle` | `thinking`, `token`, `tool_start`, `tool_end`, `done`, `error` |
+| **前端消费者** | `startSSE()` → Three.js 骨骼更新 | `startResponseSSE()` → 聊天气泡渲染 |
+
+> Sources: SSE 端点与事件推送机制，参见 [body_server.py](agent/tools/body_server.py#L114-L148)；前端 SSE 消费者，参见 [body_viewer.html](agent/tools/body_viewer.html#L383-L425)
+
+## 前端 SSE 消费者：实时消息渲染
+
+浏览器端通过标准的 `EventSource` API 建立两条 SSE 连接。响应流（`/api/response_stream`）的消费者 `startResponseSSE()` 支持四种事件类型，每种事件对应不同的 UI 呈现：
+
+- **`thinking`**：显示一个三点弹跳动画（`#thinking-indicator`），提示用户模型正在思考或调用工具，不产生文字
+- **`token`**：隐藏 thinking 动画，向当前 AI 气泡（`aiBubble`）增量追加文本内容。如果气泡尚未创建（这是第一个 token），则调用 `startAiBubble()` 创建新的 `.chat-ai` 元素。聊天记录自动滚动到底部
+- **`tool_start`**：在聊天记录中插入一条短暂显示（3 秒后自动移除）的 `.chat-tool` 气泡，内容为 `"调用 [工具名]..."`，给用户可见的工具执行反馈
+- **`done`**：隐藏 thinking 动画，将完成事件的 `response` 字段填充到 AI 气泡中（可能覆盖增量内容，确保最终回复完整），然后启动 60 秒的自动清除定时器
+- **`error`**：将气泡文字颜色改为红色并显示错误消息，同样启动清除定时器
+
+```javascript
+// body_viewer.html 第383-414行
+es.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+    if (data.type === 'thinking') {
+        document.getElementById('thinking-indicator').style.display = 'flex';
+    } else if (data.type === 'token') {
+        document.getElementById('thinking-indicator').style.display = 'none';
+        if (!aiBubble) startAiBubble();
+        aiBubble.textContent += data.content;
+        chatLog.scrollTop = chatLog.scrollHeight;
+    } else if (data.type === 'tool_start') {
+        const toolEl = addChatMsg('调用 ' + data.name + '...', 'chat-tool');
+        setTimeout(() => toolEl.remove(), 3000);
+    } else if (data.type === 'done') {
+        document.getElementById('thinking-indicator').style.display = 'none';
+        if (aiBubble && data.response) {
+            aiBubble.textContent = data.response;
+        }
+        startClearTimer();
+    }
+};
+```
+
+> Sources: 前端 SSE 消费者完整实现，参见 [body_viewer.html](agent/tools/body_viewer.html#L383-L425)
+
+## 三类消息的自动清除机制
+
+浏览器聊天记录设计了**双重自动清除**策略，避免长时间运行后界面堆积过多历史消息：
+
+1. **快速工具调用气泡**：`.chat-tool` 类型的工具状态提示在插入 3 秒后自动移除，`setTimeout(() => toolEl.remove(), 3000)`。这些是过程性信息，用户无需留存
+2. **完整对话气泡超时**：每次 AI 回复完成后（`done` 事件），启动 60 秒的 `clearTimer`。到期后清空所有聊天记录（包括用户消息和 AI 回复）。用户发送新消息时也会调用 `clearChat()` 清除上一轮对话
+3. **清除时机**：`clearChat()` 在以下三种情况触发：新消息发送时（清除上一轮）、`done` 事件时（启动定时器）、收到首个 `token` 时（通过 `startAiBubble()` 清空旧的 AI 气泡）
+
+> Sources: 自动清除机制，参见 [body_viewer.html](agent/tools/body_viewer.html#L316-L327)
+
+## 架构总结与关键设计决策
+
+整个浏览器双向交互体系的核心架构可以用一句话概括：**两条 SSE 流管道，一个 asyncio.Event 桥接器，两套线程安全队列**。这一设计面临的根本约束是：Python 的 HTTP 服务器（`HTTPServer`）运行在独立线程中，而 Agent 主循环（`asyncio`）运行在事件循环中。解决方案是在两者之间设置三个独立的**线程安全缓冲区**：
+
+| 缓冲区 | 方向 | 写入方 | 消费方 | 同步机制 |
+|--------|------|--------|--------|----------|
+| `message_queue` | 浏览器→Agent | HTTP 线程 | asyncio 任务 | `asyncio.Event` 零轮询 |
+| `commands` | Agent→浏览器 | HTTP 线程 | SSE 轮询线程 | `threading.Lock` + `time.sleep` |
+| `response_events` | Agent→浏览器 | asyncio 任务 | SSE 轮询线程 | `threading.Lock` + `time.sleep` |
+
+从浏览器到 Agent 的方向使用 `asyncio.Event` 实现**零轮询**的跨线程通知——服务器线程写入消息后立即通过 `call_soon_threadsafe` 唤醒事件循环。而从 Agent 到浏览器的响应方向则使用 **轮询（polling）方式**（`time.sleep(0.05)`），因为 SSE 端点本身就在独立的 HTTP 线程中运行，无法直接响应 asyncio 事件。20Hz 的轮询频率在视觉上已足够流畅（每帧 50ms），且避免了无限制的空转。
+
+**持续阅读建议**：理解这一交互机制后，建议接着阅读 [Three.js 前端渲染与 SSE 实时推送](27-three-js-qian-duan-xuan-ran-yu-sse-shi-shi-tui-song)，了解与之并行的 3D 命令 SSE 流如何驱动虚拟身体的骨骼动画；也可参考 [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu)，深入了解 `stream_conversation()` 生成器的完整事件协议。

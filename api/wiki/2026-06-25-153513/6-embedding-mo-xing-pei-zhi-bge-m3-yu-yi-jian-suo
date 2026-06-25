@@ -1,0 +1,144 @@
+Pocket-Agent 的语义检索（Semantic Search）能力由 **BGE-M3 嵌入模型** 驱动，为记忆系统的向量搜索提供文本→向量的转换服务。它与 SQLite FTS5 全文搜索协同工作，构成"关键词 + 语义"双路检索的 RRF 融合排序架构。本文档详细说明两种部署场景（本地 llama-server 与远程 API）、核心组件的职责划分、以及启动生命周期管理。
+
+---
+
+## 架构全景：嵌入服务在检索链中的位置
+
+语义检索不是孤立功能，而是嵌入在记忆检索管道（Memory Retrieval Pipeline）中的中间层。下图展示了 save_memory 和 search_memory 两个入口如何经过嵌入层完成向量化与搜索：
+
+```mermaid
+flowchart LR
+    subgraph 写入路径
+        A[用户/Agent 调用 save_memory] --> B[存入 messages 表<br/>获取 lastrowid]
+        B --> C[EmbeddingClient.embed<br/>文本 → 向量]
+        C --> D[VectorStore.add<br/>存入 embeddings 表<br/>(id + BLOB)]
+    end
+
+    subgraph 读取路径
+        E[Agent 调用 search_memory] --> F[FTS5 关键词搜索]
+        E --> G[VectorStore.query<br/>query文本 → 向量 → numpy<br/>余弦相似度排序]
+        F --> H[RRF 融合排序]
+        G --> H
+        H --> I[返回 top-5 记忆]
+    end
+
+    subgraph 基础设施
+        J[llama-server / 远程API<br/>提供 /embeddings 端点]
+        K[SQLite + WAL 模式<br/>embeddings 表]
+    end
+
+    C --> J
+    D --> K
+    G --> K
+    G --> J
+```
+
+这种设计将向量存储与原始内容存储分离：`embeddings` 表只存 `(id, BLOB)`，原始文本在 `messages` 表，查询时通过 id 回表取原文。`Sources: [agent/embedding.py#L98-L120](agent/embedding.py#L98-L120), [agent/tools/basic_tools.py#L753-L867](agent/tools/basic_tools.py#L753-L867)`
+
+---
+
+## 两种部署场景
+
+系统设计为"本地优先、远程兜底"的双模式架构。核心判断逻辑在 `main.py` 和 `app.py` 的初始化代码中：优先使用 `EMBEDDING_SERVER_URL`（本地 llama-server），若为空则回退到 `EMBEDDING_BASE_URL`（远程 API）。`Sources: [main.py#L115-L119](main.py#L115-L119), [.env.example#L27-L38](.env.example#L27-L38)`
+
+| 特性 | 场景一：本地 llama-server（推荐） | 场景二：远程 Embedding API |
+|---|---|---|
+| 对应 .env 变量 | `EMBEDDING_MODEL_PATH` + `EMBEDDING_SERVER_URL` | `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` |
+| 模型来源 | GGUF 格式模型文件（见下方下载说明） | 云端服务商提供（OpenAI / Jina 等） |
+| 启动方式 | App 启动时自动拉起 `llama-server` 子进程 | 无本地进程，直接 HTTP 调用 |
+| 端口占用 | 默认 8080，复用检测机制避免重复启动 | 不涉及 |
+| 依赖 | 需提前编译 `llama.cpp` 得到 `llama-server` 二进制 | 无额外编译依赖 |
+| 延迟 | 低（本地推理，受手机 GPU/CPU 影响） | 中（取决于网络延迟） |
+| 数据隐私 | 完全本地，数据不出设备 | 需发送文本到第三方服务 |
+
+---
+
+## 核心组件详解
+
+### EmbeddingClient — API 通信层
+
+`EmbeddingClient` 封装了对 OpenAI 兼容格式 `/embeddings` 端点的 HTTP 调用。关键设计决策包括：
+
+**可用性检测**：`is_available()` 方法每次调用都发送一个 `"test"` 文本的短请求，3 秒超时。不做缓存是因为嵌入服务可能是后来才启动的（特别是本地 llama-server 初始化时间不确定）。`Sources: [agent/embedding.py#L33-L42](agent/embedding.py#L33-L42)`
+
+**超长文本截断**：`embed()` 方法先尝试全文嵌入，若失败则自动截断到前 4000 字符重试。这对应 BGE-M3 的 8192 token 上下文窗口（约 4000 中文字符），避免因超长文本导致 API 返回错误。`Sources: [agent/embedding.py#L47-L59](agent/embedding.py#L47-L59)`
+
+**批量嵌入优化**：`embed_batch()` 方法支持在单次 API 调用中嵌入多条文本，减少 HTTP 往返次数。结果按 `data[index]` 字段回填到对应位置，保证顺序一致。`Sources: [agent/embedding.py#L61-L80](agent/embedding.py#L61-L80)`
+
+**序列化格式**：向量以 `struct.pack('{n}f', ...)` 打包为 float32 二进制 BLOB，每条 float 占 4 字节。BGE-M3 输出 1024 维向量，因此每条记录约 4KB。`Sources: [agent/embedding.py#L82-L96](agent/embedding.py#L82-L96)`
+
+### VectorStore — SQLite 向量存储与搜索
+
+`VectorStore` 是替代 ChromaDB 的轻量级实现，设计哲学是"只存索引，原文在外"：
+
+**表结构**：`embeddings` 表仅两列 —— `id TEXT PRIMARY KEY`（对应 messages 表的自增 id）和 `embedding BLOB`（float32 二进制向量）。旧版本的 `content` 列已在 schema 迁移逻辑中被移除。`Sources: [agent/embedding.py#L113-L143](agent/embedding.py#L113-L143)`
+
+**查询优化**：`query()` 方法支持将过滤条件（`conversation_id`、`msg_type`、`days`、`memory_type`）以下推方式写入 SQL 的 WHERE 子句，在 SQLite 层面先行过滤，只有匹配的记录才参与 numpy 余弦相似度计算。这种"过滤后计算"策略在大规模记忆库中显著提升性能。`Sources: [agent/embedding.py#L180-L243](agent/embedding.py#L180-L243)`
+
+**相似度计算**：使用 numpy 向量化运算计算余弦相似度：`cos_sim = dot(A, B) / (norm(A) * norm(B))`。结果以 `distance = 1 - similarity` 形式返回（即距离越小越相似），最终按距离升序排列取 top-N。`Sources: [agent/embedding.py#L230-L240](agent/embedding.py#L230-L240)`
+
+### 服务生命周期管理
+
+`start_embedding_server()` 和 `stop_embedding_server()` 两个顶层函数管理本地嵌入服务的子进程生命周期，其模式与 `body_control_tool` 中的身体服务器管理完全一致：
+
+**启动流程**（三段式检测）：
+1. 检查全局变量 `_embedding_process` 是否存活 → 存活则跳过
+2. 检查 `EMBEDDING_MODEL_PATH` 是否存在且 `llama-server` 是否在 PATH 中 → 否则返回 False
+3. 尝试 socket 连接 127.0.0.1:8080 检测端口是否已被占用 → 已占用则复用（不管理该进程生命周期）
+4. 清理旧进程 → 启动新进程（最多重试一次，间隔 0.3s）
+
+启动参数传递为：`llama-server -m <模型路径> --embedding -c 8192 --port 8080 --host 0.0.0.0 -np 4 -b 2048 -ub 2048 -t 4`。`Sources: [agent/embedding.py#L252-L297](agent/embedding.py#L252-L297)`
+
+**停止流程**：先 terminate 等待 3 秒，失败则 kill 等待 2 秒，最后执行 `pkill -f llama-server.*8080` 兜底清理。`Sources: [agent/embedding.py#L298-L316](agent/embedding.py#L298-L316)`
+
+**启动时序**：在 `main.py` 中，嵌入服务与身体服务器**并行启动**（`asyncio.gather`），启动后使用**指数退避**（0s→1s→3s→7s，最多 4 次）轮询 `is_available()` 确认服务就绪。终端 UI 根据就绪状态显示"语义记忆就绪"或"语义记忆未就绪，仅关键词检索"。`Sources: [main.py#L378-L395](main.py#L378-L395), [agent/ui.py#L131-L135](agent/ui.py#L131-L135)`
+
+---
+
+## 配置参数详解
+
+以下参数均在 `.env` 文件中设置，`config.py` 通过 `os.getenv()` 读取并设定默认值：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `EMBEDDING_SERVER_URL` | `http://127.0.0.1:8080/v1` | 本地 llama-server 地址，优先级高于 `EMBEDDING_BASE_URL` |
+| `EMBEDDING_MODEL` | `bge-m3` | 嵌入模型名称，发送到 API 的 `model` 字段 |
+| `EMBEDDING_MODEL_PATH` | 空字符串 | GGUF 模型文件绝对路径。**非空才触发本地服务自动启动** |
+| `EMBEDDING_BASE_URL` | 空字符串 | 远程 API 地址（如 `https://api.openai.com/v1`），仅本地模式不可用时生效 |
+| `EMBEDDING_API_KEY` | 空字符串 | 远程 API 密钥（本地模式不校验，可置空） |
+
+优先级链：`EMBEDDING_SERVER_URL` → `EMBEDDING_BASE_URL` → 空（嵌入禁用）。`Sources: [agent/config.py#L68-L72](agent/config.py#L68-L72), [main.py#L116](main.py#L116)`
+
+---
+
+## 模型下载与部署指南
+
+**推荐模型**：BGE-M3 的 GGUF 量化版，可从 HuggingFace 镜像下载：
+```
+https://hf-mirror.com/gpustack/bge-m3-GGUF/blob/main/bge-m3-Q4_K_M.gguf
+```
+
+Q4_K_M 量化在精度与体积之间取得平衡，文件约 2.2GB，在手机上可正常运行。下载后放置在设备存储中，在 `.env` 中配置 `EMBEDDING_MODEL_PATH` 为绝对路径即可。`Sources: [.env.example#L30](.env.example#L30)`
+
+**编译要求**：本地模式需要提前编译 `llama.cpp` 项目得到 `llama-server` 可执行文件（建议启用 Vulkan GPU 加速，详细步骤参见 [本地大模型部署（llama.cpp + Vulkan GPU 加速）](5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su)）。`Sources: [agent/embedding.py#L277-L278](agent/embedding.py#L277-L278)`
+
+---
+
+## 与记忆检索系统的集成
+
+嵌入向量在记忆系统中的角色是**语义搜索通道**，与 FTS5 关键词搜索形成互补：
+
+- **写入路径**：`save_memory` 工具将内存存入 `messages` 表后，调用 `VectorStore.add()` 生成向量并存为 BLOB。对于舞蹈动作记忆（dance 类型），`_extract_embed_text()` 会剥离 JSON 动作数组，只取文字描述部分嵌入，避免超长无语义内容污染向量空间。`Sources: [agent/tools/basic_tools.py#L735-L752](agent/tools/basic_tools.py#L735-L752)`
+- **读取路径**：`search_memory` 工具同时触发 FTS5 关键词搜索和 `VectorStore.query()` 向量搜索，两者结果经 RRF 融合排序后返回 top-5。最低余弦相似度阈值设为 0.35，低于此阈值的向量结果被丢弃，防止噪声污染。`Sources: [agent/tools/basic_tools.py#L471-L510](agent/tools/basic_tools.py#L471-L510)`
+- **可选降级**：如果嵌入服务未就绪（模型不存在或服务启动失败），语义搜索自动降级为仅关键词搜索，整个 Agent 仍能正常运行，只是记忆检索精度下降。`Sources: [agent/ui.py#L131-L135](agent/ui.py#L131-L135)`
+
+---
+
+## 下一步阅读
+
+本文档聚焦于嵌入服务的配置与启动。要深入理解语义检索在记忆系统中的完整作用，建议按以下顺序继续阅读：
+
+- **[向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du)** — 详解 numpy 向量化计算与过滤条件下推技术
+- **[RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue)** — 了解 FTS5 关键词与向量语义如何融合排序
+- **[记忆判断规则与存储策略](20-ji-yi-pan-duan-gui-ze-yu-cun-chu-ce-lue)** — 了解 save_memory 何时触发、重要性评分规则
+- **[环境变量配置说明（LLM、Embedding、MCP、子 Agent）](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)** — 完整配置参考

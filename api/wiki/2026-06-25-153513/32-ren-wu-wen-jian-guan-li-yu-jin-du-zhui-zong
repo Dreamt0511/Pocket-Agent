@@ -1,0 +1,193 @@
+子 Agent 系统的任务管理围绕两个核心问题构建：**任务状态的持久化存储**（通过文件系统）与 **执行进度的可视化反馈**（通过 Rich UI 组件）。本章深入剖析 `task.json` 文件的生命周期管理、派发-消费机制、执行门禁校验以及多层级的进度显示体系。
+
+## 任务文件系统：`task_manager.py`
+
+`agent/task_manager.py` 提供了任务文件系统的服务端辅助函数，负责任务目录的标准化创建与路径管理。每个任务在 `tasks/{task_id}/` 目录下拥有独立的文件夹，其中包含两个核心文件：`task.json`（任务定义与状态）和 `result.json`（执行结果）。
+
+任务 ID 通过 `generate_task_id()` 生成，格式为 `task_YYYYMMDD_HHMMSS`（基于时间戳），保证全局唯一且可排序。`init_task()` 函数接受 `tasks_dir`、`objective`、`steps`（步骤列表）和可选的 `guidance` 字段，在目标目录下创建完整的 `task.json` 文件，初始化 `status` 为 `"running"`。
+
+Sources: [task_manager.py](agent/task_manager.py#L1-L53)
+
+## 任务数据结构与生命周期
+
+`task.json` 是整个任务管理的核心载体，其数据模型定义了子 Agent 执行的全部上下文：
+
+| 字段 | 类型 | 说明 | 写入时机 |
+|---|---|---|---|
+| `task_id` | string | 唯一标识，格式 `task_时间戳` | 任务创建时 |
+| `objective` | string | 任务目标描述 | 创建时（由主 Agent 提供） |
+| `created_at` | ISO datetime | 创建时间 | 创建时 |
+| `steps` | array | 步骤列表，每步含 `id`、`desc`、`status` | 创建时（主 Agent 分解） |
+| `guidance` | string | 注意事项/约束条件 | 创建时（可选） |
+| `status` / `all_completed` | bool | 整体完成标记 | 子 Agent 执行完毕后 |
+| `summary` | string | 执行摘要 | 子 Agent 执行完毕后 |
+| `error` | string | 失败原因（仅失败时） | 异常捕获时 |
+
+`steps` 中每个步骤的 `status` 支持 `pending` → `in_progress` → `completed` / `failed` / `skipped` 的状态转换。子 Agent 每完成一步即通过 `file_write` 原地更新 `task.json`，实现细粒度的进度跟踪。
+
+Sources: [task_manager.py](agent/task_manager.py#L24-L47), [executor_system.py](agent/prompts/executor_system.py#L1-L23)
+
+## 任务派发机制：`delegate_task` 工具
+
+`delegate_task` 是注册在主 Agent 工具列表中的一个标准 LangChain `@tool`，负责将复杂任务派发给子 Agent 异步执行。其核心流程：
+
+1. **参数校验**：`description` 为必填字段，空值时直接返回错误提示。`tasks_json` 为结构化的 JSON 字符串，包含 `objective`、`steps`（含 `id`、`desc`、`status`）和可选 `guidance`
+2. **目录创建**：基于 `config.TASKS_DIR`（默认 `./tasks/`）创建 `{TASKS_DIR}/{task_id}/` 目录
+3. **数据装配**：如果 `tasks_json` 未提供 `steps`，则将整段 `description` 作为单一步骤（兜底策略）；确保每个 step 都有 `status` 字段
+4. **队列暂存**：将任务信息追加到全局列表 `_pending_background_tasks` 中，立即返回给主 Agent
+
+```python
+# 返回信息示例
+f"✅ 任务已派发到后台执行 (task_id: {task_id})。
+  子Agent完成后会自动沉淀技能。
+  任务进度可通过 file_read 查看 {task_file}"
+```
+
+主 Agent 收到返回后可通过 `file_read` 工具随时读取 `task.json`，查看当前进度。这种**异步派发 + 文件轮询**的模式保证主 Agent 在子 Agent 执行期间继续响应用户的其他需求。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L905-L995)
+
+## 任务消费执行：对话流后的异步派发
+
+任务的消费发生在每次主 Agent 对话流结束后（`run_conversation` 方法的最后阶段），通过 `consume_pending_tasks()` 函数清空全局队列并返回所有待处理任务。
+
+系统存在两种执行模式：
+
+**终端交互模式（main.py）**：使用 `_run_executor_foreground` 前台同步执行子 Agent，在主 Agent 响应完成后依次执行所有待派发任务。执行完成后自动清理主 Agent 状态中的 `delegate_task` 相关消息（通过 `RemoveMessage` 移除 `AIMessage` 和对应的 `ToolMessage`），避免下次对话时因工具调用消息格式不匹配导致 API 400 错误。
+
+**HTTP API 模式（FastAPI + SSE）**：同样消费 `_pending_background_tasks`，但使用 `async for event in self._run_executor_foreground(...)` 的生成器模式，将子 Agent 执行过程中的所有事件（`executor_start`、`tool_start`、`tool_end`、`token`、`executor_done` 等）通过 SSE 实时推送到客户端。
+
+执行完成后，任务结果（包括 `task_id`、`status`、`summary`）被暂存到 `_background_task_results` 列表，在下一次主 Agent 对话开始时输出显示。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1123-L1150), [agent_langchain.py](agent/agent_langchain.py#L1420-L1440)
+
+## 子 Agent 执行器：`_run_executor_foreground`
+
+这是子 Agent 执行的核心方法，也是一个异步生成器，yield 结构化事件供调用方消费。其执行流程可概括为以下阶段：
+
+```mermaid
+flowchart TD
+    A[开始] --> B[配置子Agent LLM<br/>继承主Agent配置 / .env专用配置]
+    B --> C[加载 executor 技能列表<br/>和可用工具集]
+    C --> D[创建独立Agent实例<br/>+ MemorySaver + 中间件链]
+    D --> E{task.json 是否存在?}
+    E -->|否| F[yield executor_done failed]
+    E -->|是| G[读取 task.json<br/>获取 objective + steps]
+    G --> H[初始化日志 + 语音通知]
+    H --> I[流式执行子Agent<br/>stream_mode=messages+updates]
+    I --> J{executor_step ≤ 2?}
+    J -->|是| K[强制重试机制<br/>全新Agent实例 + 内联指令]
+    K --> L{重试 < 2次?}
+    L -->|是| I
+    L -->|否| M[继续]
+    J -->|否| M[读取最终 task.json]
+    M --> N{存在失败步骤?}
+    N -->|是| O[标记 all_completed=false]
+    N -->|否| P[标记 all_completed=true]
+    O --> Q[写入完成状态 + summary]
+    P --> Q
+    Q --> R{yield executor_done}
+    R --> S{步骤≥3且无失败?}
+    S -->|是| T[子Agent继续沉淀技能<br/>检查格式->修正->完成]
+    S -->|否| U[结束]
+    T --> U
+```
+
+**关键特性**：
+
+- **独立 LLM 配置**：子 Agent 可从 `.env` 读取专属的 `EXECUTOR_LLM_*` 配置（base_url、api_key、model、temperature、max_tokens），未设置的字段继承主 Agent 配置。超时时间设为 30 秒（比主 Agent 的 10 秒更长），适应 MCP/Shell 调用的响应延迟
+- **工具隔离**：子 Agent 仅能访问 `shell_exec`、`file_read`、`file_write`、`file_search`、`mcp_call`、`system_info`、`tts_speak` 七个工具，与主 Agent 的工具集形成安全边界
+- **重试机制**：检测到子 Agent 仅执行了 ≤2 步（通常只是读取了 `task.json` 就停止）时，自动创建全新 Agent 实例并重试，最多 2 次。重试指令将 `task.json` 的内容内联到消息中，避免再次因读取文件后停止
+- **人工介入检测**：通过 `tts_speak` 工具或 `termux-tts-speak` shell 命令检测子 Agent 是否申请人工介入，记录到日志并在控制台显示黄色警告
+- **语音通知**：根据用户画像中的语音偏好，在任务启动和失败时通过 `termux-tts-speak` 播报状态
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1595-L1700), [agent_langchain.py](agent/agent_langchain.py#L1700-L1810)
+
+## 门禁系统：`file_write` 中的 `all_completed` 校验
+
+`file_write` 工具内置了一道**任务完成门禁**：当写入的路径以 `task.json` 结尾且 `all_completed` 字段为 `true` 时，系统自动校验所有 `steps` 的 `status` 是否均为 `completed`。如果存在未完成的步骤，直接返回拦截信息，阻止子 Agent 错误标记任务完成。
+
+```python
+unfinished = [s for s in steps if s.get("status") != "completed"]
+if unfinished:
+    first = unfinished[0]
+    return (
+        f"❌ 门禁拦截：任务还有 {len(unfinished)} 个步骤未完成，"
+        f"不能标记 all_completed。第一个未完成的步骤："
+        f"步骤{first.get('id')} - {first.get('desc')}。"
+    )
+```
+
+这道门禁与子 Agent 系统提示词中的"逐步标记"和"最终标记"规则配合，形成了**提示词约束 + 代码强制**的双重保障。即使子 Agent 的 LLM 输出出现偏差，门禁系统也能兜底拦截。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L78-L92), [executor_system.py](agent/prompts/executor_system.py#L15-L16)
+
+## 进度显示系统：`ProgressDisplay`
+
+`agent/ui.py` 中的 `ProgressDisplay` 类基于 Rich 的 `Live` 组件实现了**单行实时更新**的进度显示，用于主 Agent 和子 Agent 执行过程中的状态反馈。
+
+### 核心设计
+
+| 组件 | 职责 |
+|---|---|
+| `ProgressDisplay` | 进度上下文管理器，管理 Live 生命周期 |
+| `_TimerRenderable` | 动态渲染器，每次 Live 刷新时自动计算耗时 |
+| `Live(transient=False)` | Rich 的实时渲染引擎，4次/秒刷新频率 |
+
+`ProgressDisplay` 实现了上下文管理器协议（`__enter__` / `__exit__`），通过 `with` 语句启动和关闭进度显示。其核心属性包括：
+
+- `current_step`：当前步骤描述
+- `step_start_time`：当前步骤的开始时间（用于计算单步耗时）
+- `total_start_time`：整个进度开始时间（用于计算总耗时）
+
+`update(step)` 方法支持两种模式：传入新步骤时更新描述并重置计时器；不传参时仅刷新时间显示（由 `_TimerRenderable` 每秒自动更新耗时文本）。
+
+### 主 Agent 进度流
+
+在主 Agent 的 `run_conversation` 中，进度显示经历以下状态转换：
+
+1. **思考中** → Agent 初始化、环境感知、记忆检索
+2. **调用: tool_name(params)** → 检测到模型生成工具调用
+3. **工具执行完成** → 工具返回结果（通过 `tool_end` 事件）
+4. **Markdown 流式输出** → 首次收到模型回复内容时关闭进度显示，切换为 `Live(Markdown(...))` 渲染最终回复
+5. **完成** → 打印总耗时和上下文用量条
+
+所有异常路径（`CancelledError`、`KeyboardInterrupt`、普通异常）都确保进度显示被正确关闭，不会造成终端显示残留。
+
+Sources: [ui.py](agent/ui.py#L340-L425), [agent_langchain.py](agent/agent_langchain.py#L977-L1220)
+
+### 子 Agent 进度渲染
+
+`_render_task_progress(task_data)` 方法将 `task.json` 中的步骤状态渲染为可视化的文本符号：
+
+```
+  ⬜ 打开拼多多APP
+  ⏳ 搜索"树莓派5"
+  ✔ 咨询客服
+  ✘ 截图保存结果
+  ⤾ 发送邮件
+```
+
+渲染结果可供主 Agent 通过 `file_read` 查看，或通过 SSE 事件推送到 HTTP 客户端。在终端交互模式下，子 Agent 的执行过程通过 `console.print` 直接输出到控制台——蓝色高亮的工具调用行、黄色的人工介入提示、红色的失败信息——形成多层次的视觉反馈体系。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1577-L1593)
+
+## 错误处理与链路审计
+
+完整的错误处理机制贯穿整个任务生命周期：
+
+| 异常场景 | 处理方式 | 影响 |
+|---|---|---|
+| task.json 不存在 | yield `executor_done failed`，记录后台结果 | 下次对话主 Agent 可见失败摘要 |
+| 子 Agent 仅读不执行 | 自动重试（全新 Agent 实例 + 内联指令） | 最多重试 2 次 |
+| 子 Agent 执行异常 | 标记 task.json 为失败状态，写入 error 摘要 | TTS 语音播报失败原因 |
+| 人工介入超时 | 记录 `intervention` 状态为 `failed` | 日志可审计 |
+| 技能沉淀格式不合规 | 子 Agent 读取模板 + 重写技能文件 | 自动修正格式 |
+
+所有子 Agent 的执行日志（包括每一步的思考过程、工具调用、人工介入、最终结果）通过 `structured_logger` 记录到按天归档的日志文件中，形成完整的事件溯源链路。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L2040-L2093), [agent_langchain.py](agent/agent_langchain.py#L1655-L1670)
+
+---
+
+**下一步**：了解子 Agent 执行完成后如何将经验沉淀为可复用的技能文档，参见 [自动沉淀技能（auto-skills：执行经验自动积累）](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)。关于子 Agent 的独立配置与技能隔离机制，参见 [子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi)。

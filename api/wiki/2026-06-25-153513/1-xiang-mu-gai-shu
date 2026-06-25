@@ -1,0 +1,343 @@
+Pocket-Agent 是一个专为移动端设计的轻量级 AI Agent 框架，能在 Android 手机（通过 Termux）或服务器上运行。它基于 LangChain + LangGraph 构建，提供了手机自动化控制、3D 虚拟身体交互、分层记忆系统等独特功能，让 AI 不仅能对话，还能操控手机、控制虚拟形象、自主执行复杂任务。
+
+## 核心特性一览
+
+Pocket-Agent 的功能围绕"让 AI 在手机上真正动起来"这一目标展开，主要特性包括：
+
+| 特性类别 | 功能说明 | 典型应用场景 |
+|---------|---------|-------------|
+| **手机自动化** | 通过 NeuralBridge MCP 协议操控安卓设备 | 自动点击、滑动、输入、截图、获取 UI 树 |
+| **3D 虚拟身体** | Agent 可自主控制 Three.js 3D 模型 | 挥手、跳舞、点头等实时动作编排 |
+| **子 Agent 系统** | 主 Agent 可委托复杂任务给子 Agent | 多步手机操作任务分解与自主执行 |
+| **分层记忆** | 用户画像 + 事实记忆 + 事件记忆 | 跨会话持久化，语义检索历史信息 |
+| **技能系统** | 自动发现 SKILL.md 知识文档 | 按需加载技能指南，扩展 Agent 能力 |
+| **浏览器交互** | SSE 实时推送 + 双向消息通信 | Web 页面聊天、3D 模型实时控制 |
+
+Sources: [README.md](README.md#L1-L30)
+
+## 系统架构
+
+Pocket-Agent 采用模块化分层架构，各组件职责清晰：
+
+```mermaid
+graph TB
+    subgraph "用户接口层"
+        Terminal["终端模式<br/>main.py"]
+        HTTP["HTTP API 模式<br/>app.py"]
+        Browser["浏览器界面<br/>body_viewer.html"]
+    end
+    
+    subgraph "Agent 引擎层"
+        Agent["LangChainPocketAgent<br/>agent_langchain.py"]
+        Middleware["中间件链<br/>上下文压缩/重复检测/调用限制"]
+        Checkpoint["LangGraph Checkpoint<br/>AsyncSqliteSaver"]
+    end
+    
+    subgraph "工具系统"
+        BasicTools["基础工具<br/>文件/Shell/记忆"]
+        BodyTools["3D 身体控制<br/>control_body/move_body"]
+        MCPTools["MCP 调用<br/>手机操控"]
+        DelegateTools["子 Agent 委托<br/>delegate_task"]
+    end
+    
+    subgraph "记忆系统"
+        Profile["用户画像<br/>memory/user_profile.md"]
+        Facts["事实记忆<br/>SQLite + 向量索引"]
+        Events["事件记忆<br/>SQLite + 向量索引"]
+        Embedding["语义检索<br/>FTS5 + BGE-M3 + RRF"]
+    end
+    
+    subgraph "技能系统"
+        MainSkills["主 Agent 技能<br/>main-skills/"]
+        ExecutorSkills["子 Agent 技能<br/>executor-skills/"]
+        AutoSkills["自动沉淀技能<br/>auto-skills/"]
+    end
+    
+    Terminal --> Agent
+    HTTP --> Agent
+    Browser -->|"SSE"| BodyTools
+    
+    Agent --> Middleware
+    Agent --> Checkpoint
+    Agent --> BasicTools
+    Agent --> BodyTools
+    Agent --> MCPTools
+    Agent --> DelegateTools
+    
+    BasicTools --> Embedding
+    Embedding --> Profile
+    Embedding --> Facts
+    Embedding --> Events
+    
+    Agent --> MainSkills
+    DelegateTools --> ExecutorSkills
+```
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1-L50), [README.md](README.md#L80-L120)
+
+## 技术栈
+
+Pocket-Agent 的技术选型兼顾功能完备性与移动端部署的轻量化需求：
+
+### 核心框架
+
+| 组件 | 技术选型 | 作用 |
+|------|---------|------|
+| **Agent 引擎** | LangChain + LangGraph | 提供 Agent 循环、工具调用、状态管理 |
+| **HTTP 服务** | FastAPI + Uvicorn | 提供 SSE 流式聊天 API |
+| **数据库** | SQLite（WAL 模式） | 存储对话历史、向量索引、会话信息 |
+| **向量检索** | numpy + FTS5 | 语义搜索与全文搜索融合 |
+| **3D 渲染** | Three.js | 浏览器端虚拟身体实时渲染 |
+| **终端 UI** | Rich 库 | 流式输出、进度条、上下文用量显示 |
+
+### 运行环境依赖
+
+| 依赖 | 说明 | 必需性 |
+|------|------|--------|
+| **Termux** | Android 终端模拟器 | 手机运行必需 |
+| **Termux:API** | 提供 Android 系统 API | 通知/TTS/传感器必需 |
+| **NeuralBridge** | MCP 服务，手机无障碍操控 | 手机自动化必需 |
+| **llama.cpp** | 本地模型推理（可选） | 本地部署 LLM/Embedding |
+
+Sources: [requirements.txt](requirements.txt), [README.md](README.md#L280-L340)
+
+## 运行模式
+
+Pocket-Agent 支持两种运行模式，适用于不同场景：
+
+### 终端交互模式
+
+直接在 Termux 终端中运行，提供富文本交互界面：
+
+```bash
+python main.py
+```
+
+特点：
+- 完整的 Rich 终端 UI（流式输出、进度条、上下文用量可视化）
+- 支持会话管理（新建、恢复历史会话）
+- 自动启动 3D 身体控制服务器（端口 18081）
+- 自动拉起 Embedding 服务（如有配置）
+
+Sources: [main.py](main.py#L1-L50)
+
+### HTTP API 模式
+
+通过 FastAPI 提供 RESTful API，供 Android App 或其他客户端调用：
+
+```bash
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+特点：
+- SSE 流式聊天接口（`POST /chat`）
+- 完整的会话与消息管理 API
+- 记忆保存与检索 API
+- 心跳机制（60 秒超时自动关闭）
+
+Sources: [app.py](app.py#L1-L50)
+
+### 模式对比
+
+| 对比维度 | 终端交互模式 | HTTP API 模式 |
+|---------|-------------|---------------|
+| **入口文件** | `main.py` | `app.py` |
+| **交互方式** | 命令行输入输出 | HTTP 请求/响应 |
+| **UI 体验** | Rich 终端 UI | 依赖客户端实现 |
+| **适用场景** | 开发调试、直接使用 | App 集成、远程调用 |
+| **3D 身体** | 自动启动 | 需手动启动或集成 |
+| **会话管理** | 终端内管理 | API 调用管理 |
+
+## 核心组件
+
+### Agent 引擎
+
+Agent 引擎是 Pocket-Agent 的核心，基于 LangChain 官方 `create_agent` 构建，通过中间件链增强功能：
+
+```mermaid
+graph LR
+    Input["用户输入"] --> Agent["LangChainPocketAgent"]
+    Agent --> M1["MCPToolResultMiddleware"]
+    M1 --> M2["ImageOptimizationMiddleware"]
+    M2 --> M3["ToolCallRepeatMiddleware"]
+    M3 --> M4["ToolCallIdMiddleware"]
+    M4 --> M5["SummarizationMiddleware"]
+    M5 --> M6["ModelCallLimitMiddleware"]
+    M6 --> Output["流式输出"]
+```
+
+中间件按顺序执行，各司其职：
+- **MCPToolResultMiddleware**：将 MCP 返回的图片 base64 转为文本描述
+- **ImageOptimizationMiddleware**：移除历史消息中的图片数据
+- **ToolCallRepeatMiddleware**：检测并阻止重复工具调用
+- **ToolCallIdMiddleware**：修复某些 LLM 缺失的 tool_call id
+- **SummarizationMiddleware**：token 超限时自动压缩历史
+- **ModelCallLimitMiddleware**：限制单次运行的模型调用次数
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1-L100), [README.md](README.md#L130-L160)
+
+### 记忆系统
+
+分层记忆架构，不同类型的记忆采用不同存储策略：
+
+| 记忆层级 | 存储位置 | 数据特征 | 检索方式 |
+|---------|---------|---------|---------|
+| **用户画像** | `memory/user_profile.md` | 永久性个人信息 | 直接读取 |
+| **事实记忆** | SQLite + 向量索引 | 项目/任务相关决策 | FTS5 + 向量 + RRF |
+| **事件记忆** | SQLite + 向量索引 | 重要事件结果 | FTS5 + 向量 + RRF |
+
+记忆检索采用 **FTS5 全文搜索 + BGE-M3 向量搜索 + RRF 融合排序** 的三重保障机制，确保检索质量。
+
+Sources: [agent/embedding.py](agent/embedding.py#L1-L80), [agent/memory.py](agent/memory.py#L1-L64)
+
+### 工具系统
+
+工具是 Agent 执行具体操作的接口，Pocket-Agent 内置了丰富的工具集：
+
+| 工具分类 | 工具示例 | 功能说明 |
+|---------|---------|---------|
+| **文件操作** | `file_read`, `file_write`, `file_search` | 读写文件、搜索内容 |
+| **系统操作** | `shell_exec`, `system_info` | 执行命令、获取系统信息 |
+| **记忆管理** | `save_memory`, `search_memory` | 保存/检索记忆 |
+| **手机控制** | `mcp_call`（通过 MCP） | 点击、滑动、截图等 |
+| **3D 身体** | `control_body`, `move_body`, `body_script` | 控制虚拟身体动作 |
+| **子 Agent** | `delegate_task` | 委托复杂任务 |
+
+Sources: [agent/tools/basic_tools.py](agent/tools/basic_tools.py#L1-L80), [README.md](README.md#L200-L240)
+
+### 技能系统
+
+技能是 Agent 的"知识文档"，以 `SKILL.md` 文件形式存储，Agent 按需读取并按指南执行：
+
+```
+agent/skills/
+├── main-skills/           # 主 Agent 技能
+│   ├── body-moves/        # 3D 身体动作
+│   ├── dev/               # 开发相关
+│   └── phone/             # 手机操控
+├── executor-skills/       # 子 Agent 技能
+│   ├── fast-mode/
+│   ├── neuralbridge-operation-standard/
+│   └── phone-control-guide/
+└── auto-skills/           # 自动沉淀技能
+    ├── main/
+    └── executor/
+```
+
+技能自动发现机制：Agent 启动时扫描技能目录，将技能名称和描述注入系统提示词，模型在对话中可按需读取完整的 `SKILL.md` 内容。
+
+Sources: [agent/skills/main-skills/body-moves/SKILL.md](agent/skills/main-skills/body-moves/SKILL.md), [agent/agent_langchain.py](agent/agent_langchain.py#L50-L100)
+
+### 子 Agent 系统
+
+子 Agent 系统允许主 Agent 将复杂任务委托给专门的子 Agent 执行：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Main as 主 Agent
+    participant Sub as 子 Agent
+    participant Phone as 手机
+    
+    User->>Main: 发送复杂任务
+    Main->>Main: 调用 delegate_task
+    Main->>Sub: 传递任务描述
+    Sub->>Sub: 独立系统提示词
+    Sub->>Phone: 执行多步操作
+    Phone-->>Sub: 返回操作结果
+    Sub-->>Main: 返回任务结果
+    Main-->>User: 汇报完成情况
+```
+
+子 Agent 特点：
+- 拥有独立的系统提示词和执行权限
+- 可配置独立的 LLM 模型（默认与主 Agent 共用）
+- 任务执行过程通过任务文件管理
+- 执行结果自动返回主 Agent
+
+Sources: [agent/config.py](agent/config.py#L60-L80), [README.md](README.md#L250-L270)
+
+## 项目结构
+
+```
+Pocket-Agent/
+├── main.py                     # 终端交互模式入口
+├── app.py                      # HTTP API 模式入口
+├── agent/
+│   ├── agent_langchain.py      # Agent 核心实现
+│   ├── config.py               # 全局配置
+│   ├── embedding.py            # 向量检索模块
+│   ├── memory.py               # 用户画像管理
+│   ├── task_manager.py         # 任务文件管理
+│   ├── logger.py               # 结构化日志
+│   ├── ui.py                   # 终端 UI 组件
+│   ├── tools/                  # 工具集合
+│   │   ├── basic_tools.py      # 基础工具
+│   │   ├── body_control_tool.py # 3D 身体控制
+│   │   └── body_server.py      # 身体控制服务器
+│   ├── prompts/                # 提示词系统
+│   │   ├── system_base.py      # 主 Agent 人设
+│   │   ├── agent_enhance.py    # 主 Agent 增强规则
+│   │   ├── executor_system.py  # 子 Agent 人设
+│   │   └── executor_enhance.py # 子 Agent 增强规则
+│   └── skills/                 # 技能系统
+│       ├── main-skills/        # 主 Agent 技能
+│       ├── executor-skills/    # 子 Agent 技能
+│       └── auto-skills/        # 自动沉淀技能
+├── memory/                     # 用户画像存储
+├── docs/                       # 文档目录
+├── .env.example                # 环境变量示例
+├── requirements.txt            # Python 依赖
+└── pocket_agent.db             # SQLite 数据库
+```
+
+Sources: [README.md](README.md#L70-L100)
+
+## 快速体验
+
+想要快速体验 Pocket-Agent？按照以下步骤操作：
+
+```mermaid
+graph TD
+    A[安装依赖] --> B[配置 .env]
+    B --> C{选择模式}
+    C -->|终端模式| D[python main.py]
+    C -->|API 模式| E[uvicorn app:app]
+    D --> F[开始对话]
+    E --> G[调用 API]
+    F --> H[体验 3D 身体]
+    G --> H
+```
+
+1. **安装依赖**：`pip install -r requirements.txt`
+2. **配置环境**：复制 `.env.example` 为 `.env`，填写 LLM API 配置
+3. **启动运行**：`python main.py`（终端模式）或 `uvicorn app:app`（API 模式）
+4. **体验功能**：尝试对话、查看系统信息、控制 3D 身体
+
+详细安装步骤请参考 [快速启动](2-kuai-su-qi-dong)。
+
+Sources: [README.md](README.md#L30-L70)
+
+## 下一步阅读
+
+根据你的兴趣和需求，可以选择以下阅读路径：
+
+### 入门路径
+1. **[快速启动](2-kuai-su-qi-dong)** - 完整的安装和运行指南
+2. **[环境搭建](3-termux-an-zhuang-yu-pei-zhi)** - Termux 安装与配置详解
+3. **[终端交互模式](7-zhong-duan-jiao-hu-mo-shi-main-py)** - 深入了解终端模式功能
+
+### 架构深入
+1. **[整体架构与设计哲学](9-zheng-ti-jia-gou-yu-she-ji-zhe-xue)** - 理解设计理念
+2. **[LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian)** - Agent 引擎详解
+3. **[分层记忆架构](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi)** - 记忆系统深度解析
+
+### 功能探索
+1. **[手机控制](23-termux-api-cao-kong-tong-zhi-tts-chuan-gan-qi-dian-chi-deng)** - Termux API 操控
+2. **[3D 身体控制](26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle)** - 虚拟身体交互
+3. **[子 Agent 系统](29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa)** - 任务委托机制
+
+### 扩展开发
+1. **[技能系统概述](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)** - 如何扩展 Agent 能力
+2. **[环境变量配置](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)** - 详细配置说明
+3. **[HTTP API 模式](8-http-api-mo-shi-fastapi-sse-liu-shi)** - API 集成指南

@@ -1,0 +1,218 @@
+Pocket-Agent 基于 LangChain 官方 `create_agent` 框架构建了一套分层中间件体系，在 Agent 执行的生命周期关键节点插入拦截器，系统性地解决了三类核心工程问题：**长对话场景下的 Token 超限**、**LLM 递归行为中的重复工具调用死循环**、**单次执行的资源失控**。本文从源码层面剖析主 Agent 与子 Agent 各自的中间件链构成，以及每个中间件的拦截原理、触发条件和修复策略。
+
+## 架构全景：中间件的三层拦截模型
+
+LangChain 的 `create_agent` 函数提供了一套完整的中间件契约（`AgentMiddleware` 基类），定义了五个可重写的生命周期钩子，按调用顺序依次为 `before_agent` → `before_model` → `wrap_model_call` → `after_model` → `after_agent`，外加独立的 `wrap_tool_call` 工具调用拦截钩子。Pocket-Agent 在 `LangChainPocketAgent._create_agent()` 方法中配置了一个由 6 个中间件组成的链，按**图节点级别**（`before_agent`/`after_agent`）、**模型调用前/后级别**（`before_model`/`after_model`）和**模型调用包装级别**（`wrap_model_call`/`wrap_tool_call`）三个层级分布：
+
+```mermaid
+flowchart TB
+    subgraph Agent执行循环
+        START --> BA["before_agent 节点"]
+        BA --> BM1["MCPToolResult.before_model"]
+        BM1 --> BM2["ImageOptimization.before_model"]
+        BM2 --> MODEL["模型调用（wrap_model_call 链）"]
+        MODEL --> AM["ModelCallLimit.after_model"]
+        AM --> 决策{有 tool_calls?}
+        决策 -->|有| TOOLS["工具节点（wrap_tool_call 链）"]
+        决策 -->|无| AG["after_agent 节点"]
+        TOOLS --> BM1
+    end
+
+    subgraph wrap_model_call 链（洋葱模型）
+        direction LR
+        Summarization --> ToolCallId --> ImageOptimization --> MCPToolResult --> 实际模型调用
+    end
+
+    subgraph wrap_tool_call 链
+        direction LR
+        ToolCallRepeat --> MCPToolResult --> 实际工具执行
+    end
+```
+
+在这个层级结构中，`before_agent`/`after_agent` 节点只在 Agent 启动和完成时各执行一次；`before_model`/`after_model` 节点在每一轮 agent loop 中执行（即在每次模型调用前后触发）；而 `wrap_model_call` 和 `wrap_tool_call` 则以**洋葱模型**方式嵌套包装，形成"请求层层下沉、响应层层上浮"的拦截管道。`factory.py` 中的 `_chain_model_call_handlers()` 函数负责将多个 `wrap_model_call` 处理器从左到右（列表中第一个为最外层）编译成一个 `_ComposedModelCallHandler`，利用闭包变量 `accumulated_commands` 收集各层返回的 `Command` 指令。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L784-L822), [factory.py](langchain_agents_factory)
+
+## 上下文压缩：SummarizationMiddleware
+
+### 触发机制 —— 双重阈值系统
+
+`SummarizationMiddleware` 是 LangChain 框架内置中间件，Pocket-Agent 以 `trigger=("tokens", MAX_CONTEXT_TOKENS // 2)` 即 **64K tokens** 为压缩触发线，以 `keep=("messages", 20)` 指定压缩后保留最近的 **20 条消息**。`MAX_CONTEXT_TOKENS` 在 `config.py` 中定义为 128000（适配 DeepSeek/Qwen 等云端 API 模型的 128K 上下文窗口）。
+
+触发判断在 `_should_summarize()` 方法中执行，支持三种匹配模式：
+
+| 触发类型 | Pocket-Agent 配置 | 判断逻辑 |
+|---|---|---|
+| `("tokens", N)` | `("tokens", 64000)` | 当前消息总 token 数 ≥ N 时触发 |
+| `("messages", N)` | 未使用 | 消息条数 ≥ N 时触发 |
+| `("fraction", ratio)` | 未使用 | 占模型 max_input_tokens 的百分比 |
+
+除此之外，`_should_summarize_based_on_reported_tokens()` 还检查最后一次 `AIMessage` 的 `usage_metadata` 中报告的总 token 数是否已触及阈值——这意味着即使本地 token 计数有偏差，模型端返回的用量数据也能触发压缩，形成**双向保险**。
+
+Sources: [summarization.py](langchain_summarization#L150-L220)
+
+### 压缩策略 —— 安全分割与摘要生成
+
+当触发条件满足时，`_determine_cutoff_index()` 首先根据 `keep` 配置计算分割点。若 `keep` 设为 `("messages", 20)`，则先取 `target_cutoff = len(messages) - 20`，再调用 `_find_safe_cutoff_point()` **回溯调整**——如果分割点恰好落在某个 `ToolMessage` 上，则向前搜索对应的 `AIMessage`，确保同一次 tool call 的请求和响应**配对不分离**。这是为了防止 LLM 接收到孤立的工具响应而没有对应的调用上下文。
+
+分割完成后，历史消息通过 LLM 自身生成摘要——使用一段精心设计的 `DEFAULT_SUMMARY_PROMPT`，要求模型从四个维度提取核心信息：**SESSION INTENT**（用户目标）、**SUMMARY**（关键决策与推理）、**ARTIFACTS**（创建/修改的文件资源）、**NEXT STEPS**（待完成事项）。摘要消息通过 `RemoveMessage(id=REMOVE_ALL_MESSAGES)` 替换原有消息，压缩后的消息列表为 `[摘要HumanMessage, ...保留的20条最近消息]`。
+
+值得注意的是，`SummarizationMiddleware` 是通过 `wrap_model_call` 钩子实现的，而非 `before_model`——这意味着它在每一轮模型调用**之前**都有机会拦截并修改请求中的 `messages`，从 `ModelRequest` 层面完成消息替换。之所以用 `wrap_model_call` 而非 `before_model`，是因为它需要直接修改传入模型的 messages 列表，而 `before_model` 只能返回 state 更新，不能干预 model 节点内部的请求构建过程。
+
+Sources: [summarization.py](langchain_summarization#L230-L360)
+
+## 重复检测：ToolCallRepeatMiddleware
+
+### 问题根源 —— LLM 的递归幻觉
+
+在实际运行中，某些 LLM（尤其开源模型）在接收到工具返回结果后，可能**不分析返回内容**而是直接发出与上一轮**完全相同的工具调用**，包括相同的工具名称和参数。这种"原地踏步"行为会导致 Token 的无限消耗，且可能永远无法推进任务——这是 Agent 递归死循环的典型表现。
+
+Pocket-Agent 自定义的 `ToolCallRepeatMiddleware` 位于 `agent_langchen.py` 第 226 行，通过 `wrap_tool_call` 钩子拦截每一次工具调用，维护一个**单元素状态缓存** `self._last_tool_call` 记录上一次调用的 `(name, args_json)` 元组。当检测到当前调用与上一次完全相同时（使用 `json.dumps(args, sort_keys=True)` 确保参数结构统一），直接拦截工具执行，返回一条警告 `ToolMessage`：
+
+```
+⚠️ 你刚刚已经调用过 {name}({args}) 并且得到了结果，请勿重复调用。请基于已有结果继续下一步操作。
+```
+
+### 设计要点
+
+- **非持久化状态**：`_last_tool_call` 是实例变量而非跨轮次持久化，因为重复检测只关注**连续两次**是否相同——如果模型在中间插入了其他调用，则状态重置，不会误判。
+- **参数归一化**：使用 `sort_keys=True` 对参数字典排序后序列化，确保 `{"a":1, "b":2}` 与 `{"b":2, "a":1}` 被视为相同，避免因键顺序差异导致误判。
+- **仅拦截不阻断**：返回 `ToolMessage` 而非抛异常，模型收到警告后可以自我纠正，继续下一轮迭代。
+- 此中间件同时实现了 `wrap_tool_call`（同步）和 `awrap_tool_call`（异步）两个方法，以兼容 `create_agent` 的同步和异步执行路径。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L226-L270)
+
+## 模型调用限制：ModelCallLimitMiddleware
+
+### 双重计数机制
+
+`ModelCallLimitMiddleware` 是 LangChain 框架内置中间件，Pocket-Agent 以 `run_limit=MAX_ITERATIONS`（config.py 中默认为 **300**）和 `exit_behavior="end"` 进行配置。它通过 `before_model` 和 `after_model` 两个钩子联合工作：
+
+- **`after_model`**：每次模型调用完成后，将 `run_model_call_count` 和 `thread_model_call_count` 各加 1。`run_model_call_count` 使用 `UntrackedValue` 注解，意味着它在同一线程的不同轮次之间**不持久化**；`thread_model_call_count` 使用标准 `PrivateStateAttr`，跨轮次累计。
+- **`before_model`**：每次模型调用前检查当前计数是否已达到限制。若达到，根据 `exit_behavior` 决定行为：
+  - `exit_behavior="end"`：通过 `jump_to: "end"` 机制直接跳转到 Agent 图的结束节点，并注入一条 `AIMessage(content="...")` 说明已达到限制。
+  - `exit_behavior="error"`：抛出 `ModelCallLimitExceededError` 异常。
+
+```mermaid
+sequenceDiagram
+    participant ModelNode
+    participant AfterModel
+    participant BeforeModel
+    participant EndNode
+
+    Note over ModelNode,BeforeModel: 第 1~299 次调用
+    ModelNode->>AfterModel: 模型返回
+    AfterModel->>AfterModel: count += 1
+    AfterModel->>BeforeModel: 返回 to model
+    BeforeModel->>BeforeModel: count=299 < 300，放行
+    BeforeModel->>ModelNode: 继续调用
+
+    Note over ModelNode,BeforeModel: 第 300 次调用前
+    ModelNode->>AfterModel: 模型返回
+    AfterModel->>AfterModel: count=300
+    AfterModel->>BeforeModel: 返回 to model
+    BeforeModel->>BeforeModel: count≥300，触发 jump_to:end
+    BeforeModel->>EndNode: 注入结束消息，终止循环
+```
+
+`jump_to` 机制的底层实现依赖 `StateGraph` 的条件边——`factory.py` 中的 `_add_middleware_edge()` 函数为每一个带有 `@hook_config(can_jump_to=["end"])` 装饰器的 `before_model`/`after_model` 方法生成条件分支，读取 state 中的 `jump_to` 字段决定下一跳目标。
+
+Sources: [model_call_limit.py](langchain_model_call_limit), [agent_langchain.py](agent/agent_langchain.py#L800-L805)
+
+## 自定义补充中间件
+
+### ToolCallIdMiddleware —— 修复工具调用 ID 缺失
+
+某些 LLM（如 GLM 系列）生成的 `tool_calls` 中缺少 `id` 字段，导致 LangGraph 的 `ToolNode` 在构建 `ToolMessage` 时因 `tool_call_id` 为空而报错。此中间件通过 `wrap_model_call` 拦截模型输出，扫描所有 `AIMessage` 中的 `tool_calls`，对缺失 ID 的调用自动填充 `call_{uuid}` 格式的 ID。
+
+实现上先通过 `hasattr(msg, 'tool_calls')` 检测消息是否包含工具调用，再用 `not tc.get("id")` 逐一检查 ID 有效性。修改后生成一个新的 `AIMessage` 实例替换原消息，确保不可变性。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L273-L308)
+
+### MCPToolResultMiddleware —— 图片内容智能压缩
+
+当 MCP 工具（如 NeuralBridge 截图）返回包含 base64 图片数据的 `ToolMessage` 时，直接将其送入 LLM 会导致灾难性的 Token 爆炸——一张 1080p 截图的 base64 编码可达数 MB。此中间件通过 `wrap_tool_call` 钩子在工具结果返回时拦截处理：识别 `content` 中的图片数据（支持 MCP 标准 `image` 类型、OpenAI 格式 `image_url` 类型、以及纯 base64 字符串），将其替换为结构化的文本描述信息（分辨率、大小、格式），并附加说明"你可以直接查看生成的截图内容。如果需要分析图片内容，请明确说明。"
+
+支持四种检测模式：
+1. **MCP 标准返回**：`{"content": [{"type": "image", "data": "base64"}]}`
+2. **OpenAI 格式列表**：`msg.content` 为列表且包含 `type: "image_url"` 项
+3. **JSON 包裹的图片字段**：在字典中查找 `image`/`screenshot`/`img`/`base64`/`data` 等键
+4. **纯文本 base64**：以 `/9j/`（JPEG）或 `iVBORw0KGgo`（PNG）开头的内容
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L369-L520)
+
+### ImageOptimizationMiddleware —— 历史图片数据清除
+
+与 MCPToolResultMiddleware 不同，此中间件关注的是**历史消息**中累积的图片 base64 数据。由于对话过程中 LLM 可能多次调用截图工具，每次截图结果都会作为历史消息留在上下文中，长对话后这些图片数据会持续消耗 Token 预算。
+
+该中间件通过 `before_model` 钩子（即模型调用前），扫描 `request.messages` 中的所有消息，移除其中的图片 base64 数据（同时支持 Markdown 图片格式和多模态列表格式），替换为文本标记 `[截图已保存]`。这一修改在**请求进入模型之前**完成，模型永远看不到历史图片的二进制数据。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L311-L366)
+
+## 子 Agent 中间件链的简化策略
+
+子 Agent（Executor）的中间件链比主 Agent 更简洁，仅包含两个中间件：
+
+```python
+executor_middleware = [
+    ToolCallIdMiddleware(),
+    ModelCallLimitMiddleware(
+        run_limit=self.max_iterations,
+        exit_behavior="end",
+    ),
+]
+```
+
+子 Agent 省略了 `SummarizationMiddleware`（因为子 Agent 单次任务通常较短，无需压缩）、`MCPToolResultMiddleware`（子 Agent 不直接调用 MCP 工具，而是通过主 Agent 委托）、`ImageOptimizationMiddleware`（同理）和 `ToolCallRepeatMiddleware`（子 Agent 的任务执行流程更线性和确定）。子 Agent 的 `run_limit` 复用主 Agent 的 `max_iterations`（默认 300），确保即使子 Agent 出现异常循环也能自动终结。
+
+子 Agent 使用独立的 LLM 配置（通过 `EXECUTOR_LLM_CONFIG` 从 `.env` 读取），未配置的字段自动继承主 Agent 的对应值，实现灵活的模型隔离。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1636-L1650)
+
+## 中间件链的执行保障机制
+
+### 递归限制（Recursion Limit）
+
+在 Agent 的最外层存在一道兜底防线——`RECURSION_LIMIT` 配置项（config.py 中设为 600），通过 `config["recursion_limit"]` 传入 LangGraph 的 `CompiledStateGraph`。这个值是 LangGraph 图执行引擎层面的硬限制，无论中间件如何工作，当图的节点执行总次数达到该上限时，LangGraph 会抛出 `RecursionLimitError`。`RECURSION_LIMIT` 建议设置为 `MAX_ITERATIONS` 的两倍，为工具调用之间的「模型 → 工具 → 模型」转换留出余量。
+
+### 中间件组合优先级
+
+在 `factory.py` 的 `create_agent()` 函数中，中间件的组合遵循明确的优先级规则：
+
+1. **`before_model`/`after_model` 节点**：以列表顺序串联为图节点，先添加的中间件在流程中**更早执行**。
+2. **`wrap_model_call` 链**：以洋葱模型嵌套，列表**第一个**为最外层（最先收到请求，最后收到响应）。
+3. **`wrap_tool_call` 链**：同样以洋葱模型嵌套，通过 `_chain_tool_call_wrappers()` 从右向左组合。
+
+这种设计使得 Pocket-Agent 在 `agent_langchain.py` 中定义的中间件列表顺序至关重要：
+
+```python
+middleware = [
+    MCPToolResultMiddleware(),       # 最外层的wrap_tool_call — 最先处理工具结果
+    ImageOptimizationMiddleware(),    # before_model — 模型调用前清除历史图片
+    ToolCallRepeatMiddleware(),      # wrap_tool_call — 检测重复调用
+    ToolCallIdMiddleware(),          # wrap_model_call — 修复缺失的tool_call_id
+    SummarizationMiddleware(...),    # wrap_model_call — 上下文压缩（最内层）
+    ModelCallLimitMiddleware(...),   # before_model + after_model — 限制模型调用次数
+]
+```
+
+`SummarizationMiddleware` 放在 `wrap_model_call` 链的最内层意味着它最接近实际模型调用——这是合理的，因为压缩逻辑需要拿到完整的消息列表并可能直接替换它们。而 `ModelCallLimitMiddleware` 作为 `before_model` 节点运行，在到达模型调用链之前就已经完成了计数检查。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L784-L822), [factory.py](langchain_agents_factory)
+
+## 关键配置参数对照
+
+| 配置项 | 默认值 | 位置 | 作用 |
+|---|---|---|---|
+| `MAX_ITERATIONS` | 300 | [config.py](agent/config.py#L15) | 模型调用次数上限，同时作为 Summarization 兜底 |
+| `RECURSION_LIMIT` | 600 | [config.py](agent/config.py#L18) | LangGraph 图执行总次数硬上限 |
+| `MAX_CONTEXT_TOKENS` | 128000 | [config.py](agent/config.py#L24) | 模型上下文窗口大小，压缩触发线取其一半 |
+| `Summarization.trigger` | `("tokens", 64000)` | [agent_langchain.py](agent/agent_langchain.py#L796-L797) | 上下文压缩触发阈值 |
+| `Summarization.keep` | `("messages", 20)` | [agent_langchain.py](agent/agent_langchain.py#L798) | 压缩后保留最近消息数 |
+| `ModelCallLimit.run_limit` | `MAX_ITERATIONS` (300) | [agent_langchain.py](agent/agent_langchain.py#L802-L805) | 单次 run 模型调用次数上限 |
+
+## 学习路径
+
+- 理解中间件的底层执行机制 → [LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian)
+- 探索 DeepSeek 兼容性补丁（与 middleware 协同工作）→ [DeepSeek reasoning_content 兼容性补丁机制](12-deepseek-reasoning_content-jian-rong-xing-bu-ding-ji-zhi)
+- 了解上下文压缩后的对话生命周期 → [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu)

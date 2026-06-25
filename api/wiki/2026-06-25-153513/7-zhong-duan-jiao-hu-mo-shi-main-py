@@ -1,0 +1,350 @@
+`main.py` 是 Pocket-Agent 的**终端入口点**，也是用户最直接的使用方式。它提供了一个完整的交互式 REPL（Read-Eval-Print Loop）环境，让你在 Termux 终端中通过对话方式与 AI Agent 互动——你输入问题，Agent 调用工具、感知环境、检索记忆、生成回复，整个过程以丰富的 Rich 界面实时呈现。
+
+Sources: [main.py](main.py#L1-L10)
+
+---
+
+## 整体流程总览
+
+终端模式的运行可以划分为四个清晰的阶段：**基础设施初始化** → **后台服务启动** → **Agent 创建** → **对话循环**。下面的时序图展示了启动过程中各模块的协作关系：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Main as main.py
+    participant DB as SQLite
+    participant Embed as Embedding Server
+    participant Body as 3D Body Server
+    participant Agent as LangChain Agent
+
+    Main->>DB: _init_db() 创建表+FTS5索引
+    Main->>DB: _init_vector_store() 初始化向量存储
+    Main->>DB: _init_checkpointer() AsyncSqliteSaver
+    Main->>DB: _cleanup_old_messages() 清理旧记忆
+    Main->>Embed: start_embedding_server() 启动嵌入服务
+    Main->>Body: start_body_server() 启动3D身体服务
+    Note over Main,Body: 两个后台服务并行启动
+    Main->>Main: 打印 Banner + 服务状态
+    Main->>Agent: 创建 LangChainPocketAgent
+    Agent->>Agent: _init_llm() 初始化 LLM
+    Agent->>Agent: _create_agent() 注入工具+中间件
+    loop 对话循环
+        Main->>User: 显示输入提示
+        User->>Main: 输入消息
+        Main->>Main: 解析命令(/resume/undo/clear/技能名)
+        Main->>DB: _save_message() 持久化用户消息
+        Main->>Agent: run_conversation()
+        Agent->>Agent: 检索记忆 + 环境感知
+        Agent->>Agent: astream() 流式执行
+        Agent->>User: 流式输出回复
+        Main->>DB: _save_message() 持久化AI回复
+    end
+```
+
+Sources: [main.py](main.py#L1-L45), [main.py](main.py#L112-L145), [agent/agent_langchain.py](agent/agent_langchain.py#L524-L580)
+
+## 第一阶段：基础设施初始化
+
+### 数据库初始化（`_init_db`）
+
+程序启动的第一件事是建立数据库连接。`_init_db()` 函数使用同步 `sqlite3` 连接 `pocket_agent.db`（与 HTTP 模式 `app.py` **共用同一个数据库文件**），执行以下操作：
+
+- 创建 `conversations` 表：管理会话元数据（ID、标题、创建/更新时间）
+- 创建 `messages` 表：存储所有对话消息，按 `conversation_id` 建立索引
+- 兼容字段迁移：自动添加 `importance`、`last_access_at`、`memory_type` 等扩展列
+- FTS5 全文索引：使用 **trigram 分词器**（完美支持中文），配合触发器实现增量更新
+
+```python
+# 首次建表时全量重建 FTS 索引
+if fts_was_created:
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+```
+
+这种设计确保即使大量历史数据存在，新建 FTS 索引时也能一次完成全部重建。
+
+Sources: [main.py](main.py#L43-L108)
+
+### 向量存储初始化（`_init_vector_store`）
+
+创建 `EmbeddingClient` 和 `VectorStore` 实例。向量存储使用 `SQLite + numpy` 的轻量方案（替代 ChromaDB，避免 Rust 编译依赖），`embeddings` 表只存向量 BLOB，原始文本仍在 `messages` 表中。嵌入服务有两种配置方式：
+
+| 场景 | 配置项 | 说明 |
+|------|--------|------|
+| 本地服务（推荐） | `EMBEDDING_SERVER_URL` | 自动拉起 `llama-server` 进程 |
+| 远程 API | `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` | 兼容 OpenAI 格式 |
+
+Sources: [main.py](main.py#L112-L118), [agent/config.py](agent/config.py#L53-L58), [agent/embedding.py](agent/embedding.py#L1-L50)
+
+### Checkpoint 持久化（`_init_checkpointer`）
+
+创建 `AsyncSqliteSaver` 实例——这是 LangGraph 的**对话状态持久化层**。它将 Agent 的执行状态（包括消息历史、中间变量、工具调用记录等）实时写入 SQLite，确保即使程序意外中断，后续 `/resume` 也能完整恢复对话。如果初始化失败（如缺少 `aiosqlite` 依赖），自动降级为内存级 `MemorySaver`。
+
+Sources: [main.py](main.py#L120-L132)
+
+### 旧记忆清理（`_cleanup_old_messages`）
+
+启动时自动清理**超过 30 天且重要性 ≤ 2** 的记忆向量的索引。这个清理策略与 `app.py` 完全一致，确保向量存储不会无限膨胀。
+
+Sources: [main.py](main.py#L134-L149)
+
+---
+
+## 第二阶段：后台服务并行启动
+
+初始化完成后，`main.py` 使用 `asyncio.gather` **并行启动两个后台服务**：
+
+1. **Embedding 服务**：如果配置了本地模型路径（`EMBEDDING_MODEL_PATH`），自动拉起 `llama-server` 进程提供嵌入 API；否则跳过
+2. **3D 身体渲染服务**：启动 HTTP 服务器，提供 Three.js 前端页面和 SSE 实时推送端点
+
+启动后，程序使用**指数退避策略**（0s、1s、3s、7s）检测嵌入服务是否可用，最多等待 7 秒。状态会显示在 banner 下方的暗灰色提示行中：
+
+```
+  语义记忆就绪           # 嵌入服务正常运行
+  语义记忆未就绪，仅关键词检索  # 嵌入服务不可用，降级使用 FTS5 搜索
+```
+
+Sources: [main.py](main.py#L351-L374), [agent/embedding.py](agent/embedding.py#L100-L140)
+
+---
+
+## 第三阶段：Agent 创建
+
+### LLM 配置加载
+
+LLM 配置完全从 `.env` 环境变量读取，适配电脑/手机双环境。关键配置项包括：
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `DEFAULT_LLM_BASE_URL` | `http://127.0.0.1:8080/v1` | OpenAI 兼容 API 地址 |
+| `LLM_API_KEY` | `dummy` | API 密钥 |
+| `LLM_MODEL` | `gelab-zero-4b-preview` | 模型名称 |
+| `LLM_TEMPERATURE` | `0.7` | 温度（强制限制在 0-2 范围） |
+| `LLM_MAX_TOKENS` | `8000` | 最大输出 token（强制 ≥ 1） |
+
+配置中的数值参数经过双重安全校验（类型转换 + 范围限制），配置错误时不会导致程序崩溃。
+
+Sources: [main.py](main.py#L376-L404)
+
+### LangChainPocketAgent 创建
+
+`LangChainPocketAgent` 的构造函数执行一系列关键初始化操作：
+
+```mermaid
+flowchart LR
+    A[传入 system_prompt] --> B[_init_llm]
+    B --> C[创建 ChatOpenAI]
+    C --> D[_create_agent]
+    D --> E[注入中间件链]
+    E --> F[创建 LangGraph Agent]
+    F --> G[初始化 LongTermMemory]
+    G --> H[加载用户画像]
+    H --> I[初始化 AgentLogger]
+```
+
+`_create_agent` 方法特别重要，它构建了完整的**中间件链**来处理各种边界情况：
+
+- **MCPToolResultMiddleware**：将 MCP 工具返回的 base64 图片转换为多模态格式，防止 token 爆炸
+- **ImageOptimizationMiddleware**：优化历史图片内容，避免累积导致 token 溢出
+- **ToolCallRepeatMiddleware**：检测连续重复工具调用，第二次触发时返回警告
+- **ToolCallIdMiddleware**：修复某些 LLM 缺少 `tool_call_id` 字段的问题
+- **SummarizationMiddleware**：当历史上下文超过 64K tokens 时自动压缩，保留最近 20 条消息
+- **ModelCallLimitMiddleware**：限制单次运行最多调用 `MAX_ITERATIONS` 次模型
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L530-L580), [agent/agent_langchain.py](agent/agent_langchain.py#L738-L820)
+
+---
+
+## 第四阶段：对话循环
+
+### 主循环结构
+
+对话循环使用 `while True` 模式，每次迭代包含以下步骤：
+
+1. **异步等待用户输入**（支持 Tab 补全、方向键历史、退格编辑）
+2. **命令解析**：检查是否匹配退出命令、内置指令（`/resume`/`/undo`/`/clear`）或技能快捷调用
+3. **消息持久化**：保存用户消息到 SQLite
+4. **Agent 执行**：创建异步任务 `agent.run_conversation()`
+5. **ESC 中断监听**：在任务执行期间监听键盘中断
+6. **回复持久化**：保存 Agent 回复到 SQLite
+
+### 内置命令集
+
+| 命令 | 功能 | 内部行为 |
+|------|------|----------|
+| `q` / `quit` / `exit` / `bye` / `退出` | 退出程序 | 打印"再见！"后 `break` 退出循环 |
+| `help` | 显示常用指令 | 直接打印 Markdown 帮助文本，不走 Agent |
+| `/resume` | 恢复历史会话 | 查询 `conversations` 表 → 显示编号列表 → 用户选择 → 切换 thread_id |
+| `/undo` | 撤回上条消息 | 清空当前 Agent 历史，生成新会话 ID |
+| `/clear` | 清屏并重置对话 | 清空历史 + 清屏 + 重新显示欢迎界面 |
+| `/技能名 [需求]` | 快捷加载技能 | 将输入转换为"请读取 XX 技能并按指导执行：需求" |
+
+Source: [main.py](main.py#L438-L530)
+
+### 技能快捷调用机制
+
+`/技能名` 语法是终端模式的一个特殊设计。当用户输入以 `/` 开头但不匹配内置命令时，`main.py` 会：
+
+1. 从 `/` 后提取技能名称
+2. 在已加载的技能信息中查找匹配
+3. 将原始输入转换为自然语言指令发送给 Agent
+
+例如输入 `/develop-python 帮我写个爬虫` 会被转换为：
+```
+请读取 develop-python 技能（agent/skills/main-skills/develop-python/SKILL.md）并按指导执行：帮我写个爬虫
+```
+
+这个设计让用户可以像使用 Vim 命令一样快速唤起特定技能，同时保持 Agent 自主决策的灵活性。
+
+Sources: [main.py](main.py#L483-L490)
+
+### ESC 中断机制（高级实现）
+
+终端模式实现了**硬件级别的 ESC 打断**，中断 Agent 正在进行的思考或工具执行。其实现方式非常精妙：
+
+1. Agent 任务创建时，将任务引用存入 `_esc_ref` 列表（闭包引用）
+2. 临时修改终端属性（`termios`），关闭行缓冲、回显和信号字符
+3. 通过 `loop.add_reader(fd, ...)` 注册 stdin 的文件描述符监听
+4. 每当有数据可读时，检查是否包含 `\x1b`（ESC 键的 ASCII 码）
+5. 检测到 ESC 立即调用 `task.cancel()`
+6. 无论是否被打断，`finally` 块确保终端属性被完整恢复
+
+关键设计决策：只修改**输入属性**（`ICANON`、`ECHO`、`ISIG`），保留**输出属性**（`OPOST`），确保 Rich 的 Live 组件和 `console.print` 输出不受影响。
+
+```python
+# 只改输入属性，保留输出属性
+new_attr[0] = new_attr[0] & ~(termios.IGNBRK | termios.BRKINT | ...)
+new_attr[3] = new_attr[3] & ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG)
+# 保留输出属性（OPOST），确保 Live/console.print 正常渲染
+```
+
+Sources: [main.py](main.py#L498-L596)
+
+### 浏览器消息后台监听
+
+除了终端输入，`main.py` 还通过 `asyncio.create_task(browser_message_loop())` 启动一个**后台协程**，持续监听来自 3D 身体页面的浏览器消息。当用户通过网页输入消息时：
+
+1. 使用 `asyncio.Event` 实现无轮询等待（`await ev.wait()`）
+2. 检查 `is_processing` 标志，避免与终端输入冲突
+3. 使用 `agent.stream_conversation()` 流式处理
+4. 通过 `push_response_event()` 将 token、工具调用、完成事件实时推送到浏览器
+
+这个设计让 Pocket-Agent 同时支持终端和浏览器的**双通道交互**。
+
+Sources: [main.py](main.py#L425-L462)
+
+---
+
+## 对话执行引擎
+
+### `run_conversation` 的核心工作流
+
+当用户消息进入 Agent 后，`LangChainPocketAgent.run_conversation()` 执行以下流程：
+
+```mermaid
+flowchart TD
+    A[收到用户消息] --> B[记录对话开始日志]
+    B --> C[通知后台任务结果]
+    C --> D[创建进度显示]
+    D --> E[检索相关记忆]
+    E --> F[合并用户画像+环境感知+记忆]
+    F --> G[astream 双通道流式执行]
+    G --> H{收到 chunk}
+    H -->|messages 类型| I[累积回复内容]
+    I --> J[Markdown Live 实时渲染]
+    J --> K[on_token 回调推送]
+    H -->|updates 类型| L{来源判断}
+    L -->|model| M[工具调用/思考中]
+    M --> N[记录日志+UI显示+on_tool_event]
+    L -->|tools| O[工具执行完成]
+    O --> P[on_tool_event 通知]
+    H --> Q{流结束}
+    Q -->|是| R[消费子Agent任务队列]
+    R --> S[清理delegate_task消息]
+    S --> T[后处理去重检测]
+    T --> U[统计耗时+token用量]
+    U --> V[返回响应]
+```
+
+### 去重后处理
+
+代码中包含两层去重机制：
+
+1. **实时去重**：流式接收时检查当前 chunk 的前 30 个字符是否已出现在最近 400 个字符窗口中，避免模型生成重复内容
+2. **最终后处理**：取回复前 80 个字符，在后文中查找第二次出现的起始位置，如有则截断
+
+```python
+if len(full_response) > 200:
+    prefix = full_response[:80]
+    dup_pos = full_response.find(prefix, 80)
+    if dup_pos > 0:
+        full_response = full_response[:dup_pos]
+```
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L941-L1250)
+
+### 上下文用量可视化
+
+每次对话完成后，会在终端底部显示上下文用量条：
+
+```
+✅ 完成 (总耗时 12 秒) |████████████████░░░░| 72% (92K/128K)
+```
+
+颜色随用量变化：**绿色**（<50%）→ **黄色**（50-80%）→ **红色**（>80%），直观反映上下文窗口的消耗情况。
+
+Sources: [agent/ui.py](agent/ui.py#L300-L330)
+
+---
+
+## 用户界面组件
+
+`PocketUI` 类封装了所有终端渲染逻辑，基于 Rich 库实现：
+
+| 方法 | 用途 | 视觉效果 |
+|------|------|----------|
+| `print_banner()` | 打印 ASCII LOGO + 模型名 | 青色粗体 + 蓝色边框 Panel |
+| `show_welcome_screen()` | 全屏欢迎界面 | 清屏后调用 `print_banner` |
+| `print_agent_response()` | 渲染 AI 回复 | Rich Markdown 渲染，支持代码块、列表 |
+| `print_tool_call()` | 显示工具调用 | 绿色边框 Panel |
+| `print_tool_result()` | 显示工具返回 | 青色边框 Panel，标题"✅ 工具返回" |
+| `print_stream_chunk()` | 逐字流式输出 | 青蓝色，无换行，模拟打字机效果 |
+| `format_context_bar()` | 上下文用量条 | Unicode 进度条 + 百分比 + 数值 |
+
+输入系统基于 `prompt_toolkit`，支持：
+- **FileHistory**：历史记录持久化到 `~/.pocket_agent_history`
+- **SlashCompleter**：自动补全 `/命令` 和 `/技能名`
+- **KeyBindings**：ESC 键打断当前输入
+- **Style**：自定义补全菜单颜色（暗色主题适配）
+
+Sources: [agent/ui.py](agent/ui.py#L1-L200)
+
+---
+
+## 退出清理
+
+当用户输入退出命令或按 `Ctrl+C` 时，`main.py` 执行有序的退出流程：
+
+1. 取消浏览器消息监听后台任务
+2. 关闭 3D 身体服务器（释放 18081 端口）
+3. 关闭 Embedding 服务器（终止 `llama-server` 子进程）
+4. 使用 `os._exit(0)` 强制退出（因为 `nest_asyncio` 不会停止事件循环）
+
+```python
+browser_task.cancel()
+stop_body_server()
+stop_embedding_server()
+os._exit(0)
+```
+
+Sources: [main.py](main.py#L670-L693)
+
+---
+
+## 下一步阅读
+
+终端模式是 Pocket-Agent 最直接的交互方式。理解它的设计后，建议继续探索：
+
+- [HTTP API 模式（FastAPI + SSE 流式）](8-http-api-mo-shi-fastapi-sse-liu-shi)：了解另一种运行模式，提供 HTTP 接口和 SSE 推送
+- [LangChain Agent 核心实现（create_agent + 中间件链）](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian)：深入理解 Agent 内部的工作机制
+- [终端 UI 与进度显示系统（Rich 库）](43-zhong-duan-ui-yu-jin-du-xian-shi-xi-tong-rich-ku)：了解更多 UI 组件实现细节
+- [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu)：了解 Agent 的状态管理和流式输出协议

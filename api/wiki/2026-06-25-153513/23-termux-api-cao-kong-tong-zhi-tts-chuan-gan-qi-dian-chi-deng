@@ -1,0 +1,357 @@
+Termux API 是 Pocket-Agent 在 Android 手机上获取**系统级能力**的核心通道。它架起了 AI Agent 与手机物理硬件之间的桥梁——让 Agent 不仅能"思考"，还能"感知"和"作用于"现实世界。本章聚焦于 Termux API 工具的实现机制、可用命令体系以及它在环境感知系统中的深度集成。
+
+---
+
+## 一、架构概览：三层调用模型
+
+Pocket-Agent 对 Termux API 的调用遵循清晰的三层架构，每一层有不同的抽象粒度与服务对象：
+
+```mermaid
+flowchart TB
+    subgraph LLM["🧠 LLM（AI 决策层）"]
+        Agent["LangChain Agent"]
+        EnvSense["环境感知缓存<br/>(_sense_environment)"]
+    end
+
+    subgraph Tools["🔧 工具层（Python 封装）"]
+        SI["system_info(info_type)"]
+        SE["shell_exec(command)"]
+        TTS["tts_speak(text)"]
+    end
+
+    subgraph Termux["📡 Termux API 命令层"]
+        BAT["termux-battery-status"]
+        WIFI["termux-wifi-connectioninfo"]
+        PHONE["termux-telephony-deviceinfo"]
+        TTS_CMD["termux-tts-speak"]
+        NOTIF["termux-notification"]
+        CLIP["termux-clipboard-*"]
+        SENSOR["termux-sensor"]
+        LOC["termux-location"]
+        TORCH["termux-torch"]
+        VIB["termux-vibrate"]
+        VOL["termux-volume"]
+    end
+
+    subgraph Hardware["📱 Android 硬件层"]
+        BATTERY["电池"]
+        SENSORS["传感器<br/>(光照/加速度计)"]
+        SPEAKER["扬声器"]
+        SCREEN["屏幕<br/>(通知/亮度)"]
+        WIFI_RADIO["WiFi 射频"]
+        GPS["GPS 定位"]
+        CAMERA["摄像头"]
+        VIBRATOR["震动马达"]
+    end
+
+    Agent -->|system_info| SI
+    Agent -->|shell_exec| SE
+    Agent -->|tts_speak| TTS
+    EnvSense -->|后台自动采集| SI
+    EnvSense -->|后台自动采集| SE
+
+    SI --> BAT & WIFI & PHONE
+    SE --> TTS_CMD & NOTIF & CLIP & SENSOR & LOC & TORCH & VIB & VOL
+    TTS --> TTS_CMD
+
+    BAT --> BATTERY
+    SENSOR --> SENSORS
+    TTS_CMD --> SPEAKER
+    NOTIF --> SCREEN
+    LOC --> GPS
+    TORCH --> CAMERA
+    VIB --> VIBRATOR
+    WIFI --> WIFI_RADIO
+```
+
+**三个关键设计决策：**
+
+1. **分层而非平铺**：不将所有 Termux 命令封装为独立的 Python 工具函数，而是暴露 `shell_exec` 作为通用执行入口，配合 `system_info`（封装高频查询）和 `tts_speak`（封装异步 TTS）两个特化入口。这保持了工具列表的简洁性——`ALL_TOOLS` 中仅 12 个工具，Termux 相关仅占 3 个。
+2. **TTS 必须后台运行**：`termux-tts-speak` 是一个阻塞型命令，如果在前台同步执行，`subprocess.run` 会等待 TTS 朗读完毕才返回，导致 Agent 响应延迟。因此 `shell_exec` 和 `tts_speak` 都采用 `&>/dev/null &` 后台运行模式，`timeout=3` 只等待命令启动而非执行完毕。
+3. **环境感知独立于对话流**：`_sense_environment()` 在后台线程以缓存方式运行，不阻塞 LLM 的推理过程，采集结果以自然语言标签形式注入到系统提示词中。
+
+---
+
+## 二、工具封装：三种调用入口
+
+### 2.1 `system_info`：封装好的信息查询
+
+```python
+@tool
+def system_info(info_type: str = "all") -> str:
+```
+
+这是唯一直接封装了 Termux API JSON 解析的工具。参数 `info_type` 支持 7 种模式：
+
+| info_type | 底层命令 | 典型输出 | 备注 |
+|-----------|---------|---------|------|
+| `all` | 依次调用所有 | 完整系统报告 | 默认模式，包含全部信息块 |
+| `battery` | `termux-battery-status` | `{ "percentage": 85, "plugged": "UNPLUGGED", "status": "DISCHARGING" }` | 解析为 JSON 美化输出 |
+| `cpu` | `cat /proc/cpuinfo` | 核心数、型号、硬件架构 | 不依赖 Termux API，仅 Linux 内核 procfs |
+| `memory` | `cat /proc/meminfo` | MemTotal、MemFree、Swap 等前 10 行 | 同上，纯内核读取 |
+| `disk` / `storage` | `df -h /sdcard` 和 `df -h /data` | 存储分区使用情况 | 同时查内外存储 |
+| `network` / `wifi` | `termux-wifi-connectioninfo` | WiFi SSID、信号强度、IP 地址 | 需要 Termux:API 应用授权 |
+| `device` | `termux-telephony-deviceinfo` | 设备 ID、网络运营商、SIM 信息 | 需要电话权限授权 |
+
+**运行时的防御逻辑**（`basic_tools.py#L212-L216`）：
+
+```python
+check = subprocess.run(TERMUX_API_CHECK_CMD, shell=True, capture_output=True)
+if check.returncode != 0:
+    return TERMUX_API_INSTALL_GUIDE + "\n基础存储信息：\n" + _run_termux_cmd("df -h /sdcard")
+```
+
+当系统未安装 `termux-api` 包时，工具不会崩溃，而是返回安装指引 + 最基本的存储信息作为降级策略。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L170-L260)
+
+### 2.2 `shell_exec`：通用执行入口
+
+`shell_exec` 是所有 Termux API 单步命令的统一通道。它处理了三个关键场景：
+
+**场景一：TTS 后台执行保护**
+
+```python
+# basic_tools.py#L314-L318
+if command.strip().startswith("termux-tts-speak"):
+    subprocess.run(
+        command + " &>/dev/null &",
+        shell=True, capture_output=False, timeout=3,
+    )
+    return "✅ 已执行"
+```
+
+TTS 命令必须后台运行的理由：`termux-tts-speak` 在朗读期间会阻塞 stdout，如果 Agent 在同步上下文中调用，LLM 的 tool calling 会超时（默认 10 秒不够读完一段长文本）。后台化后返回"✅ 已执行"给 LLM，声音在后台继续播放。
+
+**场景二：Android 命令环境检查**
+
+```python
+# basic_tools.py#L276-L309
+def check_android_command_environment(cmd: str) -> Optional[str]:
+    """检查安卓控制命令是否可以在当前环境下运行"""
+    android_commands = [...]
+    is_termux = os.path.exists("/data/data/com.termux")
+    has_display = os.getenv("DISPLAY") is not None
+    if is_termux and not has_display:
+        return "⚠️  安卓控制功能需要图形界面环境才能使用..."
+```
+
+纯 Termux 终端环境（无 VNC 或 Android GUI）无法执行屏幕点击、输入等操作。但 MCP/NeuralBridge 的 curl 调用走 HTTP 协议例外，不需要 `INJECT_EVENTS` 权限。
+
+**场景三：标准命令执行**
+
+通用命令使用 `subprocess.run` 同步执行，`timeout=10` 防止死锁。stdout 和 stderr 分别捕获，返回结构化字符串。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L262-L335)
+
+### 2.3 `tts_speak`：异步 TTS 专有工具
+
+```python
+@tool
+async def tts_speak(text: str) -> str:
+```
+
+这是唯一一个**独立封装 + 异步运行**的 Termux 工具。为何不直接用 `shell_exec` 执行 `termux-tts-speak`？
+
+**TTS 在 Agent 中有双重身份**：既是工具调用，也是交互结果。Agent 需要在输出文字回复的同时，让手机同步朗读。`tts_speak` 的 `async` 签名允许它在 LangGraph 的事件循环中不阻塞流式输出。`shell_exec` 虽然是同步的但也能正常工作——区别在于 `shell_exec` 返回时需要 3 秒超时等待，而 `tts_speak` 完全异步可并行。
+
+在 `agent_enhance.py` 的提示词中，明确要求 LLM 使用规则：
+
+> "需要朗读时调用 tts_speak 工具，手机会出声。正常输出文字回复，同时调用 tts_speak(text='...') 工具读同一段话。不要用括号文字假装朗读——那没有声音，工具调用才有。"
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L713-L731), [agent_enhance.py](agent/prompts/agent_enhance.py#L52-L55)
+
+---
+
+## 三、环境感知系统：后台自动采集
+
+这是 Termux API 最具价值的深度集成——**AI Agent 能"感知"用户所处的现实环境**。
+
+### 3.1 触发时机与数据流
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant LLM as LangChain Agent
+    participant Cache as _cached_env_tag
+    participant Sensor as _sense_environment()
+    participant Termux as Termux API
+
+    Note over Cache,Sensor: 对话开始时触发
+    LLM->>Sensor: _refresh_env_cache() (后台异步)
+    Sensor->>Termux: termux-battery-status
+    Sensor->>Termux: termux-sensor -s 光照传感器
+    Sensor->>Termux: termux-sensor -s 加速度计
+    Sensor->>Termux: termux-location -p network
+    Sensor->>Termux: date +"%H:%M" & getprop
+    Termux-->>Sensor: JSON 数据
+    Sensor->>Sensor: 解析 → 自然语言标签
+    Sensor-->>Cache: 写入缓存
+
+    Note over Cache,LLM: 对话构建时读取
+    LLM->>Cache: 读取缓存
+    Cache-->>LLM: "[环境状态感知] 现在是15:30(CST)，下午工作时段；光线正常，室内；手机静止；电量85%未充电"
+
+    LLM->>U: 正常回答（不提及环境信息）
+```
+
+### 3.2 传感器数据解析逻辑
+
+`_sense_environment()` 方法（`agent_langchain.py#L596-L697`）依次采集以下维度：
+
+**时间与时区**：通过 `date +"%H:%M"` 和 `getprop persist.sys.timezone`，判断四个时段（上午工作、中午休息、下午工作、傍晚/深夜休息）。这是环境感知的基座——所有后续判断都依赖时间上下文。
+
+**光照传感器**：命令为 `termux-sensor -s "tcs3760 Ambient Light Sensor Non-wakeup" -n 1`，传感器名称因设备而异。解析逻辑按 lux 值分为四档：
+- `< 1`：环境极暗
+- `< 50`：环境较暗
+- `< 500`：光线正常，室内
+- `>= 500`：光线明亮
+
+**加速度计**：命令为 `termux-sensor -s "lsm6dsv Accelerometer Non-wakeup" -n 3`，采集 3 组采样值。通过计算 x/y/z 轴的最大差值（`max_diff`）判断手机运动状态：
+- `< 0.3`：手机静止，用户可能坐着
+- `< 2.0`：轻微活动
+- `>= 2.0`：手机在移动中
+
+**电池状态**：`termux-battery-status` 返回 JSON，提取 `percentage` 和 `plugged` 字段。当电量 `< 20%` 时，环境标签会建议"简短回复"——这是很人性化的设计。
+
+**位置信息**：`termux-location -p network`（网络定位，`timeout=3`），只提取经纬度（`latitude`、`longitude`），不记录具体地址，保护隐私。
+
+### 3.3 缓存与刷新机制
+
+环境感知采用**写时延迟、读时零等待**的设计模式：
+
+```python
+# agent_langchain.py#L700-L710
+async def _refresh_env_cache(self) -> None:
+    if self._refresh_env_lock.locked():
+        return  # 已有刷新任务在进行，跳过本次
+    async with self._refresh_env_lock:
+        loop = asyncio.get_event_loop()
+        tag = await loop.run_in_executor(None, self._sense_environment)
+        if tag:
+            self._cached_env_tag = tag
+```
+
+- 刷新触发点有两处：对话开始时（`agent_langchain.py#L1205`）和对话结束时（同文件`#L1497`），确保下一次对话使用最新数据。
+- `asyncio.Lock` 防止并发刷新——传感器采集需要约 1-3 秒，对话期间最多触发一次。
+- `run_in_executor` 将同步的传感器采集放到线程池中，不阻塞 LLM 流式输出。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L560-L710)
+
+---
+
+## 四、命令速查：完整 Termux API 清单
+
+根据 `phone-control-quickref/SKILL.md` 的整理，所有可通过 `shell_exec` 调用的 Termux API 命令可分为五大类：
+
+### 4.1 交互与通知
+
+| 命令 | 功能 | 典型参数 |
+|------|------|---------|
+| `termux-tts-speak "文字"` | 语音朗读 | 文本内容（后台运行） |
+| `termux-notification -t "标题" -c "内容"` | 发送通知 | `-i ID` 更新/取消通知 |
+| `termux-clipboard-get` | 读取剪贴板 | 无参数 |
+| `termux-clipboard-set "内容"` | 写入剪贴板 | 文本内容 |
+| `termux-toast "提示文字"` | 短提示（Toast） | 文本（短暂显示） |
+| `termux-open-url <URL>` | 打开链接 | HTTP/HTTPS 链接 |
+| `termux-open <文件路径>` | 打开文件 | 文件路径 |
+
+### 4.2 系统功能
+
+| 命令 | 功能 | 备注 |
+|------|------|------|
+| `termux-battery-status` | 电池状态 | 返回 JSON |
+| `termux-brightness <0-255>` | 调节屏幕亮度 | 0 最低，255 最高 |
+| `termux-volume music 7` | 调节音量 | 媒体流，范围 0-15 |
+| `termux-wifi-connectioninfo` | WiFi 连接信息 | JSON 格式 |
+| `termux-wifi-scaninfo` | 扫描 WiFi 网络 | 返回附近 AP 列表 |
+| `termux-wifi-enable true/false` | 开关 WiFi | 需要用户确认弹窗 |
+| `termux-torch on/off` | 手电筒 | 使用后置摄像头闪光灯 |
+| `termux-vibrate -d 1000` | 震动 | `-d` 持续时间(毫秒) |
+| `termux-location -p network` | 定位 | `-p provider`: network/gps/passive |
+| `termux-wallpaper -f 图片路径` | 设置壁纸 | 支持本地图片 |
+| `termux-wake-lock` / `termux-wake-unlock` | 唤醒锁 | 阻止 CPU 休眠 |
+| `termux-download <URL>` | 下载文件 | 下载到默认目录 |
+
+### 4.3 媒体与传感器
+
+| 命令 | 功能 | 备注 |
+|------|------|------|
+| `termux-camera-photo /sdcard/photo.jpg` | 拍照 | 保存到指定路径 |
+| `termux-media-player play 文件` | 播放媒体 | 支持常见音频格式 |
+| `termux-microphone-record -f 文件 -l 秒数` | 录音 | 指定时长和路径 |
+| `termux-sensor -s "传感器名" -n 1` | 传感器数据 | `-n` 采样次数，`-l` 列出所有传感器 |
+
+### 4.4 系统信息（非 Termux API，但常用）
+
+| 命令 | 功能 |
+|------|------|
+| `getprop ro.product.model` | 设备型号 |
+| `getprop ro.build.version.release` | Android 版本 |
+| `getprop persist.sys.timezone` | 系统时区 |
+| `free -h` | 内存使用 |
+| `df -h /data` | 存储使用 |
+| `top -n 1` | 进程列表 |
+
+Sources: [phone-control-quickref/SKILL.md](agent/skills/main-skills/phone/phone-control-quickref/SKILL.md#L1-L83)
+
+---
+
+## 五、提示词策略：Agent 如何决定用还是不用
+
+Termux API 的调用决策不是随机的，而是由 `agent_enhance.py` 的提示词规则严格约束：
+
+**简单操作 → 自己用 `shell_exec` 执行**：单步 Termux API 命令（通知、剪贴板、TTS、音量、电池、手电筒、相机等）、查系统信息（`getprop`、`free`）、包管理（`pm list packages`）——这些操作 Agent 直接执行，不需要派发。
+
+**复杂操作 → 全盘委托 `delegate_task`**：需要点击、输入、滑动、UI 树分析等多步交互的——Agent**不能自己做任何准备工作**（不能查包名、不能启动应用），必须将整个任务全盘委托给子 Agent。
+
+**快速失败原则**：同一个方案失败后最多换 1 个替代方案再试，仍然失败就告知用户。
+
+这一策略直接体现在 `phone-control-quickref/SKILL.md` 的文件描述中：
+
+> "本技能只包含**单步命令**，遇到此类需求直接用 `shell_exec` 执行，不需要派发给 executor。如果任务需要子 Agent（涉及 UI 交互），不要先查包名或启动应用，全盘委托给子 Agent 处理。"
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L42-L47), [phone-control-quickref/SKILL.md](agent/skills/main-skills/phone/phone-control-quickref/SKILL.md#L4-L10)
+
+---
+
+## 六、配置项
+
+`agent/config.py` 中集中管理 Termux API 相关的常量和命令模板：
+
+| 配置项 | 默认值 | 用途 |
+|--------|--------|------|
+| `TERMUX_API_CHECK_CMD` | `which termux-battery-status` | 检测 Termux API 是否安装 |
+| `TERMUX_API_INSTALL_GUIDE` | 安装指引文本 | 未安装时的降级提示 |
+| `ENV_LIGHT_SENSOR_CMD` | `termux-sensor -s "tcs3760 Ambient Light Sensor Non-wakeup" -n 1` | 光照传感器命令 |
+| `ENV_ACCEL_SENSOR_CMD` | `termux-sensor -s "lsm6dsv Accelerometer Non-wakeup" -n 3` | 加速度计命令 |
+| `ENV_TIME_CMD` | `date +"%H:%M"` | 时间获取命令 |
+| `ENV_TIMEZONE_CMD` | `getprop persist.sys.timezone` | 时区获取命令 |
+
+其中传感器名称（`tcs3760`、`lsm6dsv`）是特定设备（如 OnePlus 或 Xiaomi）的传感器标识，不同手机可能需要根据 `termux-sensor -l` 的输出调整。
+
+Sources: [config.py](agent/config.py#L83-L107)
+
+---
+
+## 七、常见问题与降级策略
+
+| 场景 | 行为 | 代码位置 |
+|------|------|---------|
+| Termux API 未安装（`pkg install termux-api`） | `system_info` 返回安装指引 + 基础存储信息，不崩溃 | `basic_tools.py#L212-L216` |
+| Termux:API 手机应用未安装 | Termux 命令执行失败，stderr 提示"未找到命令" | `basic_tools.py#L199-L205` |
+| 纯终端无 GUI 环境 | 安卓控制命令被拦截，提示安装 GUI | `basic_tools.py#L276-L309` |
+| TTS 执行超时 | 后台运行，超时 3 秒只等启动，不等朗读结束 | `basic_tools.py#L314-L318` |
+| 传感器不支持（设备差异） | `_run_sensor` 返回 `None`，跳过该维度 | `agent_langchain.py#L587-L590` |
+| 传感器采集超时 | `timeout=5`，超时时静默跳过 | `agent_langchain.py#L588` |
+
+---
+
+## 八、延伸阅读
+
+完成本章后，你已理解 Pocket-Agent 如何通过 Termux API 与 Android 硬件交互。接下来可以探索更高级的手机控制能力：
+
+- **[NeuralBridge MCP 服务（UI 树分析、点击滑动、截图）](24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu)**：Termux API 只能做单步系统操作，真正的 UI 自动化（点击、输入、滑动、UI 树分析）由 NeuralBridge MCP 服务完成。
+- **[手机操纵指南与包名管理](25-shou-ji-cao-zong-zhi-nan-yu-bao-ming-guan-li)**：如何通过 `am start -p` 启动应用，以及常用应用的包名速查表。
+- **[内置工具一览（文件操作、Shell 执行、系统信息、MCP 调用）](22-nei-zhi-gong-ju-lan-wen-jian-cao-zuo-shell-zhi-xing-xi-tong-xin-xi-mcp-diao-yong)**：了解 `system_info` 和 `shell_exec` 在整体工具生态中的定位。
+- **[环境变量配置说明（LLM、Embedding、MCP、子 Agent）](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)**：查看 `.env` 中 Termux API 相关配置项。

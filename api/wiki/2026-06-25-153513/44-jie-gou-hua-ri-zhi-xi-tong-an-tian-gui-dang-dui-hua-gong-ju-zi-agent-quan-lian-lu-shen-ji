@@ -1,0 +1,307 @@
+Pocket-Agent 的审计日志系统为每一次交互提供完整的执行轨迹记录——从用户输入到工具调用链，再到子 Agent 的任务分解与步骤执行，全部以结构化 Markdown 格式按天归档。这套系统不依赖外部日志框架，而是基于一个轻量的 `AgentLogger` 类（约 120 行），在关键生命周期节点埋点写入，形成可人工阅读、可机器解析的审计线索。
+
+Sources: [logger.py](agent/logger.py#L1-L121)
+
+---
+
+## 一、设计原则与日志架构
+
+日志系统的设计遵循三条原则：**零侵入性**——日志记录作为副作用附加在现有流程中，不改变业务逻辑的执行路径；**可读性优先**——输出格式为 Markdown，可在任何终端或编辑器中直接阅读，无需专用工具；**全链路覆盖**——不局限于最终结果，而是记录每一个步骤的上下文、耗时和关键参数。
+
+日志文件的存储路径为 `PROJECT_ROOT/logs/`，按日期自动归档：
+
+```text
+logs/
+├── 2026-06-05.md          # 每日日志文件，自动创建
+├── 2026-06-06.md
+├── 2026-06-08.md
+├── 2026-06-11.md
+├── ...
+└── llama-server.log       # 独立于 AgentLogger 的 llama.cpp 服务日志
+```
+
+每个日志文件的命名格式为 `YYYY-MM-DD.md`，由 `AgentLogger._get_today_file()` 根据系统当前日期计算。跨天执行的长任务，其日志会按任务开始的日期归属，不会跨文件拆分。
+
+Sources: [logger.py](agent/logger.py#L14-L27), [agent_langchain.py](agent/agent_langchain.py#L577)
+
+---
+
+## 二、AgentLogger 核心实现
+
+`AgentLogger` 类的内部结构分为三个层次：文件路由、时间戳生成、写入接口。
+
+```python
+class AgentLogger:
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+
+    def _get_today_file(self) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        return os.path.join(self.log_dir, f"{today}.md")
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("[%H:%M:%S]")
+
+    def _write(self, content: str):
+        filepath = self._get_today_file()
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(content + "\n")
+```
+
+`_write` 方法以追加模式打开当日文件，每次调用写入一行。所有公开的日志方法最终都通过 `_write` 输出。由于每个日志条目以 `\n` 结尾，多行内容（如工具参数 JSON）会在同一个逻辑段落中连续写入。
+
+Sources: [logger.py](agent/logger.py#L10-L27)
+
+---
+
+## 三、对话生命周期日志
+
+每一次用户输入触发的对话，从开始到结束形成一个完整的日志单元。系统为每次对话分配一个唯一的 `conv_task_id`，格式为 `conv_HHMMSS`（基于对话开始时间），用于在日志中区分不同会话。
+
+### 3.1 对话开始
+
+当用户发送消息时，`log_conversation_start(conv_task_id, user_message)` 被调用，写入一个二级标题和用户消息摘要（取前 200 字符）：
+
+```markdown
+## [14:32:01] 对话 conv_143201
+- **用户**: 去拼多多给我买件衣服
+```
+
+### 3.2 工具调用记录
+
+在每个工具调用发生时，`log_tool_call(task_id, step_num, tool_name, args, result)` 记录工具名称、参数 JSON（截取前 300 字符）和当前结果摘要（截取前 200 字符）：
+
+```markdown
+  [14:32:35] 步骤1 | delegate_task({"description": "去拼多多给用户买一件男装...", ...})
+  → [执行中]
+  [14:32:40] 步骤2 | save_memory({"content": "用户想要购买男装...", "type": "fact", "importance": 4})
+  → [执行中]
+```
+
+### 3.3 对话结束
+
+当对话完成（正常结束、回退到 ainvoke 或发生异常），`log_conversation_end(task_id, summary, tool_count, elapsed)` 写入耗时统计和回复摘要（前 200 字符）：
+
+```markdown
+- **完成**: [14:33:12] 耗时37s, 调用工具2次
+- **回复摘要**: 你说的"买件衣服"有点笼统哈～ 我帮你具体问问：1. 什么类型？2. 预算范围？...
+```
+
+完整的对话日志块如下所示（来自实际运行日志）：
+
+```markdown
+## [01:29:34] 对话 conv_012934
+- **用户**: 过去跳的劈叉舞
+  [01:29:39] 步骤1 | search_memory({"query": "劈叉舞 完整动作数据 body_script", ...})
+  → [执行中]
+  [01:29:43] 步骤2 | body_idle({})
+  → [执行中]
+  [01:29:51] 步骤3 | body_script({"moves": "[{\"action\":\"pos\",\"y\":0.35,..."})
+  → [执行中]
+- **完成**: [01:30:01] 耗时26s, 调用工具3次
+- **回复摘要**: 好嘞，我先搜一下之前存好的劈叉舞数据！...
+```
+
+Sources: [logger.py](agent/logger.py#L33-L47), [agent_langchain.py](agent/agent_langchain.py#L964-L1201), [logs/2026-06-17.md](logs/2026-06-17.md#L21-L34)
+
+---
+
+## 四、子 Agent 全链路审计日志
+
+子 Agent（Executor）的日志是系统中最精细的审计维度。与主 Agent 的单行工具调用记录不同，子 Agent 日志使用缩进块和三级标题来体现任务分解的层次结构，使阅读者能快速区分主对话流与子任务的边界。
+
+### 4.1 任务启动
+
+`log_executor_start(task_id, objective)` 在子 Agent 开始执行时触发，写入三级标题和任务目标。`task_id` 格式为 `task_YYYYMMDD_HHMMSS`：
+
+```markdown
+  ### [02:29:40] 子Agent task_20260616_022935
+  - **目标**: 在拼多多挑选一件100元左右的男装供用户选择
+```
+
+### 4.2 步骤执行与耗时追踪
+
+`log_executor_step(task_id, step_num, tool_name, args)` 记录每一步的工具调用。系统内部维护 `_executor_step_time` 类变量，在上一步与当前步之间自动计算耗时差，追加在日志行末尾：
+
+```markdown
+    [02:29:43] 步骤1 | file_read({"filepath": "...task.json"})
+    [02:29:50] 步骤2 | file_read({"filepath": "...SKILL.md"})  [耗时6s]
+    [02:30:28] 步骤6 | mcp_call({"server_url": "...", "tool_name": "android_launch_app", ...})  [耗时38s]
+```
+
+这个 **步骤级耗时追踪** 是调试性能瓶颈的关键线索。例如在上述日志中，`android_launch_app` 耗时 38 秒，说明 NeuralBridge MCP 服务的应用启动响应较慢；而 `file_read` 通常仅需数秒，属于正常范围。
+
+### 4.3 思考过程记录
+
+`log_executor_reasoning(task_id, reasoning)` 记录模型在子 Agent 执行过程中的完整推理内容（取前 300 字符）。这对于排查 "子 Agent 为什么做出某个决策" 至关重要：
+
+```markdown
+    💭 [02:31:47] 好的，我来读取任务并开始执行。先加载相关技能指导。
+    好的，我已经读取了所有相关技能。现在开始按步骤执行。
+    ## Step 1：打开拼多多APP拼多多已成功打开。...
+```
+
+### 4.4 人工介入审计
+
+当子 Agent 调用 `tts_speak` 等需要用户交互的工具时，`log_executor_intervention` 记录完整的介入生命周期，包含三个状态：
+
+| 状态 | 日志标识 | 触发场景 |
+|------|----------|----------|
+| `pending` (申请介入) | `🆘 [人工介入]` | 子 Agent 调用 TTS 语音通知用户 |
+| `resolved` (介入解决) | `✅ [人工介入已解决]` | 系统等待 30 秒后继续执行 |
+| `failed` (介入失败) | `❌ [人工介入失败]` | 子 Agent 异常退出时仍有未解决的介入 |
+
+```markdown
+    🆘 [人工介入] [02:29:35]: TTS语音通知: 请确认这件衣服是否满意
+    ⏳ 等待用户手动操作（30秒）...
+    ✅ [人工介入已解决] [02:30:05]: 子Agent在等待后继续执行
+```
+
+### 4.5 任务完成/失败
+
+子 Agent 结束时，`log_executor_end(task_id, status)` 写入总耗时和执行状态。异常退出时会附加完整的 Python 异常栈：
+
+```markdown
+  - **完成**: [02:31:47]  ⏱️ 子Agent总耗时126s
+```
+
+或失败时：
+
+```markdown
+  - **失败: Traceback (most recent call last):
+  File "/data/data/.../httpx/_transports/default.py", line 101, in map_httpcore_exceptions
+  ...
+  httpcore.ConnectTimeout
+```
+
+Sources: [logger.py](agent/logger.py#L51-L109), [agent_langchain.py](agent/agent_langchain.py#L1668-L2049), [logs/2026-06-16.md](logs/2026-06-16.md#L40-L100)
+
+---
+
+## 五、日志写入流程的完整时序
+
+下图展示了一次包含子 Agent 委托的完整对话中，日志系统在各个阶段的工作位置：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Agent as 主Agent
+    participant Logger as AgentLogger
+    participant Executor as 子Agent
+
+    User->>Agent: 发送消息
+    Agent->>Logger: log_conversation_start(task_id, message)
+    Note over Logger: 写入 "## [HH:MM:SS] 对话 conv_HHMMSS"
+
+    loop 每一步工具调用
+        Agent->>Logger: log_tool_call(task_id, step, tool, args, result)
+        Note over Logger: 写入 "步骤N | tool_name(args)"
+    end
+
+    alt 发现 delegate_task
+        Agent->>Executor: 派发子Agent任务
+        Executor->>Logger: log_executor_start(task_id, objective)
+        Note over Logger: 写入 "### [HH:MM:SS] 子Agent task_id"
+
+        loop 每个子步骤
+            Executor->>Logger: log_executor_step(task_id, step, tool, args)
+            Note over Logger: 写入 "步骤N | tool(args) [耗时Ns]"
+
+            alt 需要人工介入
+                Executor->>Logger: log_executor_intervention(task_id, detail, "pending")
+                Executor-->>User: TTS语音通知
+                User-->>Executor: 30s等待后继续
+                Executor->>Logger: log_executor_intervention(task_id, detail, "resolved")
+            end
+        end
+
+        Executor->>Logger: log_executor_reasoning(task_id, full_response)
+        Executor->>Logger: log_executor_end(task_id, status)
+    end
+
+    Agent->>Logger: log_conversation_end(task_id, summary, tool_count, elapsed)
+    Note over Logger: 写入 "完成: 耗时Ns, 调用工具N次"
+```
+
+Sources: [logger.py](agent/logger.py#L33-L109), [agent_langchain.py](agent/agent_langchain.py#L964-L2049)
+
+---
+
+## 六、日志配置与扩展
+
+### 6.1 日志目录配置
+
+日志存储路径通过 `config.py` 中的 `LOGS_DIR` 常量定义，默认指向 `PROJECT_ROOT/logs/`：
+
+```python
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+```
+
+主 Agent 初始化时直接拼接路径：
+
+```python
+self.logger = AgentLogger(log_dir=os.path.join(PROJECT_ROOT, "logs"))
+```
+
+Sources: [config.py](agent/config.py#L70-L72), [agent_langchain.py](agent/agent_langchain.py#L577)
+
+### 6.2 通用事件接口
+
+对于不适合归入对话或子 Agent 周期的零散事件，`log_event(event_type, detail, task_id)` 提供了通用写入入口：
+
+```python
+def log_event(self, event_type: str, detail: str, task_id: str = ""):
+    ts = self._ts()
+    tag = f"[{task_id}] " if task_id else ""
+    self._write(f"{ts} {tag}{event_type}: {detail[:200]}")
+```
+
+当前系统中该接口尚未被调用，但为未来扩展预留了位置（如系统启动事件、技能加载事件等）。
+
+Sources: [logger.py](agent/logger.py#L114-L121)
+
+### 6.3 与其他日志的关系
+
+`logs/` 目录下还有一个独立的 `llama-server.log` 文件，由 llama.cpp 服务进程自身输出，**不经过** `AgentLogger` 系统。这意味着：
+
+- Agent 交互日志（`YYYY-MM-DD.md`）记录的是 `Pocket-Agent` 应用层的完整执行链路
+- `llama-server.log` 记录的是底层推理服务的运行状态（模型加载、GPU 初始化等）
+- 排查问题时需要结合两类日志：前者定位 Agent 决策逻辑问题，后者定位模型推理/服务异常
+
+Sources: [logs/llama-server.log](logs/llama-server.log#L1-L17)
+
+---
+
+## 七、使用场景与最佳实践
+
+### 7.1 调试工具调用异常
+
+当子 Agent 执行失败时，日志提供了从步骤 1 到异常点的完整回溯。典型排查路径是：先看 `- **失败**` 行的异常摘要 → 定位到最后一个成功步骤 → 分析该步骤的工具参数是否合理 → 检查 `💭` 思考内容判断模型决策逻辑。
+
+### 7.2 性能分析
+
+步骤级耗时记录（`[耗时Ns]`）可在不引入 APM 工具的情况下快速定位性能瓶颈：
+
+| 耗时范围 | 典型工具 | 可能原因 |
+|----------|----------|----------|
+| < 5s | `file_read`, `save_memory` | 正常，IO 开销 |
+| 5-15s | `body_script`, `body_idle` | 正常，3D 渲染 |
+| 15-60s | `mcp_call(android_launch_app)` | 应用启动耗时，可接受 |
+| > 60s | `mcp_call(android_tap)` | 可能超时，需检查 MCP 连接 |
+
+### 7.3 审计回溯
+
+由于日志按天归档且包含完整的用户输入-工具调用-模型回复链路，可用于事后审计：Agent 在什么时间执行了什么操作？调用了哪些外部工具？传递了什么参数？这些信息全都可以在对应的日志文件中追溯。
+
+Sources: [logger.py](agent/logger.py#L51-L80), [logs/2026-06-16.md](logs/2026-06-16.md#L40-L100), [logs/2026-06-17.md](logs/2026-06-17.md#L21-L34)
+
+---
+
+## 下一步
+
+日志系统为整个 Pocket-Agent 提供了可视化审计能力。建议继续阅读以下相关主题：
+
+- **[对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu)** — 了解日志中 `conv_task_id` 背后的流式执行机制
+- **[子 Agent 委托机制](29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa)** — 深入子 Agent 任务派发与执行的完整流程
+- **[子 Agent 前台同步执行与流式输出](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu)** — 理解子 Agent 日志中每一步的实时推送原理

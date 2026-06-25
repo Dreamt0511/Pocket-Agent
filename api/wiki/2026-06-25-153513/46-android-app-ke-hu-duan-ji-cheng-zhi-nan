@@ -1,0 +1,613 @@
+Pocket-Agent 的 FastAPI HTTP 服务旨在让 Android 原生 App 通过 RESTful API 与 AI Agent 交互。服务运行在 Termux 环境中，通过 `uvicorn` 启动，对外暴露流式聊天、会话管理、记忆管理、技能管理、版本控制等全量功能。本指南为 Android 客户端开发者提供完整的集成路线——从服务启动到消息流解析，从心跳保活到错误恢复。
+
+---
+
+## 架构概览
+
+下图展示了 Android App 作为客户端与 Pocket-Agent 后端之间的通信拓扑：
+
+```mermaid
+flowchart TD
+    subgraph Android Device
+        subgraph Termux
+            A[uvicorn server<br/>port 8000]
+            B[llama-server<br/>Embedding Service<br/>port 8080]
+            C[SQLite DB<br/>pocket_agent.db]
+            D[3D Body Server<br/>port 7474]
+        end
+        E[Android App<br/>Kotlin/Java Client]
+    end
+
+    E -- "HTTP/SSE :8000" --> A
+    E -- "HTTP :7474" --> D
+    A --> B
+    A --> C
+    D --> C
+
+    style E fill:#4a90d9,color:#fff
+    style A fill:#2d2d2d,color:#fff
+    style B fill:#2d2d2d,color:#fff
+    style C fill:#555,color:#fff
+    style D fill:#2d2d2d,color:#fff
+```
+
+核心通信路径只有一条：Android App 通过 **HTTP 请求** 与 FastAPI 服务（端口 8000）交互，所有 AI 对话响应通过 **SSE（Server-Sent Events）流式推送** 返回。嵌入服务（llama-server，端口 8080）和 3D 身体控制服务器（端口 7474）由 FastAPI 服务内部管理，客户端无需直接操作。
+
+```mermaid
+sequenceDiagram
+    participant App as Android App
+    participant API as FastAPI (:8000)
+    participant Agent as LangChain Agent
+    participant DB as SQLite DB
+    participant LLM as LLM API
+
+    App->>API: POST /chat {message, conversation_id}
+    API->>DB: 保存用户消息
+    API->>Agent: stream_conversation()
+    Agent->>LLM: 调用 LLM API
+    LLM-->>Agent: token 流
+    Agent-->>API: event 流（token/progress/tool）
+    API-->>App: SSE data: {token_content}
+    API-->>App: SSE data: [TOOL] {json_event}
+    API-->>App: SSE data: [DONE]
+    App->>API: POST /heartbeat（每 30s）
+    Note over API: 心跳超时 60s 自动关闭服务
+```
+
+Sources: [app.py](app.py#L1-L4), [app.py](app.py#L465-L596)
+
+---
+
+## 服务启动与连接
+
+### 启动服务
+
+在 Termux 中执行以下命令启动 FastAPI 服务：
+
+```bash
+cd /sdcard/Pocket-Agent
+source .venv/bin/activate      # 激活虚拟环境（如使用）
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `--host 0.0.0.0` | 监听所有网络接口，允许局域网访问 | 固定值 |
+| `--port` | 监听端口 | `8000` |
+| `--workers` | 工作进程数 | 手机端建议 `1`（避免资源竞争） |
+| `--reload` | 热重载（仅开发环境） | 生产环境禁用 |
+
+启动时服务会自动执行以下初始化序列：
+1. 加载 `.env` 环境变量
+2. 初始化 SQLite 数据库（建表、建 FTS5 全文索引）
+3. 初始化 AsyncSqliteSaver 持久化 checkpoint（失败则降级 MemorySaver）
+4. 启动 llama-server embedding 服务（端口 8080）
+5. 初始化 VectorStore 向量存储
+6. 启动心跳看门狗线程（超时 60 秒自动退出）
+
+Sources: [app.py](app.py#L169-L251)
+
+### 连接验证
+
+Android App 启动后应立即验证服务可达性：
+
+```kotlin
+// Kotlin 使用 OkHttp
+val client = OkHttpClient.Builder()
+    .connectTimeout(5, TimeUnit.SECONDS)
+    .readTimeout(10, TimeUnit.SECONDS)
+    .build()
+
+fun checkHealth(baseUrl: String, callback: (Boolean, String) -> Unit) {
+    val request = Request.Builder()
+        .url("$baseUrl/health")
+        .get()
+        .build()
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            val body = response.body?.string() ?: "{}"
+            val ok = response.isSuccessful && body.contains("\"status\":\"ok\"")
+            callback(ok, body)
+        }
+        override fun onFailure(call: Call, e: IOException) {
+            callback(false, e.message ?: "连接失败")
+        }
+    })
+}
+```
+
+服务正常时返回：
+```json
+{"status": "ok", "python": "3.11.5", "project_root": "/sdcard/Pocket-Agent"}
+```
+
+Sources: [app.py](app.py#L330-L336)
+
+---
+
+## API 端点速查表
+
+Pocket-Agent 共暴露 20+ 个 RESTful 端点，以下按功能域分组：
+
+### 系统管理
+
+| 方法 | 路径 | 说明 | 请求参数 | 响应关键字段 |
+|------|------|------|----------|-------------|
+| GET | `/health` | 健康检查 | 无 | `status`, `python`, `project_root` |
+| GET | `/uptime` | 服务运行时长 | 无 | `uptime_seconds`, `started_at` |
+| POST | `/heartbeat` | 客户端心跳 | 无 | `status` |
+| GET | `/version` | 当前版本（git SHA） | 无 | `version` |
+| GET | `/version/history` | 版本安装历史 | 无 | `history: [{sha, message, timestamp}]` |
+| POST | `/version/rollback` | 回退版本 | `{sha: string}` | `status`, `version` |
+| POST | `/sync` | git pull 同步代码 | `{mirror?: string}` | `status`, `output`, `pip_updated` |
+| POST | `/setup` | pip 安装依赖 | 无 | `status`, `output`, `error` |
+| GET | `/config` | 读取 .env 配置 | 无 | 键值对 |
+| POST | `/config` | 写入 .env 配置 | 键值对 | `status` |
+| POST | `/shutdown` | 关闭服务 | 无 | `status` |
+
+### 对话管理
+
+| 方法 | 路径 | 说明 | 请求参数 | 响应 |
+|------|------|------|----------|------|
+| POST | `/chat` | 发送消息（SSE 流式） | `{message, conversation_id?, config?}` | SSE 事件流 |
+| GET | `/conversations` | 会话列表 | 无 | `[{id, title, created_at, updated_at}]` |
+| GET | `/conversations/{id}/messages` | 会话消息历史 | 无 | `[{id, role, content, timestamp}]` |
+| DELETE | `/conversations/{id}` | 删除会话 | 无 | `{status}` |
+| DELETE | `/conversations/all` | 清空所有会话 | 无 | `{status}` |
+| POST | `/clear_history` | 清除线程历史（保留会话） | `{conversation_id}` | `{status}` |
+| POST | `/cancel` | 打断当前执行 | 无 | `{ok}` |
+| GET | `/debug_chat` | 查看上次 /chat 请求参数 | 无 | `{message, config}` |
+
+### 消息与记忆
+
+| 方法 | 路径 | 说明 | 请求参数 | 响应 |
+|------|------|------|----------|------|
+| DELETE | `/messages/{id}` | 删除单条消息 | 无 | `{status}` |
+| GET | `/conversations/{id}/search` | FTS5 全文搜索 | `?q=&cross_session=` | `[{role, content, timestamp}]` |
+| GET | `/messages/vector_search` | 向量语义搜索 | `?q=&limit=` | `[{id, distance}]` |
+| POST | `/memory/save` | 保存记忆 | `{content, type?, importance?, conversation_id?}` | `{ok, type, id}` |
+| DELETE | `/memory/{id}` | 删除向量记忆 | 无 | `{ok, deleted}` |
+
+### 技能管理
+
+| 方法 | 路径 | 说明 | 请求参数 | 响应 |
+|------|------|------|----------|------|
+| GET | `/skills` | 列出所有技能 | 无 | `{main_skills, executor_skills, auto_skills}` |
+| POST | `/skills` | 创建新技能 | `{name, description, content, category?}` | `{path, name}` |
+| PUT | `/skills/{path}` | 更新技能 | `{name, description, content}` | `{ok}` |
+| DELETE | `/skills/{path}` | 删除技能 | 无 | `{ok}` |
+
+Sources: [app.py](app.py#L330-L1065)
+
+---
+
+## SSE 流式协议详解
+
+`POST /chat` 是核心交互端点，响应采用 **SSE（Server-Sent Events）** 协议。Android 端需使用支持流式读取的 HTTP 客户端逐行解析。
+
+### 请求格式
+
+```json
+{
+    "message": "帮我查一下天气",           // 用户输入，必填
+    "conversation_id": "session-001",     // 会话 ID，不传则为 "default-session"
+    "config": {                           // 可选，覆盖 .env 中的 LLM 配置
+        "base_url": "http://192.168.1.x:8080/v1",
+        "model": "gelab-zero-4b-preview",
+        "temperature": 0.7,
+        "max_tokens": 8000
+    }
+}
+```
+
+### 响应协议
+
+SSE 流中的每一行遵循 `data: <payload>\n\n` 格式，payload 有以下类型：
+
+#### 1. 标记行
+
+| SSE 行 | 含义 | 解析策略 |
+|--------|------|----------|
+| `:ok` | 首行注释，触发响应头发送 | 直接忽略 |
+| `retry: 1000` | 重连间隔（ms） | 记录 |
+| `data: [DONE]` | 流结束 | 停止读取，回调 onComplete |
+| `data: [已中断]` | 用户取消/被打断 | 展示中断提示 |
+| `data: [ERROR] {message}` | 执行出错 | 展示错误信息 |
+
+#### 2. 流式 Token
+
+```
+data: {json_string_of_content}
+```
+
+每一行 `data:` 后紧跟 **JSON 字符串** 的是 AI 生成的文本片段。Android 端应逐个拼接以还原完整回答。
+
+```kotlin
+// Kotlin SSE 解析示例（OkHttp + 逐行读取）
+fun streamChat(baseUrl: String, message: String, conversationId: String,
+               onToken: (String) -> Unit, onDone: () -> Unit, onError: (String) -> Unit) {
+    
+    val jsonBody = """
+        {
+            "message": "$message",
+            "conversation_id": "$conversationId"
+        }
+    """.trimIndent()
+    
+    val request = Request.Builder()
+        .url("$baseUrl/chat")
+        .post(jsonBody.toMediaType("application/json"))
+        .build()
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            response.body?.source()?.let { source ->
+                val buffer = Buffer()
+                while (!source.exhausted()) {
+                    source.read(buffer, 8192)
+                    val lines = buffer.readString(Charset.forName("UTF-8"))
+                        .split("\n")
+                    
+                    for (line in lines) {
+                        when {
+                            line.startsWith("data: [DONE]") -> onDone()
+                            line.startsWith("data: [ERROR]") -> {
+                                val msg = line.removePrefix("data: [ERROR] ")
+                                onError(msg)
+                            }
+                            line.startsWith("data: ") -> {
+                                val payload = line.removePrefix("data: ")
+                                // 判断是否为 JSON token（非标记行）
+                                if (payload.startsWith("\"") && payload.endsWith("\"")) {
+                                    val token = JsonParser.parseString(payload).asString
+                                    onToken(token)
+                                } else if (payload.startsWith("[")) {
+                                    // [TOOL] 标记事件，可选解析
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        override fun onFailure(call: Call, e: IOException) {
+            onError(e.message ?: "网络错误")
+        }
+    })
+}
+```
+
+#### 3. 工具执行事件
+
+以 `data: [TOOL] {json}\n\n` 格式传输，用于在 App UI 中展示 Agent 的工具调用过程：
+
+| 事件类型 | 字段 | 用途 |
+|----------|------|------|
+| `tool_start` | `{name, args}` | 工具开始执行，展示工具名和参数 |
+| `tool_end` | `{name, result}` | 工具执行完成 |
+| `progress` | `{type, message}` | 执行进度 |
+| `thinking` | `{}` | Agent 正在思考 |
+| `executor_start` | `{task}` | 子 Agent 开始执行 |
+| `executor_done` | `{task, result}` | 子 Agent 完成 |
+| `skill_condense` | `{skill}` | 技能知识压缩 |
+| `skill_verify` | `{skill, verified}` | 技能验证结果 |
+| `done_stats` | `{elapsed}` | 总耗时（秒） |
+
+Android App 可选择解析 `[TOOL]` 事件并展示在 UI 中（如进度条、工具调用卡片），或直接忽略只展示最终 token 拼接结果。
+
+Sources: [app.py](app.py#L512-L596)
+
+---
+
+## 心跳机制与保活策略
+
+Pocket-Agent 内置 **心跳看门狗**：若超过 60 秒未收到心跳，服务将自动关闭（包括停止 embedding 服务）。Android App **必须** 实现心跳发送。
+
+### 心跳协议
+
+```kotlin
+// 使用 Coroutine 定期发送心跳
+fun startHeartbeat(baseUrl: String, scope: CoroutineScope) {
+    scope.launch {
+        while (isActive) {
+            try {
+                val request = Request.Builder()
+                    .url("$baseUrl/heartbeat")
+                    .post("{}".toMediaType("application/json"))
+                    .build()
+                client.newCall(request).execute()
+            } catch (e: Exception) {
+                // 静默处理，不打断心跳循环
+            }
+            delay(30_000L) // 每 30 秒一次
+        }
+    }
+}
+```
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 间隔 | 30 秒 | 看门狗每 30 秒检查一次，间隔需小于 60 秒 |
+| 超时阈值 | 60 秒 | 连续未收到心跳超过此值则触发关闭 |
+| 心跳 API | `POST /heartbeat` | 无请求体，返回 `{"status":"ok"}` |
+
+### 服务重连策略
+
+当 App 检测到连接中断（如用户切换网络、服务崩溃），应遵循以下重试策略：
+
+```
+1. 首次重试等待：1 秒
+2. 每次重试加倍：2 秒 → 4 秒 → 8 秒
+3. 最大间隔：60 秒
+4. 最大重试次数：10 次
+5. 超过上限：提示用户手动检查服务状态
+```
+
+```kotlin
+suspend fun reconnectWithBackoff(baseUrl: String, maxRetries: Int = 10) {
+    var delay = 1000L
+    for (i in 1..maxRetries) {
+        try {
+            val response = client.newCall(
+                Request.Builder().url("$baseUrl/health").get().build()
+            ).execute()
+            if (response.isSuccessful) return  // 重连成功
+        } catch (_: Exception) { }
+        
+        delay(delay)
+        delay = minOf(delay * 2, 60_000L)
+    }
+    // 所有重试失败，通知用户
+}
+```
+
+Sources: [app.py](app.py#L49-L50), [app.py](app.py#L236-L251), [app.py](app.py#L349-L353)
+
+---
+
+## 会话管理最佳实践
+
+### 会话生命周期
+
+```
+App 启动 → 获取会话列表 GET /conversations
+    ├─ 有已有会话 → 加载最新会话的消息历史
+    └─ 无会话 → 首次 /chat 自动创建新会话
+用户发送消息 → POST /chat with conversation_id
+用户切换会话 → GET /conversations/{id}/messages
+用户删除会话 → DELETE /conversations/{id}
+App 进入后台 → 继续发送心跳，保持服务存活
+App 完全退出 → POST /shutdown（可选）
+```
+
+### conversation_id 设计建议
+
+| 策略 | 实现 | 适用场景 |
+|------|------|----------|
+| UUID 随机 | `UUID.randomUUID().toString()` | 每次新建会话 |
+| 时间戳 + 序号 | `"conv_${timestamp}_${seq}"` | 需要可排序的会话 ID |
+| 用户标识 + 日期 | `"user_123_2024-01-01"` | 按用户分层管理 |
+| 固定默认 | `"default-session"` | 只维持单一对话 |
+
+推荐 Android 端使用 **UUID** 或 **持久化自增 ID**，存储在 `SharedPreferences` 或 Room 数据库中，保证多设备/UUID 重启后的会话连续性。
+
+Sources: [app.py](app.py#L467-L506), [app.py](app.py#L704-L720)
+
+---
+
+## 技能管理集成
+
+Android App 可以通过 API 枚举、创建和编辑 Agent 技能，实现客户端驱动的技能管理界面。
+
+### 技能分类结构
+
+```
+agent/skills/
+├── main-skills/          # 主 Agent 技能（开发类、手机操控类）
+│   ├── dev/          → SKILL.md
+│   ├── phone/        → SKILL.md
+│   └── body-moves/   → SKILL.md
+├── executor-skills/      # 子 Agent 技能
+│   ├── fast-mode/         → SKILL.md
+│   ├── phone-control-guide/ → SKILL.md
+│   ├── neuralbridge-operation-standard/ → SKILL.md
+│   └── skill-creator/    → SKILL.md
+└── auto-skills/          # 自动沉淀技能（只读）
+    ├── main/
+    └── executor/
+```
+
+### 获取技能列表
+
+```kotlin
+data class SkillItem(
+    val name: String,
+    val description: String,
+    val path: String,
+    val content: String
+)
+
+data class SkillsResponse(
+    val main_skills: List<SkillItem>,
+    val executor_skills: List<SkillItem>,
+    val auto_skills: List<SkillItem>
+)
+
+// GET /skills
+fun fetchSkills(baseUrl: String, callback: (SkillsResponse?) -> Unit) {
+    val request = Request.Builder()
+        .url("$baseUrl/skills")
+        .get()
+        .build()
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            val skills = JsonParser.parseString(response.body?.string())
+                .asJsonObject
+                .let { Gson().fromJson(it, SkillsResponse::class.java) }
+            callback(skills)
+        }
+        override fun onFailure(call: Call, e: IOException) {
+            callback(null)
+        }
+    })
+}
+```
+
+### 创建新技能
+
+```kotlin
+fun createSkill(baseUrl: String, name: String, description: String, 
+                content: String, category: String = "auto-skills") {
+    val json = """
+        {
+            "name": "$name",
+            "description": "$description",
+            "content": $content,
+            "category": "$category"
+        }
+    """.trimIndent()
+    
+    val request = Request.Builder()
+        .url("$baseUrl/skills")
+        .post(json.toMediaType("application/json"))
+        .build()
+    
+    client.newCall(request).enqueue(...)
+}
+```
+
+系统预装技能（`main-skills/xxx` 和 `executor-skills/xxx` 直接子目录）不可删除，只能删除 `user/` 和 `auto-skills/` 下的技能。
+
+Sources: [app.py](app.py#L869-L1012)
+
+---
+
+## 取消与打断
+
+当用户希望停止当前 AI 响应时，调用 `POST /cancel`：
+
+```kotlin
+fun cancelExecution(baseUrl: String) {
+    val request = Request.Builder()
+        .url("$baseUrl/cancel")
+        .post("{}".toMediaType("application/json"))
+        .build()
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            // 取消成功后，SSE 流会收到 data: [已中断]
+        }
+        override fun onFailure(call: Call, e: IOException) { }
+    })
+}
+```
+
+取消机制同时作用于主 Agent 和子 Agent。在 SSE 流中收到 `data: [已中断]` 或 `data: [DONE]` 后应停止拼接 token 并关闭连接。
+
+Sources: [app.py](app.py#L1017-L1034)
+
+---
+
+## 错误处理与异常场景
+
+### 错误类型速查
+
+| 场景 | Behavior | App 处理 |
+|------|----------|----------|
+| 服务未启动 | 连接拒绝 / 超时 | 显示"服务未运行"提示，引导用户启动 |
+| 网络切换（WiFi↔移动数据） | 连接中断，心跳失败 | 触发重连流程（指数退避） |
+| LLM API 超时 | SSE 流中收到 `[ERROR]` | 展示错误消息，允许重试 |
+| Agent 死循环 | 超过 `MAX_ITERATIONS`（300轮）或 `RECURSION_LIMIT`（600） | 自动终止，收到 `[DONE]` |
+| 对话历史超长 | 超过 `MAX_CONTEXT_TOKENS`（128K） | Agent 自动截断中间消息 |
+| 手机休眠 | 心跳中断，60s 后服务自动关闭 | 使用前台 Service + 心跳 |
+| 端口冲突 | `uvicorn` 启动失败 | 提示用户检查 8000 端口占用 |
+
+### SSE 连接异常恢复
+
+SSE 协议支持通过 `retry: 1000` 实现自动重连。Android 侧的 `OkHttp EventSource` 或自定义 SSE 客户端应监听连接关闭事件并自动恢复：
+
+```kotlin
+// 使用 OkHttp EventSource
+val factory = EventSources.createFactory(client)
+val eventSource = factory.newEventSource(request, object : EventSourceListener() {
+    override fun onEvent(eventSource: EventSource, id: String?, 
+                         type: String?, data: String) {
+        // 处理各事件类型
+    }
+    override fun onFailure(eventSource: EventSource, t: Throwable?, 
+                           response: Response?) {
+        // 指数退避重连
+        scope.launch {
+            delay(1000)
+            reconnect()
+        }
+    }
+    override fun onClosed(eventSource: EventSource) {
+        // 正常关闭，不需要重连
+    }
+})
+```
+
+Sources: [app.py](app.py#L14-L18), [agent/config.py](agent/config.py#L15-L24)
+
+---
+
+## 网络连接与安全
+
+### 局域网连接
+
+服务默认监听 `0.0.0.0:8000`，Android App 可通过局域网 IP 访问：
+
+```
+http://192.168.1.xxx:8000/health
+```
+
+获取手机 Termux 的局域网 IP 方式：
+```bash
+# 在 Termux 中执行
+ip addr show wlan0 | grep inet
+# 或在 Android App 中通过 /proc/net 或 NetworkInterface 获取
+```
+
+### IPv6 兼容
+
+`--host 0.0.0.0` 仅监听 IPv4。如需 IPv6 支持，需改为 `--host ::` 或在 App 中同时尝试两种地址族。
+
+### 安全性提醒
+
+| 风险 | 说明 | 缓解措施 |
+|------|------|----------|
+| 无认证机制 | 当前 API 无 Token 验证 | 仅限局域网使用；通过 `iptables` 限制来源 IP |
+| 无 TLS | 明文 HTTP 传输 | 局域网环境下风险可控；广域网需前置 nginx + Let's Encrypt |
+| 配置可读写 | `POST /config` 可修改 API Key | 在 App 侧增加二次确认；由服务端限制写权限 |
+
+---
+
+## 完整集成清单
+
+Android App 集成 Pocket-Agent 时需要完成以下关键模块：
+
+| 模块 | 必须/可选 | 实现要点 |
+|------|----------|----------|
+| 服务连接检测 | 必须 | 启动时调用 `/health`，失败则引导用户 |
+| SSE 流式聊天 | 必须 | `POST /chat` + 逐行解析 `data:` 行 |
+| 心跳保活 | **必须** | 每 30 秒 `POST /heartbeat`，断联后指数退避重连 |
+| 会话列表 | 推荐 | `GET /conversations`，左侧抽屉展示 |
+| 消息历史加载 | 推荐 | `GET /conversations/{id}/messages` |
+| 打断功能 | 推荐 | 发送按钮变为停止按钮，调用 `POST /cancel` |
+| 工具执行展示 | 可选 | 解析 `[TOOL]` 事件，展示工具调用卡片 |
+| 技能管理 UI | 可选 | 枚举/创建/编辑技能 |
+| 版本管理 | 可选 | 版本历史展示 + 回退操作 |
+| 聊天搜索 | 可选 | `GET /conversations/{id}/search` 实现历史搜索 |
+
+---
+
+## 相关文档
+
+- [HTTP API 模式（FastAPI + SSE 流式）](8-http-api-mo-shi-fastapi-sse-liu-shi) — 了解服务端的工作机制
+- [环境变量配置说明](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent) — 理解 `.env` 配置项含义
+- [FastAPI HTTP 服务启动与心跳机制](45-fastapi-http-fu-wu-qi-dong-yu-xin-tiao-ji-zhi) — 深入服务端启动流程
+- [无线 ADB 调试配置](47-wu-xian-adb-diao-shi-pei-zhi) — 无线调试辅助开发
+- [3D 身体控制工具](26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle) — 如需集成 3D 身体渲染

@@ -1,0 +1,281 @@
+> **本文定位**：本文是环境搭建系列的核心环节，紧接 [Termux 安装与配置](3-termux-an-zhuang-yu-pei-zhi)，指导你完成 Python 依赖安装和环境变量配置。完成后，你将进入 [本地大模型部署（llama.cpp + Vulkan GPU 加速）](5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su)。
+
+## 全景概览
+
+Pocket-Agent 的依赖和配置体系分为三层：**Python 依赖包**（第三方库）→ **环境变量**（API 密钥、URL 等敏感信息）→ **代码内置配置**（项目路径、默认参数等非敏感设置）。用户在安装阶段只需关注前两层——依赖由 `pip` 管理，敏感配置存储在 `.env` 文件中（被 `.gitignore` 排除，不会误提交）。
+
+```mermaid
+flowchart TD
+    A[项目根目录] --> B[requirements.txt]
+    A --> C[pyproject.toml]
+    A --> D[.env.example]
+    
+    B --> E[pip install -r requirements.txt]
+    C --> F[pip install -e .]
+    
+    D --> G[复制为 .env]
+    G --> H[填写 API Key / URL]
+    
+    E --> I[依赖就绪]
+    F --> I
+    
+    H --> J[配置就绪]
+    
+    I --> K[启动 Agent]
+    J --> K
+    
+    style A fill:#1a1a2e,stroke:#e94560,color:#fff
+    style K fill:#0f3460,stroke:#e94560,color:#fff
+    style G fill:#533483,stroke:#e94560,color:#fff
+```
+
+## 第一步：安装 Python 依赖
+
+项目根目录下有两个文件声明依赖——`requirements.txt`（供用户直接安装）和 `pyproject.toml`（供包管理器使用）。两者内容一致，任选一种安装方式即可。
+
+### 方式一：使用 requirements.txt（推荐新手）
+
+在项目根目录执行：
+
+```bash
+pip install -r requirements.txt
+```
+
+该命令将一次性安装所有必需的第三方库。核心依赖可分为以下几类：
+
+| 分类 | 包名 | 用途 |
+|------|------|------|
+| **LLM 引擎** | `langchain>=0.2.0`, `langgraph>=0.2.0`, `langchain-openai>=0.1.0`, `langchain-core>=0.2.0` | Agent 核心框架，管理工具调用、对话流和状态图 |
+| **持久化** | `langgraph-checkpoint-sqlite>=2.0.0`, `aiosqlite>=0.19.0` | 异步 SQLite 存储对话历史，重启后可恢复上下文 |
+| **HTTP 服务** | `fastapi>=0.115.0`, `uvicorn>=0.34.0`, `sse-starlette>=2.0.0` | API 模式下的 SSE 流式聊天接口，供 Android App 调用 |
+| **终端 UI** | `rich>=13.0.0`, `prompt_toolkit>=3.0.0` | 终端美化、自动补全、流式输出渲染 |
+| **网络与异步** | `aiohttp>=3.8.0`, `requests>=2.25.0`, `nest_asyncio>=1.6.0` | HTTP 请求库 + 事件循环兼容 |
+| **图像处理** | `pillow>=10.0.0`, `piexif>=1.1.3` | 截图处理、EXIF 信息解析 |
+| **工具增强** | `psutil>=5.9.0`, `geopy>=2.4.0` | 系统监控、GPS 地址反查 |
+| **向量检索** | `numpy>=1.24.0` | 在 SQLite 中存储的 embedding 向量上运行余弦相似度计算 |
+
+### 方式二：使用 pyproject.toml（推荐开发者）
+
+项目遵循 Python 标准打包规范，支持可编辑模式安装：
+
+```bash
+pip install -e .
+```
+
+安装后你将获得三个额外好处：
+- **全局命令**：在任何目录执行 `pocket-agent` 即可启动，无需 `python main.py`
+- **相对导入修复**：`from .config import xxx` 等模块内导入不再报错
+- **依赖自动管理**：`pyproject.toml` 中声明的所有依赖随安装自动解析
+
+Source: [requirements.txt](requirements.txt#L1-L36), [pyproject.toml](pyproject.toml#L1-L66), [docs/00-运行说明.md](docs/00-运行说明.md#L78-L96)
+
+### 方式三：使用虚拟环境（推荐手机 Termux 环境）
+
+手机端的 Termux 环境中，推荐创建独立的 Python 虚拟环境来隔离项目依赖：
+
+```bash
+# 创建虚拟环境（在项目根目录下）
+python -m venv .venv
+
+# 激活虚拟环境
+source .venv/bin/activate
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+> **为什么推荐虚拟环境？** Termux 的 Python 环境与系统包（pkg）共享命名空间，不同项目之间的依赖版本冲突很难排查。用 `.venv` 隔离后，卸载只需删除目录 `rm -rf .venv`，不影响系统 Python。
+> 
+> **注意**：`.venv` 目录已被 `.gitignore` 排除，不会误提交到版本控制系统。
+
+激活虚拟环境后，后续的 `python main.py` 或 `uvicorn` 命令都在隔离环境中运行。每次打开新终端都需要先执行 `source .venv/bin/activate`。
+
+Sources: [.gitignore](.gitignore#L83), [app.py](app.py#L5)
+
+### 可选依赖
+
+以下功能需要额外安装依赖包：
+
+```bash
+# Ollama 本地模型支持（如需使用 Ollama 而非 llama.cpp）
+pip install langchain-ollama
+
+# 系统信息增强（psutil 已在 requirements.txt 中，如需最新版本可单独升级）
+pip install psutil
+
+# OCR 终极兜底方案（当 MCP 截图+UI 树都获取失败时使用）
+pip install pytesseract
+```
+
+Sources: [requirements.txt](requirements.txt#L36), [docs/00-运行说明.md](docs/00-运行说明.md#L98-L105)
+
+## 第二步：配置环境变量
+
+### 创建 .env 文件
+
+项目根目录下的 `.env.example` 提供了完整的环境变量模板，复制并修改即可：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 文件存储所有敏感配置（API 密钥、服务器地址等），已被 `.gitignore` 排除，不会误提交。应用启动时，`main.py` 和 `app.py` 都会在导入任何内部模块之前调用 `load_dotenv()` 加载该文件。
+
+Sources: [.env.example](.env.example#L1-L38), [main.py](main.py#L23-L25), [app.py](app.py#L14-L15)
+
+### 核心配置项详解
+
+| 配置项 | 必填 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `DEFAULT_LLM_BASE_URL` | ✅ | `http://127.0.0.1:8080/v1` | LLM API 地址，兼容任何 OpenAI 格式的接口（云端如 OpenAI、DeepSeek，或本地 llama-server） |
+| `LLM_API_KEY` | ✅ | `dummy` | API 密钥；本地模型填 `dummy`，云端填真实 key |
+| `LLM_MODEL` | ✅ | `gelab-zero-4b-preview` | 模型名称，云端填 `gpt-4o` 等 |
+| `LLM_TEMPERATURE` | ❌ | `0.7` | 生成随机性，范围 0.0~2.0 |
+| `LLM_MAX_TOKENS` | ❌ | `8000` | 单次生成最大 token 数 |
+| `MCP_SERVER_URL` | ❌ | `http://127.0.0.1:7474/mcp` | NeuralBridge MCP 服务地址（手机操控功能） |
+| `EMBEDDING_SERVER_URL` | ❌ | `http://127.0.0.1:8080/v1` | Embedding 服务地址（语义检索） |
+| `EMBEDDING_MODEL_PATH` | ❌ | 空 | BGE-M3 GGUF 模型绝对路径；留空则语义搜索不可用，FTS5 全文搜索仍正常 |
+| `EMBEDDING_MODEL` | ❌ | `bge-m3` | Embedding 模型名称 |
+| `EXECUTOR_LLM_BASE_URL` | ❌ | 继承主 Agent | 子 Agent 独立 LLM 地址，不填则与主 Agent 共用 |
+| `EXECUTOR_API_KEY` | ❌ | 继承主 Agent | 子 Agent 独立 API 密钥 |
+| `EXECUTOR_MODEL` | ❌ | 继承主 Agent | 子 Agent 独立模型名称 |
+| `EXECUTOR_TEMPERATURE` | ❌ | `0.3` | 子 Agent 温度（默认更低，追求确定性） |
+| `EXECUTOR_MAX_TOKENS` | ❌ | `8192` | 子 Agent 最大 token |
+
+Sources: [.env.example](.env.example#L1-L38), [agent/config.py](agent/config.py#L31-L44), [main.py](main.py#L407-L431)
+
+### 典型配置场景
+
+**场景一：手机端使用本地大模型（默认配置）**
+
+这是项目在手机 Termux 上的标准配置。无需修改 `.env`，`main.py` 会自动读取默认值：
+
+```env
+# LLM — 连接本地 llama-server（端口 8080）
+DEFAULT_LLM_BASE_URL=http://127.0.0.1:8080/v1
+LLM_API_KEY=dummy
+LLM_MODEL=gelab-zero-4b-preview
+LLM_TEMPERATURE=0.7
+LLM_MAX_TOKENS=8000
+
+# Embedding — 同样由本地 llama-server 提供服务
+EMBEDDING_SERVER_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL=bge-m3
+EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
+
+# MCP — 手机操控服务
+MCP_SERVER_URL=http://127.0.0.1:7474/mcp
+```
+
+Sources: [main.py](main.py#L407-L431), [agent/config.py](agent/config.py#L60-L63)
+
+**场景二：电脑端使用云端 API 测试（最简单快速）**
+
+无需本地部署大模型，直接连接云端服务测试 Agent 逻辑：
+
+```env
+# 注释掉本地模型配置
+# DEFAULT_LLM_BASE_URL=http://127.0.0.1:8080/v1
+# LLM_API_KEY=dummy
+# LLM_MODEL=gelab-zero-4b-preview
+
+# 使用云端 API
+DEFAULT_LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
+LLM_MODEL=gpt-4o
+LLM_TEMPERATURE=0.7
+LLM_MAX_TOKENS=8000
+
+# Embedding 使用远程 API（如 OpenAI）
+# EMBEDDING_BASE_URL=https://api.openai.com/v1
+# EMBEDDING_API_KEY=sk-xxxxxxxxxxxxxxxx
+# EMBEDDING_MODEL=text-embedding-3-small
+```
+
+> **注意**：当 `LLM_API_KEY` 为空或为 `dummy` 时，`agent_langchain.py` 的 `_init_llm()` 方法会探测到并使用 mock 配置（`http://mock.localhost:9999/v1`），避免 OpenAI SDK 的 API key 验证错误，此时实际请求由 `LangChainPocketAgent` 的后续逻辑处理。
+
+Sources: [docs/00-运行说明.md](docs/00-运行说明.md#L1-L40), [agent/agent_langchain.py](agent/agent_langchain.py#L747-L762)
+
+**场景三：子 Agent 使用独立模型**
+
+当主 Agent 使用大模型进行对话，而子 Agent 执行手机操控任务时希望用小模型节省资源：
+
+```env
+# 主 Agent — 云端大模型
+DEFAULT_LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-xxxxxxxx
+LLM_MODEL=gpt-4o
+
+# 子 Agent — 本地小模型（更快响应）
+EXECUTOR_LLM_BASE_URL=http://127.0.0.1:11434/v1
+EXECUTOR_API_KEY=ollama
+EXECUTOR_MODEL=qwen2.5:7b
+EXECUTOR_TEMPERATURE=0.3
+EXECUTOR_MAX_TOKENS=8192
+```
+
+未设置的子 Agent 字段会**自动继承**主 Agent 的对应值。例如只设置 `EXECUTOR_MODEL` 而不设置 `EXECUTOR_LLM_BASE_URL`，则子 Agent 使用主 Agent 的 base URL 加上不同的模型名。
+
+Sources: [.env.example](.env.example#L17-L23), [agent/config.py](agent/config.py#L36-L44), [agent/agent_langchain.py](agent/agent_langchain.py#L1617-L1630)
+
+### 加载机制细节
+
+环境变量的加载遵循严格的时间顺序，确保在内部模块初始化前注入：
+
+```
+Python 进程启动
+  → main.py / app.py 第一行有效代码调用 load_dotenv()
+  → 读取 .env 文件到 os.environ
+  → import agent.config（读取 os.getenv 值，构建配置字典）
+  → import agent.agent_langchain（使用配置初始化 LLM）
+```
+
+如果在 `import agent` 之后再调用 `load_dotenv()`，`agent/config.py` 在导入时已经执行了 `os.getenv()` 调用，读取到的将是空值。因此 `main.py` 和 `app.py` 都将 `load_dotenv()` 放在了所有 `import agent.*` 语句之前。
+
+Sources: [main.py](main.py#L23-L26), [app.py](app.py#L14-L15)
+
+## 第三步：验证安装
+
+### 验证 Python 依赖
+
+运行以下命令确认所有核心包可正常导入：
+
+```bash
+python -c "import dotenv, langchain, langgraph, langchain_openai, rich, fastapi, aiohttp, numpy, requests"
+```
+
+如果没有任何报错，说明依赖安装成功。
+
+### 验证 LLM 连接
+
+Pocket-Agent 的 `main.py` 启动后会自动依次执行以下检测：
+1. 检查 Embedding 模型路径是否存在（`EMBEDDING_MODEL_PATH`），存在则自动拉起 `llama-server`
+2. 指数退避检测 Embedding 服务是否就绪（最多等待 7 秒）
+3. 检测 Termux API 是否安装（`termux-battery-status` 命令是否可执行）
+4. 启动 3D 身体控制服务（端口 18081）
+
+如果 `.env` 配置正确，启动时应看到终端 UI 显示模型名称和嵌入状态。
+
+Sources: [main.py](main.py#L383-L399), [agent/embedding.py](agent/embedding.py#L252-L316)
+
+### 常见问题排查
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| `ModuleNotFoundError: No module named 'langchain'` | 依赖未安装 | 执行 `pip install -r requirements.txt` |
+| `OPENAI_API_KEY is not set` 或 401 错误 | API Key 无效或为空 | 检查 `.env` 中 `LLM_API_KEY` 是否正确填写 |
+| 中文显示乱码（Windows） | 控制台编码不是 UTF-8 | 运行前执行 `set PYTHONUTF8=1`，或使用 WSL2 |
+| 连接被拒绝（Connection refused） | LLM 服务未启动 | 启动本地 `llama-server` 或将 `DEFAULT_LLM_BASE_URL` 指向云端 API |
+| `pocket-agent: command not found` | 未执行 `pip install -e .` | 在项目根目录执行 `pip install -e .` |
+
+Sources: [docs/00-运行说明.md](docs/00-运行说明.md#L51-L55)
+
+## 下一步
+
+依赖安装和环境变量配置完成后，建议按以下顺序继续：
+
+1. **[本地大模型部署（llama.cpp + Vulkan GPU 加速）](5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su)** —— 在手机上编译 llama.cpp 并启动本地 LLM 服务
+2. **[Embedding 模型配置（BGE-M3 语义检索）](6-embedding-mo-xing-pei-zhi-bge-m3-yu-yi-jian-suo)** —— 下载 BGE-M3 GGUF 模型，让 Agent 具备长期语义记忆能力
+3. 完成上述两个步骤后，进入 **[终端交互模式（main.py）](7-zhong-duan-jiao-hu-mo-shi-main-py)** 启动 Agent，开始第一次对话
+
+> **小贴士**：如果只是想快速体验 Agent 功能，可以先配置云端 API（场景二），跳过本地模型部署，直接启动 `python main.py` 即可。

@@ -1,0 +1,277 @@
+Pocket-Agent 的 3D 虚拟身体系统由三条技术线交织构成：**Python HTTP 服务器提供 SSE 与 REST 端点**、**Three.js 前端执行 3D 渲染与骨骼动画插值**、**Agent 工具层将语义指令转为骨骼操控命令**。当用户打开浏览器访问 `http://<手机IP>:18081` 时，Three.js 页面加载、SSE 连接建立、模型就位，Agent 便可实时操控身体的每一根骨骼——挥手、点头、跳舞、蹲下，所有动作以流式命令推送到浏览器，无需轮询。
+
+---
+
+## 双 SSE 通道架构
+
+整个系统最为关键的设计决策是**两条独立的 SSE 连接**，将"骨骼控制命令"与"AI 回复流"在传输层分离。这是对单一 SSE 通道复用多种事件类型的简化替代方案，让两端代码的职责边界清晰可辨。
+
+```mermaid
+flowchart LR
+    subgraph Python后端
+        BS[BodyServer<br/>ThreadedHTTPServer]
+        BS -- "/api/events" --> SSE1[SSE: 骨骼命令]
+        BS -- "/api/response_stream" --> SSE2[SSE: AI回复Token]
+        BS -- "/api/send_message" --> POST[POST: 用户输入]
+    end
+
+    subgraph 浏览器前端
+        THREE[Three.js 场景]
+        THREE -- EventSource --> SSE1
+        CHAT[聊天UI] -- EventSource --> SSE2
+        CHAT -- fetch POST --> POST
+    end
+
+    subgraph Agent引擎
+        CT[control_body / move_body<br/>body_script / body_idle]
+        CT -- HTTP POST --> BS
+        BB[browser_message_loop<br/>main.py] -- push_response_event --> BS
+    end
+
+    BB -- asyncio.Event --> WAIT[等待浏览器消息]
+    CHAT --> POST --> BB
+```
+
+第一条 SSE 通道 `/api/events` 承载骨骼操控命令（`set_bone`、`set_position`、`idle`），由 Agent 工具通过 HTTP POST 写入服务器端命令队列，前端 `EventSource.onmessage` 消费后驱动骨骼插值。第二条 SSE 通道 `/api/response_stream` 承载 AI 回复流（`token`、`thinking`、`tool_start`、`done`、`error`），由 `browser_message_loop` 协程在每次 Agent 流式输出时通过 `push_response_event()` 写入独立的事件队列。
+
+这两条通道共享同一个 `ThreadedHTTPServer` 实例，但在服务器端各自维护独立的事件列表和 ID 计数器（`commands` vs `response_events`），互不干扰。前端也因此可以分别控制 3D 渲染循环和聊天气泡渲染逻辑，骨骼动画的 60fps 流畅度不会因为 Token 流式输出而卡顿。
+
+Sources: [body_server.py](agent/tools/body_server.py#L1-L145), [body_viewer.html](agent/tools/body_viewer.html#L255-L295)
+
+---
+
+## BodyServer：无框架的轻量级 HTTP + SSE
+
+BodyServer 选择 Python 标准库 `http.server.HTTPServer` 而非 FastAPI，是一个刻意的架构权衡：**零依赖启动**。这个服务器作为子线程在 Agent 主进程启动时伴随运行，如果依赖 FastAPI + uvicorn，意味着额外增加一个进程和端口，且与主 Agent 的 FastAPI 服务（app.py）争夺资源。标准库实现的服务器足够轻量，且 `ThreadingMixIn` 确保了每个 SSE 连接不会被其他请求阻塞。
+
+```
+BodyControlHandler (SimpleHTTPRequestHandler)
+├── do_GET
+│   ├── /           → 302 → /body_viewer.html
+│   ├── /api/events → SSE: 骨骼命令流
+│   ├── /api/status → JSON: 服务器状态
+│   ├── /api/response_stream → SSE: AI回复流
+│   └── *           → 静态文件服务（body_viewer.html, models/*）
+├── do_POST
+│   ├── /api/set_bone       → 骨骼旋转
+│   ├── /api/set_position   → 整体位移
+│   ├── /api/idle           → 恢复待机
+│   └── /api/send_message   → 浏览器消息入队
+└── do_OPTIONS → CORS 预检
+```
+
+SSE 的实现方式值得注意：每次事件推送后调用 `self.wfile.flush()` 确保数据立即到达浏览器，而非等待 TCP 缓冲区填满。服务器使用自增 ID 追踪每个客户端已消费的事件位置（`last_id`），新连接只推送增量事件。这种方式避免了广播机制的复杂性——每个 SSE 连接独立轮询全局队列，连接断开后重连时从断点继续消费：
+
+```python
+# body_server.py: SSE 增量推送模式
+with lock:
+    new_commands = [c for c in commands if c['id'] > last_id]
+for cmd in new_commands:
+    last_id = cmd['id']
+    data = json.dumps(cmd)
+    self.wfile.write(f'data: {data}\n\n'.encode())
+    self.wfile.flush()
+time.sleep(0.05)  # 50ms 轮询间隔
+```
+
+50ms 的轮询间隔意味着骨骼命令的理论延迟约 50ms，而人眼对 3D 动画的感知阈值约为 100ms（10fps），这一参数足以支撑流畅的实时操控。`BrokenPipeError` 和 `ConnectionResetError` 的捕获确保了客户端断开时服务器不会崩溃。
+
+Sources: [body_server.py](agent/tools/body_server.py#L23-L145)
+
+---
+
+## Three.js 渲染引擎：骨骼插值与待机动画
+
+前端 Three.js 场景的构建遵循标准的三要素（场景、相机、渲染器），但在骨骼动画系统上做了精心设计。3D 模型 `robot.geo.gltf` 包含一组具有层级关系的骨骼节点（root → body → head, left_leg, right_leg 等），渲染循环不依赖 Three.js 原生动画系统（AnimationMixer），而是自建了一套基于**目标值插值（lerp）** 的轻量骨骼驱动系统。
+
+```
+骨骼插值状态机
+┌─────────────────────────────────────────┐
+│                animMode                  │
+│  ┌──────────┐      ┌───────────────┐    │
+│  │   idle   │←────→│    manual     │    │
+│  └────┬─────┘      └───────┬───────┘    │
+│       │                     │            │
+│  sampleKF(IDLE_KFS, t)     │            │
+│       │                     │            │
+│       ▼                     ▼            │
+│  target[name] = {x,y,z}     │            │
+│       │                     │            │
+│       └─────────┬───────────┘            │
+│                 ▼                        │
+│         applyBones(dt):                  │
+│  cur += (target - cur) * (1-e^(-8*dt))   │
+│  bone.rotation.set(cur * DEG2RAD)        │
+└─────────────────────────────────────────┘
+```
+
+核心数学公式：`cur += (target - cur) * (1 - e^(-LERP_SPEED * dt))`。这是一个指数平滑插值，`LERP_SPEED = 8` 意味着每帧骨骼向其目标值靠近约 `1 - e^(-8/60) ≈ 12.5%`（60fps 下），约 20 帧（0.33 秒）达到 95% 接近度。这种插值方式的好处是：**新旧命令之间的过渡天然平滑**，不会出现骨骼"跳变"。
+
+待机动画（idle 模式）使用关键帧系统 `IDLE_KFS`，为每个骨骼定义了在 0~1 时间循环内的位置序列。以 `right_hand` 为例：
+
+```javascript
+const IDLE_KFS = {
+  right_hand: {0: [0,0,-20], 0.5: [0,0,-17.5], 1: [0,0,-20]},
+  left_hand:  {0: [0,0,20],  0.5: [0,0,17.5],  1: [0,0,20]},
+  root:       {0: [0,0,0],   0.5: [-0.5,0,0],   1: [0,0,0]},
+  body:       {0: [0,0,0],   0.5: [-1,0,0],     1: [0,0,0]},
+  // ...
+};
+```
+
+双手在 -20° 到 -17.5° 之间微摆，全身（root）和躯干（body）在左右 0.5°~1° 之间轻摇——这就是"呼吸感"的来源。`sampleKF()` 函数在关键帧之间做线性插值，将离散的关键帧序列变为连续动画曲线。
+
+当 SSE 推送 `set_bone` 命令时，`animMode` 切换为 `manual`，对应骨骼加入 `manual` 集合，其目标值不再由 `updateAnim()` 覆盖。当推送 `idle` 命令时，`goIdle()` 清空 `manual` 集合，所有骨骼回归待机关键帧的初始位置，实现"归位"。
+
+Sources: [body_viewer.html](agent/tools/body_viewer.html#L85-L245)
+
+---
+
+## 聊天交互：浏览器 → Agent → SSE 回流的完整链路
+
+浏览器端的聊天栏不是独立的 UI 组件，而是与 SSE 推送系统深度绑定的消息收发终端。当用户在输入框按下回车时，触发的是一个**两阶段通信流程**：
+
+**第一阶段：消息发送（POST）**
+```javascript
+// 用户输入通过 POST 发送到服务器
+await fetch('/api/send_message', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: "你好，挥个手"})
+});
+```
+浏览器不等待 AI 响应就立即返回，显示"思考中"动画。服务端 `do_POST` 将消息推入线程安全的 `message_queue`，并通过 `asyncio.Event` 唤醒主协程中的 `browser_message_loop`。
+
+**第二阶段：SSE 回流（EventSource）**
+```javascript
+const es = new EventSource('/api/response_stream');
+es.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+    if (data.type === 'thinking') {
+        // 显示思考动画
+    } else if (data.type === 'token') {
+        aiBubble.textContent += data.content;  // 流式追加
+    } else if (data.type === 'tool_start') {
+        // 短暂显示工具调用提示（3秒后自动消失）
+    } else if (data.type === 'done') {
+        // 填充完整响应，启动60秒自动清除计时器
+    }
+};
+```
+
+`main.py` 中的 `browser_message_loop` 是连接浏览器与 Agent 引擎的桥梁：
+
+```python
+async def browser_message_loop():
+    init_browser_event(asyncio.get_event_loop())
+    ev = get_browser_event()
+    while True:
+        msg = get_browser_message()  # 非阻塞读取队列
+        if not msg:
+            ev.clear()
+            msg = get_browser_message()  # double-check
+            if not msg:
+                await ev.wait()  # 无轮询等待
+                msg = get_browser_message()
+        # ... 调用 agent.stream_conversation(msg)
+        # 流式输出通过 push_response_event() 推送
+        async for chunk in agent.stream_conversation(msg):
+            if chunk['type'] == 'token':
+                push_response_event('token', {'content': chunk['content']})
+        push_response_event('done', {'response': response})
+```
+
+这里的 `asyncio.Event` 避免了轮询等待：当消息队列为空时，协程挂起在 `ev.wait()`；当 POST 请求将消息入队后，`call_soon_threadsafe(ev.set())` 在事件循环线程中安全地唤醒等待协程。这是典型的**无锁异步通信模式**，既避免了线程安全问题，又实现了零 CPU 开销的等待。
+
+聊天历史记录每 60 秒自动清除，由 `startClearTimer()` 管理。这意味着浏览器端的聊天 UI 被设计为**临时的对话展示窗口**而非持久化记录器——完整的对话历史由后端的 LangGraph Checkpoint 管理。
+
+Sources: [body_viewer.html](agent/tools/body_viewer.html#L310-L425), [main.py](agent/tools/../main.py#L455-L500), [body_server.py](agent/tools/body_server.py#L148-L175)
+
+---
+
+## 工具层：语义到骨骼的坐标变换
+
+Agent 通过四个工具与 3D 身体交互，定义在 `body_control_tool.py` 中：
+
+| 工具 | 用途 | HTTP 端点 |
+|------|------|-----------|
+| `control_body(part, x, y, z)` | 控制单根骨骼旋转角度 | `POST /api/set_bone` |
+| `move_body(x, y, z)` | 整体位移（蹲下、跳跃） | `POST /api/set_position` |
+| `body_script(moves)` | 批量执行动作序列（跳舞） | 依次调用上述端点 |
+| `body_idle()` | 恢复待机动画 | `POST /api/idle` + 位移复位 |
+
+其中最为关键的架构细节是 **BONE_MAP 与轴取反机制**。3D 模型中的骨骼命名为英文（`left_hand`、`da_shou2`），而 Agent 提示词中使用的是自然语言部位名（`right_arm`、`right_elbow`）。工具层做了双向映射，并对 `Z_NEGATE_PARTS` 和 `Y_NEGATE_PARTS` 中的骨骼进行**轴取反**：
+
+```python
+BONE_MAP = {
+    "right_arm": "left_hand",    # 右臂 → 模型中的左手骨骼
+    "right_forearm": "da_shou2", # 右前臂 → 模型中的"大手2"
+    "right_ear": "zuo_ear2",     # 右耳 → 模型中的"左耳2"
+    # ...
+}
+Z_NEGATE_PARTS = {"left_leg", "right_arm", "left_arm", ...}
+Y_NEGATE_PARTS = {"right_arm", "left_arm"}
+```
+
+这种映射的存在是因为：模型的骨骼坐标系与 Agent 约定的人体坐标系不一致。例如，模型中的"左手骨骼"实际上是 Agent 视角的"右臂"。轴取反则是为了修正旋转方向——当 Agent 说"右臂向前伸（y 负）"时，发送到模型骨骼的值需要取反才能产生"向前"的视觉效果。这些映射和取反规则是通过反复实验验证后硬编码的，在工具的 docstring 中已经逐部位说明了方向约定。
+
+`body_script` 工具是一个**批量脚本执行器**，接受 JSON 数组格式的动作序列：
+
+```json
+[
+  {"action":"bone","part":"right_arm","z":60,"delay":0.3},
+  {"action":"bone","part":"right_arm","y":-20,"z":60,"delay":0.3},
+  {"action":"idle"}
+]
+```
+
+每个步骤支持 `bone`（骨骼旋转）、`pos`（位移）、`idle`（归位）三种动作类型，步间可指定延时。这种设计让 Agent 可以一次调用完成一组连续动作（如挥手三次、跳舞片段），而无需多次调用 `control_body` 产生间隙性卡顿。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L1-L289)
+
+---
+
+## 服务器生命周期与启动时机
+
+BodyServer 的生命周期与主 Agent 进程绑定，由 `body_control_tool.py` 中的 `start_body_server()` 统一管理：
+
+```python
+def start_body_server(port=18081):
+    from .body_server import ThreadedHTTPServer, BodyControlHandler
+    stop_body_server()  # 清理旧实例
+    _server_instance = ThreadedHTTPServer(('0.0.0.0', port), BodyControlHandler)
+    _server_thread = threading.Thread(target=_server_instance.serve_forever, daemon=True)
+    _server_thread.start()
+```
+
+主程序 `main.py` 在启动阶段通过 `asyncio.ensure_future(_start_body_server())` 将其作为后台协程启动，使用 `loop.run_in_executor(None, ...)` 将阻塞的 `serve_forever` 转移到线程池执行。这意味着服务器启动不会阻塞 Agent 的正常初始化流程。
+
+`stop_body_server()` 的清理逻辑值得注意：通过设置 `_BaseServer__shutdown_request = True` 和关闭 socket 来强制终止 `serve_forever`，这是一种"虽然粗暴但有效"的 Python 标准库服务器关闭方式。端口不释放的问题通过 `allow_reuse_address = True`（在 `ThreadedHTTPServer` 类中设置）来缓解，并在 `start_body_server` 中捕获 `OSError` 后自动重试一次。
+
+3D 模型文件 `robot.geo.gltf` 位于 `agent/tools/models/` 目录下，由 BodyServer 通过 `SimpleHTTPRequestHandler` 的静态文件服务能力（`directory` 参数指向 `body_server.py` 所在目录）提供访问。前端通过 `GLTFLoader` 加载该模型，并在加载完成后初始化 SSE 连接。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L50-L75), [main.py](agent/tools/../main.py#L365-L382)
+
+---
+
+## 架构权衡与设计决策
+
+| 决策 | 选择 | 替代方案 | 理由 |
+|------|------|---------|------|
+| 服务器框架 | `http.server` 标准库 | FastAPI + uvicorn | 零额外依赖，线程内运行，不占端口 |
+| 命令传输 | SSE 增量推送 | WebSocket | 单向推送场景 SSE 足够，EventSource 浏览器原生支持，自动重连 |
+| 骨骼动画 | 自建 lerp 状态机 | Three.js AnimationMixer | 骨骼映射关系复杂，自建系统便于与 SSE 对接 |
+| 双 SSE 通道 | 两条独立连接 | 单通道多事件类型 | 职责分离，骨骼 60fps 不会受 Token 流输出影响 |
+| 消息传递 | asyncio.Event + 线程安全队列 | asyncio.Queue | 跨线程（HTTP handler 线程 → 主协程）通信需要线程锁 |
+
+**核心约束**：BodyServer 的 SSE 实现是"每个客户端独立轮询"模式。当存在多个浏览器同时连接时，每个客户端都从全局 `commands` 列表拉取增量事件。在单用户场景下（移动端 Pocket-Agent 的典型使用模式），这种简单实现完全够用；但如果有多客户端需求，应当改用发布-订阅模式为每个客户端维护独立游标。
+
+Sources: [body_server.py](agent/tools/body_server.py#L23-L145), [body_viewer.html](agent/tools/body_viewer.html#L255-L310)
+
+---
+
+## 下一步阅读
+
+- **工具系统前置**：了解 Agent 如何通过工具调用触发身体控制，参见[内置工具一览](22-nei-zhi-gong-ju-lan-wen-jian-cao-zuo-shell-zhi-xing-xi-tong-xin-xi-mcp-diao-yong)
+- **3D 身体控制工具定义**：`control_body` / `move_body` / `body_script` / `body_idle` 的完整参数说明与示例，详见[3D 身体控制工具](26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle)
+- **浏览器双向交互**：了解聊天输入如何经过 Agent 处理并流式返回到浏览器，详见[浏览器双向交互](28-liu-lan-qi-shuang-xiang-jiao-hu-xiao-xi-shu-ru-xiang-ying-liu)

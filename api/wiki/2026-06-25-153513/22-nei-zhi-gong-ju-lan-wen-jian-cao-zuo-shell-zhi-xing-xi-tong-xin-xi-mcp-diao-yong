@@ -1,0 +1,315 @@
+Pocket-Agent 的内置工具系统是 Agent 与外部世界交互的桥梁——Agent 通过它们读取文件、执行命令、查询设备状态、调用外部服务，以及管理记忆和派发子任务。所有工具以 `@tool` 装饰器定义在 `basic_tools.py` 中，通过 `create_agent(tools=ALL_TOOLS)` 统一注册到 LangChain Agent 中。本文将逐一介绍每个工具的用途、参数和设计细节。
+
+## 工具总览：一张图看清所有内置工具
+
+```mermaid
+graph TB
+    subgraph 文件操作["📂 文件操作"]
+        FR[file_read]
+        FW[file_write]
+        FS[file_search]
+        DL[directory_list]
+    end
+
+    subgraph 系统与执行["⚙️ 系统与执行"]
+        SE[shell_exec]
+        SI[system_info]
+    end
+
+    subgraph MCP通信["🔌 MCP 通信"]
+        MC[mcp_call]
+    end
+
+    subgraph 记忆系统["🧠 记忆系统"]
+        SM[save_memory]
+        SR[search_memory]
+        UP[update_user_profile]
+    end
+
+    subgraph 任务与语音["📋 其他"]
+        DT[delegate_task]
+        TS[tts_speak]
+    end
+
+    Agent --> 文件操作
+    Agent --> 系统与执行
+    Agent --> MCP通信
+    Agent --> 记忆系统
+    Agent --> 任务与语音
+
+    style Agent fill:#4a90d9,color:#fff
+    style 文件操作 fill:#e8f5e9
+    style 系统与执行 fill:#fff3e0
+    style MCP通信 fill:#e3f2fd
+    style 记忆系统 fill:#f3e5f5
+    style 任务与语音 fill:#fce4ec
+```
+
+每个工具的功能、参数、使用场景整理如下：
+
+| 工具名 | 分类 | 功能概述 | 关键参数 |
+|--------|------|---------|---------|
+| `file_read` | 文件操作 | 读取文件内容，支持相对路径 | `filepath`, `max_lines`(默认100) |
+| `file_write` | 文件操作 | 写入/追加文件内容，含任务完成门禁 | `filepath`, `content`, `append` |
+| `file_search` | 文件操作 | 正则搜索文件内容，带上下文 | `pattern`, `filepath`, `context_lines`(默认2) |
+| `directory_list` | 文件操作 | 列出目录内容（文件/夹区分） | `directory`, `pattern` |
+| `shell_exec` | 系统执行 | 执行 Shell 命令（10s超时） | `command` |
+| `system_info` | 系统信息 | 获取手机系统状态 | `info_type`(all/battery/cpu/memory/disk/network/device) |
+| `mcp_call` | MCP通信 | 调用任意 MCP JSON-RPC 服务 | `server_url`, `tool_name`, `arguments` |
+| `save_memory` | 记忆系统 | 保存事实/事件/舞蹈记忆 | `content`, `type`(fact/episodic/dance), `importance`(1-10) |
+| `search_memory` | 记忆系统 | 跨会话语义+关键词混合检索 | `query`, `scope`(memory/session), `memory_type`, `days` |
+| `update_user_profile` | 记忆系统 | 更新用户画像信息 | `section`, `content` |
+| `delegate_task` | 任务管理 | 派发任务给子 Agent 后台执行 | `description`, `tasks_json` |
+| `tts_speak` | 语音输出 | 文字转语音朗读 | `text` |
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L999-L1001)
+
+## 文件操作工具（file_read / file_write / file_search / directory_list）
+
+文件操作是 Agent 最基础的能力，四个工具覆盖了"读、写、搜、览"的完整闭环。
+
+### file_read — 读取文件内容
+
+```python
+@tool
+def file_read(filepath: str, max_lines: int = 100) -> str
+```
+
+读取文本文件，默认最多 100 行（防止输出爆炸）。支持相对路径——传入 `README.md` 时，自动从项目根目录拼接绝对路径。每行附带行号（`  1| content`），方便定位。超过 `max_lines` 时截断并标注 `... (已截止)`。
+
+设计亮点：文件不存在时返回友好提示而非异常，允许 Agent 根据反馈自主决策下一步。
+
+### file_write — 写入/追加文件内容
+
+```python
+@tool
+def file_write(filepath: str, content: str, append: bool = False) -> str
+```
+
+覆盖写入（`append=False`）或追加写入（`append=True`）。最值得关注的特性是**任务完成门禁**（gatekeeper）：当写入 `task.json` 且 `all_completed=true` 时，会自动检查所有步骤的 `status` 是否均为 `completed`，若有未完成步骤则拦截并提示第一个未完成项。这套机制防止了子 Agent 误标记任务完成，是整个任务管理系统的关键质量保障。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L81-L95)
+
+### file_search — 正则搜索文件内容
+
+```python
+@tool
+def file_search(pattern: str, filepath: str, context_lines: int = 2) -> str
+```
+
+在全文中搜索正则表达式模式，匹配行用 `>>>` 标记，并提供上下各 `context_lines` 行作为上下文。返回结果按匹配位置顺序排列，多个匹配间用空行分隔。
+
+### directory_list — 列出目录内容
+
+```python
+@tool
+def directory_list(directory: str, pattern: str = "*") -> str
+```
+
+列出目录下的文件和子目录，文件夹用 `📁` 图标标记，文件用 `📄` 图标标记并显示字节大小。结果按名称字母序排列。注意 `pattern` 参数目前是预留的，实际尚未实现筛选过滤。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L37-L173)
+
+## Shell 执行工具（shell_exec）
+
+```python
+@tool
+def shell_exec(command: str) -> str
+```
+
+执行任意的 Shell 命令，输出结果和错误信息均返回给 Agent。10 秒超时保护防止命令挂死。针对 `termux-tts-speak` 做了特殊优化——后台运行（`&>/dev/null &`），不会阻塞对话流程。
+
+环境检测逻辑值得一提：当在纯 Termux 终端（无图形界面）下执行安卓控制类命令（如 `android_click`、`android_screenshot`）时，工具会给出友好提示，引导用户在图形界面或 VNC 环境中使用。但对 MCP 的 curl 调用会跳过此检查——因为 MCP 走 HTTP 协议，不需要图形界面权限。
+
+设计原则：命令执行结果始终包含截断后的命令前缀（最多 50 字符），确保日志可追踪，同时避免输出过长。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L266-L347)
+
+## 系统信息工具（system_info）
+
+```python
+@tool
+def system_info(info_type: str = "all") -> str
+```
+
+通过 Termux API 获取手机系统状态，支持按类型查询：
+
+| 类型值 | 返回信息 | 底层命令 |
+|--------|---------|---------|
+| `battery` | 电池电量、温度、状态 | `termux-battery-status` |
+| `cpu` | 核心数、型号、硬件信息 | `/proc/cpuinfo` 解析 |
+| `memory` | 内存总量、可用量 | `/proc/meminfo` 前10行 |
+| `disk`/`storage` | 存储空间 | `df -h /sdcard` 和 `/data` |
+| `network`/`wifi` | WiFi 连接信息 | `termux-wifi-connectioninfo` |
+| `device` | 设备 IMEI、网络类型等 | `termux-telephony-deviceinfo` |
+| `all`（默认） | 以上全部 | — |
+
+未安装 Termux API 时，工具会自动检测并给出安装指引，同时返回基础的存储信息（`df -h /sdcard`）作为兜底，保证至少有些信息可用。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L176-L264)
+
+## MCP 调用工具（mcp_call）
+
+```python
+@tool
+async def mcp_call(server_url: str, tool_name: str, arguments: Optional[str] = None) -> str
+```
+
+mcp_call 是 Agent 连接外部世界的通用协议接口。它实现了 MCP（Model Context Protocol）的 JSON-RPC 调用，支持任意 MCP 服务。默认集成的 MCP 服务是 NeuralBridge（地址 `http://127.0.0.1:7474/mcp`），提供安卓设备操控能力（点击、滑动、截图、UI 树分析等）。
+
+工具设计有几个关键细节：
+
+- **参数解析**：`arguments` 支持 JSON 字符串，也兼容 Python 的 `ast.literal_eval` 格式，容错性强
+- **协议兼容**：内置 `tools/list` 特殊处理——这是 MCP 的查询方法，不走 `tools/call` 包装，直接返回可用工具列表
+- **结果处理**：自动识别 `content` 数组中的 `text` 类型（提取文本）和 `image` 类型（统计截图尺寸和大小，不传输 base64 数据避免 token 爆炸）
+- **错误处理**：区分连接失败、请求超时（30秒）、服务端错误三种场景，给出中文指引
+
+典型的 NeuralBridge 工具链调用流程：
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 Agent
+    participant MCP as 🔌 mcp_call
+    participant NB as NeuralBridge MCP
+
+    Agent->>MCP: mcp_call("http://127.0.0.1:7474/mcp", "tools/list")
+    MCP->>NB: JSON-RPC tools/list
+    NB-->>MCP: 返回可用工具列表
+    MCP-->>Agent: 📦 可用工具 (8个): ...
+
+    Agent->>MCP: mcp_call(url, "android_get_ui_tree")
+    MCP->>NB: JSON-RPC tools/call
+    NB-->>MCP: UI 树 XML 数据
+    MCP-->>Agent: UI 分析结果
+
+    Agent->>MCP: mcp_call(url, "android_tap", '{"x":315,"y":1002}')
+    MCP->>NB: JSON-RPC tools/call
+    NB-->>MCP: 点击成功
+    MCP-->>Agent: ✅ 调用成功
+```
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L626-L710)
+
+## 记忆系统工具（save_memory / search_memory / update_user_profile）
+
+这三个工具构成了 Pocket-Agent 的分层记忆系统的对外接口。它们的内部实现涉及 FTS5 全文搜索、向量语义搜索和 RRF 融合排序，但在工具层面使用起来非常简洁。
+
+### save_memory — 保存记忆
+
+```python
+@tool
+def save_memory(content: str, type: str = "fact", importance: int = 5) -> str
+```
+
+将重要信息保存到 SQLite `messages` 表（`role="memory"`），同时写入向量索引。支持三种记忆类型：
+
+- `fact`：事实记忆——用户偏好、技术决定、知识性信息
+- `episodic`：事件记忆——操作结果、问题解决方案、时间相关事件
+- `dance`：舞蹈动作记忆——编舞数据、动作序列、姿态信息
+
+`importance` 参数（1-10）影响后续检索时的排序权重，大多数记忆打 3-5 分即可。
+
+### search_memory — 搜索记忆
+
+```python
+@tool
+def search_memory(query: str, scope: str = "memory", memory_type: str = None, days: int = None) -> str
+```
+
+内部运行一套完整的混合检索流水线：FTS5 trigram 关键词搜索 → 向量语义搜索（EmbeddingClient + numpy 余弦相似度）→ RRF 融合排序 → 时间衰减加权 → 取 top 5。`scope="session"` 时仅搜索当前会话的原始对话（不搜索记忆），用于回溯用户刚说过的话。
+
+### update_user_profile — 用户画像
+
+```python
+@tool
+async def update_user_profile(section: str, content: str) -> str
+```
+
+记录用户明确提到的个人信息，按 `section` 分类存储。预设分类包括：基本信息、沟通偏好、行为要求、反馈、其他。每个 section 的内容会追加或覆盖，保持简洁。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L585-L622), [basic_tools.py](agent/tools/basic_tools.py#L753-L822), [basic_tools.py](agent/tools/basic_tools.py#L826-L902)
+
+## 辅助工具（delegate_task / tts_speak）
+
+### delegate_task — 子 Agent 任务派发
+
+```python
+@tool
+def delegate_task(description: str, tasks_json: str = "") -> str
+```
+
+将复杂任务派发给子 Agent（executor）在后台异步执行。调用后会写入 `task.json` 到 `tasks/task_YYYYMMDD_HHMMSS/` 目录，并将任务加入待处理队列。主 Agent 的流式输出结束后，`consume_pending_tasks()` 会读取队列并启动子 Agent。
+
+设计约束：
+- `tasks_json` 必须按原子粒度分解步骤（每个 step 一个操作）
+- 每个 step 必须有 `status: "pending"`，子 Agent 完成时改为 `"completed"`
+- 所有步骤完成后才能标记 `all_completed: true`
+
+### tts_speak — 文字转语音
+
+```python
+@tool
+async def tts_speak(text: str) -> str
+```
+
+调用 Termux 的 `termux-tts-speak` 在后台朗读文字，不阻塞当前对话。朗读失败时静默忽略，Agent 正常进行文字回复。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L713-L733), [basic_tools.py](agent/tools/basic_tools.py#L918-L990)
+
+## 工具注册与加载机制
+
+所有内置工具集中在 `ALL_TOOLS` 列表中：
+
+```python
+ALL_TOOLS = [
+    file_read, file_write, file_search, directory_list,
+    system_info, shell_exec,
+    update_user_profile, mcp_call,
+    delegate_task, tts_speak,
+    save_memory, search_memory
+] + BODY_TOOLS  # 3D 身体控制工具（可选）
+```
+
+在 `agent_langchain.py` 的 `_create_agent()` 方法中，`ALL_TOOLS` 直接传入 `create_agent(tools=ALL_TOOLS)` 完成注册。工具名称列表同时被注入到增强系统提示词中（`agent_enhance_prompt`），让 Agent 知道可用工具的范围和功能。
+
+工具调用过程受多层中间件保护：
+1. **ToolCallRepeatMiddleware**——检测连续重复的工具调用，第二次时返回警告，让模型自我纠正
+2. **ToolCallIdMiddleware**——修复某些 LLM（如 GLM 系列）缺失的 `tool_call_id` 字段
+3. **ModelCallLimitMiddleware**——限制单次运行最多 `MAX_ITERATIONS`（300 次）模型调用
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L999-L1001), [agent_langchain.py](agent/agent_langchain.py#L770-L822), [agent_langchain.py](agent/agent_langchain.py#L226-L269)
+
+## 使用要点与最佳实践
+
+### 何时用哪些工具？
+
+选择工具的核心原则是匹配任务类型：
+
+| 任务场景 | 推荐工具组合 |
+|---------|------------|
+| 读取项目代码 | `file_read` → 查看关键文件；`directory_list` → 了解目录结构 |
+| 修改配置文件 | `file_read` → 先读，`file_write` → 再写 |
+| 排查 Bug | `file_search` → 搜索关键模式，`shell_exec` → 运行诊断命令 |
+| 获取手机状态 | `system_info(battery)` → 看电量，`system_info(memory)` → 看内存 |
+| 自动化操作手机 | `mcp_call(NeuralBridge, "android_get_ui_tree")` → 分析界面，`mcp_call(NeuralBridge, "android_tap")` → 点击 |
+| 记住用户偏好 | `save_memory` → 存事实记忆，`update_user_profile` → 更新画像 |
+| 回溯历史信息 | `search_memory` → 跨会话检索，或 `search_memory(scope="session")` → 看当前对话 |
+| 复杂多步骤任务 | `delegate_task` → 分解步骤派给子 Agent |
+| 语音播报 | `tts_speak` → 朗读文本 |
+
+### 工具调用的安全边界
+
+- `shell_exec` 有 10 秒超时，长时间运行的命令（如模型推理）请使用后台执行方式
+- `mcp_call` 有 30 秒超时，适合 UI 分析和截图等操作
+- `file_write` 对 `task.json` 有门禁检查，避免错误标记任务完成
+- 安卓控制命令在纯 Termux 终端环境下会被拦截并提示，防止在无图形界面下误操作
+- TTS 命令自动后台运行，不会阻塞 Agent 的思考流程
+
+## 延伸阅读
+
+了解完内置工具的概貌后，可以根据需要深入特定领域：
+
+- 工具的直接操控对象之一——**手机界面操控**的详细说明请见：[Termux API 操控（通知、TTS、传感器、电池等）](23-termux-api-cao-kong-tong-zhi-tts-chuan-gan-qi-dian-chi-deng) 和 [NeuralBridge MCP 服务（UI 树分析、点击滑动、截图）](24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu)
+- 了解子 Agent 如何消费 `delegate_task` 派发的任务，见 [子 Agent 前台同步执行与流式输出](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu)
+- 记忆系统的内部原理和存储策略，见 [分层记忆架构（用户画像 + 事实记忆 + 事件记忆）](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi)
+- 工具调用的中间件保护机制，见 [中间件链深度解析（上下文压缩、重复检测、模型调用限制）](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi)

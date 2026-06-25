@@ -1,0 +1,169 @@
+记忆系统并非只写不删——Pocket-Agent 内置了一套自动化的遗忘机制与索引维护流程，确保向量存储不会随着时间无限膨胀，同时保持全文索引与向量索引的一致性。本文聚焦于**清理策略**和**索引维护机制**，不涉及记忆的写入与检索流程（详见 [记忆工具使用](19-ji-yi-gong-ju-shi-yong-save-memory-search-memory-update-user-profile) 和 [RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue)）。
+
+---
+
+## 遗忘机制：低重要性旧记忆的自动清理
+
+系统在启动时自动执行一次清理操作（`_cleanup_old_messages`），针对的是超过 30 天且重要性评分 ≤ 2 的`memory`类型消息。清理的**对象是向量嵌入（embedding）而非原始消息内容**——`messages`表中的记录被保留，`embeddings`表中的向量索引被删除。这种设计基于一个关键假设：低重要性旧记忆的语义检索价值随时间衰减，保留其原始文本记录仍可作为关键词搜索的备选，但不再占用向量索引空间和检索资源。
+
+```python
+# app.py 第 149 行
+thirty_days_ago = int((time.time() - 30 * 24 * 3600) * 1000)
+old_message_ids = await db.execute_fetchall(
+    """SELECT id FROM messages
+       WHERE role = 'memory' AND importance <= 2 AND timestamp < ?""",
+    (thirty_days_ago,)
+)
+for row in old_message_ids:
+    _vector_store.delete(row[0])
+```
+
+清理条件有两个维度：**时间维度（30 天）** 和 **重要性维度（≤ 2 分）**。两者必须同时满足——30 天前的高重要性记忆不会被清理；近期但不重要的记忆也不会被清除。这一双重阈值的设计平衡了检索质量与存储成本：`importance` 评分由 `save_memory` 工具调用时设定，大多数常规记忆分布在 3-5 分，真正低价值的历史记录才会被遗忘。
+
+Sources: [app.py](app.py#L149-L163), [main.py](main.py#L139-L152), [basic_tools.py](agent/tools/basic_tools.py#L753-L826)
+
+---
+
+## 向量索引的级联删除
+
+`VectorStore.delete()` 是整个向量索引维护的原子操作（位于 `agent/embedding.py`）。它接受 `message_id` 参数，从 `embeddings` 表中删除对应行：
+
+```python
+def delete(self, message_id: int):
+    conn = self._get_conn()
+    try:
+        conn.execute("DELETE FROM embeddings WHERE id = ?", (str(message_id),))
+        conn.commit()
+    finally:
+        conn.close()
+```
+
+删除操作发生在多个场景中：**自动清理**（上述遗忘机制）、**API 手动删除**（`DELETE /memory/{memory_id}`）、**前端的显式删除操作**。每次删除都独立作用于单条嵌入，不涉及级联事务——向量索引与消息表之间的关联通过消息 ID 维持，但不建立外键约束，这是有意为之的松耦合设计，允许两表独立演进。
+
+Sources: [embedding.py](agent/embedding.py#L240-L251), [app.py](app.py#L794-L800)
+
+---
+
+## 全文索引（FTS5）的自动同步
+
+与向量索引需要手动维护不同，FTS5 全文索引通过 SQLite 触发器实现**完全自动同步**。系统在 `messages` 表上注册了三个触发器，覆盖了所有数据变更场景：
+
+| 触发器 | 触发时机 | 行为 |
+|--------|----------|------|
+| `messages_fts_ai` | `AFTER INSERT` | 为新插入的行自动构建 FTS 条目 |
+| `messages_fts_ad` | `AFTER DELETE` | 删除对应 FTS 条目（通过 `'delete'` 命令） |
+| `messages_fts_au` | `AFTER UPDATE` | 先删旧 FTS 条目，再插入新条目 |
+
+```sql
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+END
+```
+
+触发器的存在意味着：**删除消息**（`DELETE /messages/{message_id}`）、**清空会话**（`DELETE /conversations/{conversation_id}`）等操作后，FTS 索引自动保持与 `messages` 表一致，无需额外的维护步骤。
+
+此外，当数据库迁移检测到 FTS 表使用旧分词器时，系统会**重建 FTS 表**——先 DROP 旧表，重新创建使用 `trigram` 分词器的 FTS5 虚拟表，然后通过 `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')` 全量重建索引。这一操作仅在首次建表或检测到分词器变更时触发。
+
+Sources: [app.py](app.py#L120-L146), [main.py](main.py#L86-L109)
+
+---
+
+## 启动时自动补录缺失的向量索引
+
+系统启动时（`startup` 事件），会执行一次**向量索引完整性检查**：对比 `messages` 表中所有 `role = 'memory'` 的记录与 `embeddings` 表中的现有 ID，将缺失的嵌入补录回去。
+
+```python
+rows = await db.execute_fetchall("SELECT id, content FROM messages WHERE role = 'memory'")
+existing_ids = await db.execute_fetchall("SELECT id FROM embeddings")
+existing = {str(r[0]) for r in existing_ids}
+missing = [r for r in rows if str(r[0]) not in existing]
+for msg_id, content in missing:
+    _vector_store.add(msg_id, content)
+```
+
+补录机制的设计意图很明确：向量嵌入的生成依赖外部的 Embedding 服务（BGE-M3 via llama-server），如果服务在记忆写入时尚未就绪 `save_memory` 会跳过向量索引写入，但消息文本已经进入 `messages` 表。启动时补录确保这些"孤儿"记忆最终获得向量索引。`_vector_store.add()` 内部会检查嵌入服务的可用性，如果仍然不可用则跳过，不会阻塞启动流程。
+
+Sources: [app.py](app.py#L213-L228)
+
+---
+
+## API 层面的清理操作
+
+HTTP API 提供了三个不同粒度的清理端点，各自的行为边界如下：
+
+| API 端点 | 影响范围 | 向量索引 | FTS 索引 | 会话历史 |
+|----------|----------|----------|----------|----------|
+| `DELETE /memory/{id}` | 单条记忆 | 删除嵌入 | 不受影响 | 不受影响 |
+| `DELETE /conversations/all` | 所有会话 | **保留** | 自动清除 | 全部删除 |
+| `DELETE /conversations/{id}` | 指定会话 | **不受影响** | 自动清除 | 删除该会话 |
+
+最关键的设计决策在于：**删除会话不会自动清理对应的向量索引**。`DELETE /conversations/all` 清空 `messages` 表但特意保留 `embeddings` 表——这样做的意图在于，跨会话记忆的检索不依赖会话 ID，即使某个会话被删除，其中的记忆信息仍然可以被后续的 `search_memory` 检索到。只有当用户通过 `DELETE /memory/{id}` 显式删除某条记忆或系统自动清理触发时，向量索引才被移除。
+
+Sources: [app.py](app.py#L794-L865)
+
+---
+
+## 维护全景图
+
+```mermaid
+flowchart TB
+    subgraph 写入路径
+        A[save_memory] --> |INSERT| B[(messages 表)]
+        B --> |FTS5 触发器| C[(FTS 全文索引)]
+        B --> |VectorStore.add| D[(embeddings 向量索引)]
+    end
+
+    subgraph 清理路径
+        E[启动清理] --> |30天+importance≤2| F{筛选条件}
+        F --> |命中| G[VectorStore.delete<br/>仅删除 embedding]
+        F --> |未命中| H[保留向量索引]
+        
+        I[DELETE /memory/{id}] --> J{删除单条记忆}
+        J --> K[仅删除 embedding]
+        
+        L[DELETE /conversation] --> M{CASCADE 删除消息}
+        M --> N[FTS 自动同步]
+        M --> O[embeddings 不受影响]
+    end
+
+    subgraph 修复路径
+        P[启动检测] --> Q{检查 embeddings<br/>与 messages 一致性}
+        Q --> |有缺失| R[逐个补录嵌入]
+        Q --> |一致| S[跳过]
+    end
+
+    style G fill:#f96,stroke:#333
+    style N fill:#6f9,stroke:#333
+    style O fill:#f9f,stroke:#333
+```
+
+## 设计权衡与局限
+
+当前维护机制存在几个值得关注的权衡点。**遗忘策略是静态的**：30 天 + importance ≤ 2 的双阈值被硬编码在 `_cleanup_old_messages` 中，没有在线可调的配置项或动态遗忘曲线。这意味着系统无法根据嵌入服务的负载或磁盘空间压力自适应调整清理门限。**向量索引没有碎片整理**：`embeddings` 表的删除操作会造成表的"空洞"，SQLite 的 auto_vacuum 机制并不能完全消除碎片，长期运行后建议手动执行 `VACUUM`（未被内置到启动流程中）。**补录是完整的全量扫描**：启动时遍历所有 `role = 'memory'` 的消息与全部 embeddings 做集合差集，当记忆量达到数万条时，这一操作的开销可能达到数秒级别。
+
+对于需要手动介入的场景，可通过以下 SQL 直接操作数据库：
+
+```sql
+-- 查看当前向量索引总数
+SELECT COUNT(*) FROM embeddings;
+
+-- 检查有哪些记忆缺少向量索引
+SELECT m.id, m.content FROM messages m
+LEFT JOIN embeddings e ON CAST(m.id AS TEXT) = e.id
+WHERE m.role = 'memory' AND e.id IS NULL;
+
+-- 手动整理向量表碎片
+PRAGMA auto_vacuum = FULL;
+VACUUM;
+```
+
+Sources: [main.py](main.py#L139-L152), [embedding.py](agent/embedding.py#L240-L251)
+
+---
+
+## 延伸阅读
+
+- [向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du) — 理解向量索引如何被查询
+- [RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue) — 全文搜索与向量搜索的联合排序
+- [记忆判断规则与存储策略](20-ji-yi-pan-duan-gui-ze-yu-cun-chu-ce-lue) — 决定什么值得被记忆的规则
+- [SQLite + FTS5 全文搜索（trigram 中文支持）](16-sqlite-fts5-quan-wen-sou-suo-trigram-zhong-wen-zhi-chi) — FTS 索引底层实现

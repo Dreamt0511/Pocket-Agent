@@ -1,0 +1,205 @@
+为 Pocket Agent 赋予了一个看得见、摸得着的 3D 虚拟化身——一个由 Three.js 渲染的卡通机器人，位于独立浏览器窗口中。Agent 可以通过四把 LangChain 工具直接操控这个虚拟身体的骨骼旋转和空间位移，实现挥手、点头、跳舞、蹲下等拟人化动作。这套工具并非简单的视觉点缀，它构建了一个**双向通信闭环**：浏览器中的用户可以通过聊天输入框直接与 Agent 对话，Agent 的响应和工具调用结果也能实时推送到浏览器显示，使 3D 化身成为人机交互的另一种界面形态。
+
+## 架构总览：工具→服务器→浏览器 三级流水线
+
+整个系统的数据流遵循一条清晰的单向管道——**Agent 决策 → 工具调用 → HTTP REST → 命令队列 → SSE 推送 → Three.js 骨骼动画**——同时附带一条反向通路用于浏览器消息回传。
+
+```mermaid
+flowchart LR
+    subgraph Agent[Agent 进程]
+        A[LLM 决定动作] --> B[调用 body_control_tool.py 中的工具]
+        B --> C[HTTP POST 到 localhost:18081]
+    end
+
+    subgraph Server[body_server.py]
+        D[/api/set_bone<br>/api/set_position<br>/api/idle] --> E[(线程安全命令队列)]
+        E --> F[SSE /api/events]
+    end
+
+    subgraph Browser[浏览器 body_viewer.html]
+        G[SSE EventSource] --> H[更新 target 骨骼角度]
+        H --> I[LERP 插值循环<br>60fps]
+        I --> J[Three.js 骨骼渲染]
+        K[聊天输入框] --> L[POST /api/send_message]
+        L --> M[(浏览器消息队列)]
+        M --> N[asyncio.Event 唤醒主协程]
+        N --> A
+    end
+
+    Agent -->|REST| Server
+    Server -->|SSE| Browser
+    Browser -->|用户输入| Server
+    Server -->|消息队列| Agent
+```
+
+**设计核心原则**：工具层（`body_control_tool.py`）仅负责将参数序列化为 HTTP 请求，不维护任何状态；服务器层（`body_server.py`）维持一个全局命令队列并通过 SSE 推送给所有已连接的浏览器；前端（`body_viewer.html`）做最终的插值与渲染。这种三层解耦使得 Agent 本身无需关心动画帧率、插值算法或 WebSocket 管理。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L91-L288), [body_server.py](agent/tools/body_server.py#L60-L271), [body_viewer.html](agent/tools/body_viewer.html#L40-L303)
+
+## 四把工具的职责与用法
+
+### control_body：单部位旋转控制
+
+核心骨骼操控工具，控制身体**指定部位**绕 X、Y、Z 轴的旋转角度。每个部位的运动方向经过精心调试（见代码中的方向注释），确保与直观认知一致：
+
+| 部位 | X 轴方向 | Y 轴方向 | Z 轴方向 | 典型用法 |
+|------|---------|---------|---------|---------|
+| `head` | 正=低头，负=抬头 | 正=左转，负=右转 | — | 点头(`x=15`)、摇头(`y=±30`) |
+| `right_arm` | — | 负=前伸，正=后收 | 正=抬起，负=放下 | 举手(`z=60`) |
+| `left_arm` | — | 正=前伸，负=后收 | 负=抬起，正=放下 | 举手(`z=-60`) |
+| `right_forearm` / `right_elbow` | — | 负=向前，正=向后 | 负=弯曲，正=伸直 | 弯肘(`z=-60`) |
+| `left_forearm` / `left_elbow` | — | 正=向前，负=向后 | 正=弯曲，负=伸直 | 弯肘(`z=60`) |
+| `right_ear` | 正=前倾，负=后仰 | — | — | 天线抖动(`x=30`) |
+| `left_ear` | 正=前倾，负=后仰 | — | — | 天线抖动(`x=30`) |
+| `right_leg` | 负=前抬，正=后收 | — | 正=左摆，负=右摆 | 抬腿(`x=-20`) |
+| `left_leg` | 负=前抬，正=后收 | — | 正=右摆，负=左摆 | 抬腿(`x=-20`) |
+| `right_calf` | 负=前伸，正=后收 | — | — | 踢腿 |
+| `left_calf` | 负=前伸，正=后收 | — | — | 踢腿 |
+| `body` | 正=前倾，负=后仰 | 正=左转(拧腰)，负=右转 | 正=右倾，负=左倾 | 弯腰(`x=30~60`) |
+| `root` | — | 正=左转，负=右转 | — | 转身(`y=90`) |
+
+工具内部做了两层变换：首先通过 **`BONE_MAP`** 将 API 部位名（如 `right_arm`）映射为模型骨骼名（`left_hand`——模型侧骨骼命名与视觉左右相反）；然后通过 **`Y_NEGATE_PARTS` 和 `Z_NEGATE_PARTS`** 对特定部位的 Y、Z 轴取反，补偿模型骨骼的原始朝向差异。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L13-L33), [body_control_tool.py](agent/tools/body_control_tool.py#L91-L157)
+
+### move_body：全身位移控制
+
+控制虚拟身体的**空间位置**（平移，非旋转），坐标系为：X 正=右、Y 正=上、Z 正=前。主要用于蹲下、跳跃、前进后退等整体动作。与 `control_body` 配合使用效果更佳——例如蹲下需要同时降低 Y 位移（`y=-0.5`）并使躯干前倾（`body x=30`）。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L161-L195)
+
+### body_script：连续动作脚本
+
+接收一段 JSON 数组，按顺序执行多步动作，每步可指定 `delay`（默认 0.2 秒）。支持三种 action 类型：`bone`（旋转）、`pos`（位移）、`idle`（归位）。这是实现跳舞、挥手、打拳等复杂连贯动作的关键工具——Agent 只需一次性构造好动作序列，即可流畅执行，无需多次往返调用。
+
+```json
+// 挥手打招呼示例
+[
+  {"action":"bone","part":"right_arm","z":60,"delay":0.3},
+  {"action":"bone","part":"right_ear","x":30,"delay":0.3},
+  {"action":"bone","part":"right_arm","y":-20,"z":60,"delay":0.3},
+  {"action":"bone","part":"right_arm","y":20,"z":60,"delay":0.3},
+  {"action":"idle"}
+]
+```
+
+脚本执行时逐帧发送 HTTP 请求，步间通过 `time.sleep(delay)` 控制节奏。**注意**：脚本执行是阻塞的，Agent 在执行 `body_script` 期间不会响应其他消息。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L199-L264)
+
+### body_idle：恢复待机状态
+
+一键重置所有骨骼到待机动画——撤销之前所有 `control_body` 和 `move_body` 的操作。待机动画包含一组预设的**关键帧**（`IDLE_KFS`）：身体微微左右摇晃、手臂小幅度摆动、耳朵抖动，模拟"看向玩家"的活波姿态。工具文档要求 Agent "开始新动作前必须先调用 body_idle() 归位"，这是为了避免新旧动作的骨骼状态冲突。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L268-L284), [body_viewer.html](agent/tools/body_viewer.html#L121-L135)
+
+## 骨骼映射与轴取反：连接 API 与模型的适配层
+
+模型本身（`robot.geo.gltf`）的骨骼命名和朝向与 API 约定的方向存在两处不对称：
+
+1. **左右镜像**：模型侧右臂骨骼名为 `left_hand`，左臂为 `right_hand`——这正是命名的反直觉所在。`BONE_MAP` 解决了这一映射问题。
+2. **轴朝向差异**：部分骨骼的 Y/Z 轴方向与 API 约定相反，需要通过 `Y_NEGATE_PARTS` / `Z_NEGATE_PARTS` 取反。例如 `right_arm` 的 Z 轴取反，意味着 API 中 `z=60`（抬起）在模型侧实际发送 `z=-60`。
+
+```python
+# 轴取反逻辑（位于 control_body 工具内）
+send_y = -y if part in Y_NEGATE_PARTS else y
+send_z = -z if part in Z_NEGATE_PARTS else z
+
+# 发送到服务器的实际JSON中，x保持原值，y/z经过取反
+response = requests.post(f'{BODY_SERVER_URL}/api/set_bone',
+    json={'bone': bone, 'x': x, 'y': send_y, 'z': send_z})
+```
+
+**注意**：发送给服务器的 JSON 中 y/z 已经过取反，而工具的返回值中展示的是原始参数值——这确保了 Agent 和开发者看到的日志是符合直觉的"抬起右手 z=60"。
+
+Sources: [body_control_tool.py](agent/tools/body_control_tool.py#L12-L33), [body_control_tool.py](agent/tools/body_control_tool.py#L136-L156)
+
+## 服务器层：命令队列与 SSE 双通道
+
+`body_server.py` 实现了 `ThreadedHTTPServer`（基于 Python 标准库），同时扮演三个角色：
+
+**静态文件服务器**：根路径 `/` 重定向到 `body_viewer.html`，同时提供 `models/robot.geo.gltf` 模型文件。前端所需的一切资源都由 Python 标准库 HTTP 服务器直接提供。
+
+**REST API 端点**：三个核心 POST 端点分别对应三个工具后端命令：
+- `/api/set_bone` — 设置骨骼旋转（JSON：`bone`, `x`, `y`, `z`）
+- `/api/set_position` — 设置全身位移（JSON：`x`, `y`, `z`）
+- `/api/idle` — 重置待机
+- `/api/send_message` — 浏览器用户输入（JSON：`text`）
+
+所有命令都写入线程安全列表 `commands`，以自增 `command_id` 标记顺序。
+
+**SSE 推送通道**：两条独立的 Server-Sent Events 流：
+- `/api/events` — 推送骨骼命令（`set_bone`/`set_position`/`idle` 类型），前端通过此流获得动作指令
+- `/api/response_stream` — 推送 Agent 回复事件（`thinking`/`token`/`tool_start`/`done`/`error` 类型），前端通过此流显示聊天气泡
+
+SSE 采用轮询方式：每 50ms 检查一次 `commands` 或 `response_events` 队列中是否有新事件，按 `id` 增量推送。这种设计虽然简单，但足够应对低频率的骨骼控制命令。
+
+Sources: [body_server.py](agent/tools/body_server.py#L1-L271)
+
+## 前端渲染引擎：Three.js 骨骼动画循环
+
+`body_viewer.html` 是一个自包含的单页应用，通过 CDN 加载 Three.js 及相关组件：
+
+**场景设置**：包含天蓝色背景、柔和雾效、三方向光源（主平行光 + 两个辅助方向光）、阴影接收的透明地面。相机采用透视投影（30° FOV），启动 `OrbitControls` 允许用户拖拽旋转视角。
+
+**模型加载**：通过 `GLTFLoader` 加载 `models/robot.geo.gltf`（约 127KB 的 GLTF 格式机器人模型）。加载后自动居中缩放，使脚底落在 y=0 平面上，并遍历场景树提取所有非 Mesh 的 Object3D 节点作为可操控骨骼。
+
+**骨骼状态管理**：维护三个核心数据结构：
+- `cur[name]` — 当前实际旋转角度（插值目标）
+- `target[name]` — 目标旋转角度（由 SSE 命令或待机关键帧更新）
+- `manual` — 集合，记录已被 Agent 手动控制的骨骼（待机动画不再覆盖这些骨骼）
+
+**LERP 插值**：每帧通过 `1 - exp(-LERP_SPEED * dt)` 计算插值因子（`LERP_SPEED = 8`），将骨骼角度从 `cur` 平滑过渡到 `target`。这种指数衰减插值保证了动作切换的流畅性——切换越快越跟手，接近时越平滑。
+
+**待机关键帧系统**：`IDLE_KFS` 中为每个骨骼定义了时间点上的关键帧（如 `head: {0: [10,0,0]}` 表示头部始终前倾 10°）。当 `animMode === 'idle'` 且骨骼未被 `manual` 标记时，`updateAnim()` 每帧插值计算当前时间对应的关键帧值，形成循环动画。
+
+Sources: [body_viewer.html](agent/tools/body_viewer.html#L40-L303)
+
+## 浏览器↔Agent 双向交互
+
+这是 3D 身体系统最独特的设计——浏览器不仅仅是 3D 渲染窗口，也是一个完整的聊天界面。用户在浏览器底部输入框发送消息，经过以下链路：
+
+```
+用户输入 → POST /api/send_message → 消息队列 → asyncio.Event 唤醒 → main.py 的 browser_message_loop()
+→ agent.stream_conversation() → SSE response_stream → 浏览器聊天气泡
+```
+
+关键实现细节在 `main.py` 的第 454-493 行：`browser_message_loop` 是一个 asyncio 协程，使用 `asyncio.Event` 实现**无轮询等待**——只有当 `/api/send_message` 被调用时，服务器线程通过 `call_soon_threadsafe` 设置事件，主协程才被唤醒处理消息。处理时通过 `push_response_event` 将 Agent 的流式输出实时推送到浏览器的 SSE 端点 `/api/response_stream`。
+
+前端聊天界面具备完善的用户体验设计：思考动画（三个跳动圆点）、工具调用短暂提示（3 秒自动消失）、60 秒无交互自动清屏、用户消息与 AI 回复分别左右对齐显示。
+
+Sources: [main.py](agent/tools/../main.py#L454-L493), [body_server.py](agent/tools/body_server.py#L217-L232), [body_viewer.html](agent/tools/body_viewer.html#L312-L421)
+
+## 生命周期管理：启动与退出
+
+身体控制服务器在终端模式（`main.py`）启动时自动开启，与 Embedding 服务器并行初始化：
+
+```python
+# main.py 第 365-381 行
+async def _start_body_server():
+    loop = asyncio.get_event_loop()
+    from agent.tools.body_control_tool import start_body_server
+    await loop.run_in_executor(None, start_body_server)
+    return "http://localhost:18081"
+
+body_task = asyncio.ensure_future(_start_body_server())
+```
+
+`start_body_server()` 在后台线程中启动 `ThreadedHTTPServer`，监听 `0.0.0.0:18081`（端口可通过环境变量 `BODY_SERVER_URL` 覆盖）。退出时由 `stop_body_server()` 清理——设置关闭标志、关闭 socket、调用 `server_close()`，确保端口可被快速重用。
+
+工具的加载在 `basic_tools.py` 的模块级别完成：
+
+```python
+# basic_tools.py 第 992-1001 行
+from .body_control_tool import control_body, move_body, body_script, body_idle
+BODY_TOOLS = [control_body, move_body, body_script, body_idle]
+ALL_TOOLS = [...] + BODY_TOOLS
+```
+
+使用 try/except 包裹，即使 `body_control_tool.py` 依赖缺失也不影响主系统运行。
+
+Sources: [main.py](agent/tools/../main.py#L365-L381), [main.py](agent/tools/../main.py#L657-L662), [basic_tools.py](agent/tools/basic_tools.py#L992-L1001)
+
+## 与相邻页面的关联
+
+本页聚焦于工具定义和后端服务器实现。前端渲染的视觉细节（阴影映射、模型缩放、光照参数）在 [Three.js 前端渲染与 SSE 实时推送](27-three-js-qian-duan-xuan-ran-yu-sse-shi-shi-tui-song) 中展开；浏览器聊天界面的消息格式和交互逻辑在 [浏览器双向交互（消息输入 + 响应流）](28-liu-lan-qi-shuang-xiang-jiao-hu-xiao-xi-shu-ru-xiang-ying-liu) 中详述。工具系统的整体框架请参考 [内置工具一览](22-nei-zhi-gong-ju-lan-wen-jian-cao-zuo-shell-zhi-xing-xi-tong-xin-xi-mcp-diao-yong)。

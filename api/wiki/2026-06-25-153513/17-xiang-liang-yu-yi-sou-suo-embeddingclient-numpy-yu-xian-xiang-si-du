@@ -1,0 +1,185 @@
+向量语义搜索是 Pocket-Agent 记忆系统的语义理解层，它通过 **EmbeddingClient** 将文本转化为高维语义向量，再利用 **numpy** 在 SQLite 存储的向量空间中执行余弦相似度匹配，实现超越关键词表面匹配的深层语义检索。整个设计围绕一个核心约束展开：**在 Android Termux 环境下避免编译 ChromaDB 的 Rust 依赖**，因此选择了 SQLite + numpy 的轻量替代方案。
+
+## 架构全景：从文本到语义向量的数据流
+
+向量语义搜索涉及三个层次的分工协作：`EmbeddingClient` 负责与嵌入服务通信生成向量，`VectorStore` 负责向量的持久化存储和检索计算，`tools/basic_tools.py` 中的 `_vector_search` 函数则作为业务层封装，将检索结果回连到 `messages` 表获取原文。完整的调用链路如下图所示：
+
+```mermaid
+flowchart TB
+    subgraph 存储["写入路径：save_memory"]
+        A1[用户消息/记忆内容] --> A2[_extract_embed_text]
+        A2 --> A3[EmbeddingClient.embed]
+        A3 --> A4[struct.pack → BLOB]
+        A4 --> A5[(embeddings 表)]
+        A2 --> A6[(messages 表)]
+    end
+
+    subgraph 检索["搜索路径：search_memory / 自动注入"]
+        B1[用户查询文本] --> B2[EmbeddingClient.embed]
+        B2 --> B3[numpy 余弦相似度]
+        B3 --> B4[SQL JOIN: embeddings × messages]
+        B4 --> B5[相似度过滤 ≥ 0.35]
+        B5 --> B6[RRF 融合排序]
+    end
+
+    subgraph 服务["嵌入服务生命周期"]
+        C1[start_embedding_server]
+        C2[llama-server 进程]
+        C3[stop_embedding_server]
+        C1 -->|subprocess.Popen| C2
+        C3 -->|terminate/kill| C2
+        C2 -->|OpenAI /embeddings API| A3
+        C2 -->|OpenAI /embeddings API| B2
+    end
+```
+
+Sources: [embedding.py](agent/embedding.py#L1-L316), [basic_tools.py](agent/tools/basic_tools.py#L471-L500), [basic_tools.py](agent/tools/basic_tools.py#L735-L745)
+
+## EmbeddingClient：与嵌入服务的通信协议
+
+`EmbeddingClient` 是一个轻量级 HTTP 客户端，兼容 OpenAI 的 `/embeddings` 端点格式，支持两种部署场景：本地 `llama-server`（推荐，通过 GGUF 模型如 BGE-M3 提供服务）和远程 Embedding API（如 OpenAI `text-embedding-3-small`、Jina 等）。
+
+**可用性检测**采用**无缓存的实时检测策略**——每次 `is_available()` 调用都真实发起一次 POST 请求（3 秒超时），不做状态缓存。这在本地服务可能被系统回收的 Termux 环境中尤为重要，确保检测结果始终反映真实状态。检测请求使用 `"test"` 作为最短输入，最小化开销。
+
+**文本嵌入生成**的核心逻辑在 `embed()` 方法中，实现了**自动截断重试**机制：先尝试完整文本，若请求失败（超长文本可能导致服务端拒绝），则自动截断至前 4000 字符重试一次。4000 字符约对应 `batch_size=2048 tokens` 的上下文窗口，与 BGE-M3 的 typical 处理能力对齐。如果两次尝试均失败，返回 `None`，调用方据此决定是否继续走 FTS5 关键词搜索降级路径。
+
+**批量嵌入**通过 `embed_batch()` 支持，将多条文本打包为单次 API 调用，返回的 JSON 结构通过 `data[].index` 字段与原始输入顺序对齐。批量处理在需要为大量历史消息补录向量索引时显著降低 API 开销。
+
+```python
+# 批量调用的返回结构示例
+{
+  "data": [
+    {"index": 0, "embedding": [0.123, -0.456, ...]},
+    {"index": 1, "embedding": [0.789, -0.012, ...]}
+  ]
+}
+```
+
+Sources: [embedding.py](agent/embedding.py#L25-L94)
+
+## 向量的序列化与反序列化：struct.pack 的紧凑存储
+
+Embedding 向量通常是 768 维（BGE-M3）或 1024+ 维的 float32 数组。`EmbeddingClient` 提供了两个静态方法 `embedding_to_blob` 和 `blob_to_embedding`，使用 Python 标准库 `struct.pack` 将向量序列化为紧凑的二进制 BLOB 存入 SQLite。
+
+```python
+# 写入：float32 数组 → BLOB（768 维 → 3072 字节）
+@staticmethod
+def embedding_to_blob(embedding: List[float]) -> bytes:
+    return struct.pack(f'{len(embedding)}f', *embedding)
+
+# 读取：BLOB → float32 数组
+@staticmethod
+def blob_to_embedding(blob: bytes) -> List[float]:
+    count = len(blob) // 4  # 每个 float32 占 4 字节
+    return list(struct.unpack(f'{count}f', blob))
+```
+
+这种方案的存储效率极高：768 维向量仅需 3072 字节（768 × 4 bytes），相比 ChromaDB 的 SQLite 后端（约 4-5KB 含元数据）更为紧凑。`VectorStore.query()` 在检索时直接使用 `np.frombuffer(blob, dtype=np.float32)` 零拷贝地从 BLOB 创建 numpy 数组，避免 `struct.unpack` 到 Python list 再到 numpy array 的双重转换开销——这也是性能优化的关键细节。
+
+Sources: [embedding.py](agent/embedding.py#L86-L93)
+
+## VectorStore：SQLite 向量存储与 numpy 余弦相似度计算
+
+`VectorStore` 是整个向量搜索系统的核心。它管理一个独立的 `embeddings` 表（仅含 `id TEXT PRIMARY KEY` 和 `embedding BLOB` 两列），原始文本内容存放在 `messages` 表中，通过消息 ID 关联。这种"**索引与内容分离**"的设计避免了向量数据的冗余存储，也使 `messages` 表可以被 FTS5 全文搜索和向量搜索共同使用。
+
+### 数据库 Schema 与自动迁移
+
+`embeddings` 表的建表语句极简：
+
+```sql
+CREATE TABLE IF NOT EXISTS embeddings (
+    id TEXT PRIMARY KEY,   -- 关联 messages.id
+    embedding BLOB         -- float32 数组的二进制表示
+);
+```
+
+早期版本中该表包含 `content` 列，`_init_table()` 方法内置了**自动迁移逻辑**：检测到旧 schema 时，自动将表重命名为 `embeddings_old`，创建新表，迁移向量数据后删除旧表。这是一个无停机的一键迁移路径。
+
+### 写入：add() 方法
+
+`add(message_id, text)` 方法的工作流：
+1. **前置校验**：检查 `embedding_client` 是否存在且服务可用
+2. **向量生成**：调用 `EmbeddingClient.embed(text)` 获取 float32 向量
+3. **序列化**：通过 `EmbeddingClient.embedding_to_blob()` 转为 BLOB
+4. **持久化**：`INSERT OR REPLACE` 写入 embeddings 表（幂等）
+
+调用方需自行保证 `messages` 表中已存在对应 ID 的记录——`VectorStore` 不负责创建 `messages` 记录，也不存储原文，恪守单一职责。
+
+### 检索：query() 方法——过滤下推 + numpy 批量计算
+
+`query()` 方法是整个系统的技术精华，其设计体现了**过滤条件下推到数据库层**和**numpy 向量化计算**两个核心思想。
+
+**过滤下推**：调用方可以传入 `conversation_id`（按会话过滤）、`msg_type`（按角色过滤：user/assistant/memory）、`days`（按时间范围过滤）、`memory_type`（按记忆类型过滤：fact/episodic/dance）四个维度的筛选条件。这些条件**不**在应用层对搜索结果做后过滤，而是通过 `JOIN messages` 拼接到 SQL 查询的 `WHERE` 子句中，让 SQLite 在执行全表扫描前就过滤掉不相关的行，减少需要反序列化并计算相似度的向量数量。当没有任何过滤条件时，直接查询 `embeddings` 表（全量扫描），以保持简单路径的最高性能。
+
+```python
+# 有过滤条件时 JOIN messages 表
+if conditions:
+    sql = f"SELECT e.id, e.embedding FROM embeddings e 
+           JOIN messages m ON e.id = CAST(m.id AS TEXT) {where_clause}"
+# 无条件时直接查 embeddings 表（更快）
+else:
+    sql = "SELECT id, embedding FROM embeddings"
+```
+
+**numpy 批量计算**：从数据库取出所有候选行后，使用 `np.frombuffer(blob, dtype=np.float32)` 将 BLOB 零拷贝转换为 numpy 数组，逐行计算余弦相似度：
+
+```
+cos_sim(A, B) = (A · B) / (||A|| × ||B||)
+```
+
+计算出的相似度（范围 -1 到 1）通过 `1.0 - cos_sim` 转为**距离**（distance），距离越小表示语义越相似。结果按距离升序排列，取 top-n 返回。`distance` 字段作为 `_rrf_merge` 融合排序的输入信号，与 FTS5 的 BM25 分数在 RRF 层统一排序。
+
+**过滤阈值**方面，`_vector_search` 在业务层设置了 `MIN_SIMILARITY = 0.35` 的硬门槛（即余弦相似度不低于 0.35 的结果才被纳入候选集），这确保了低质量匹配不会污染融合排序的结果。
+
+Sources: [embedding.py](agent/embedding.py#L96-L250), [basic_tools.py](agent/tools/basic_tools.py#L471-L500)
+
+## 嵌入服务生命周期管理
+
+`start_embedding_server()` 和 `stop_embedding_server()` 负责嵌入服务的启停，与 [3D 身体控制服务](26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle) 的 server 管理采用相同模式。
+
+**启动流程**（三步判断）：
+1. 检查 `_embedding_process` 是否还在运行 → 存活则直接返回
+2. 检查 `EMBEDDING_MODEL_PATH` 环境变量是否存在且文件可访问 → 缺失则静默返回 False
+3. 尝试连接 `127.0.0.1:8080` 端口 → 已被占用说明有其他进程在提供服务，直接复用（不管理其生命周期）
+4. 清理残留进程 → 以 `subprocess.Popen` 启动新的 `llama-server` 进程（带一次 0.3 秒重试）
+
+```bash
+llama-server -m <EMBEDDING_MODEL_PATH> --embedding -c 8192 --port 8080 \
+  --host 0.0.0.0 -np 4 -b 2048 -ub 2048 -t 4
+```
+
+启动参数使用 4 个并行处理槽位（`-np 4`）、2048 的 batch size，4 个 CPU 线程（`-t 4`），针对 Android 移动设备的资源限制做了平衡。
+
+**停止流程**：依次尝试 `terminate()`（SIGTERM，3 秒超时）→ `kill()`（SIGKILL，2 秒超时）→ `pkill -f llama-server.*8080`（兜底清理）。这种三层终止策略确保了端口被可靠释放。
+
+Sources: [embedding.py](agent/embedding.py#L251-L316)
+
+## 与记忆系统的集成路径
+
+向量语义搜索在系统中通过两条路径被调用：
+
+**路径一：save_memory 的主动建索引**。当 Agent 调用 `save_memory` 工具保存一条记忆时，先写入 `messages` 表获得自增 ID，然后调用 `_vector_store_ref.add(message_id, text)` 为该记忆生成向量索引。入索引前通过 `_extract_embed_text()` 做**语义内容提取**——如果内容包含动作 JSON 数组（以 `[{"action":` 开头），只取 JSON 之前的文字描述部分；如果超过 2000 字符则截断。这避免了将工具调用的结构化噪音编入向量空间，提升了检索质量。
+
+**路径二：search_memory 的语义检索 + RRF 融合**。当 Agent 搜索记忆时，`_vector_search` 与 `_fts_search` 并行执行，结果通过 RRF 融合排序。语义搜索特别擅长处理"**概念匹配**"场景——比如搜索"上次提到的实习安排"，即使原文中从未出现"实习"二字，只要文本的语义向量与查询向量方向接近，也能被匹配到。向量结果的 `similarity` 字段（= 1 - distance）直接参与 RRF 加权计算，作为语义相关性的量化信号。
+
+**路径三：自动上下文注入**。Agent 在处理每条用户消息前，自动调用 `_search_relevant_memories` 搜索 top-3 相关记忆注入到系统提示词中。该函数同样使用 `_vector_search + _fts_search + _rrf_merge` 的组合检索策略，但会**过滤掉舞蹈类记忆**（`memory_type == "dance"`），因为这些记忆包含大量的动作序列数据，对普通对话理解无益且浪费 token。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L735-L814), [agent_langchain.py](agent/agent_langchain.py#L705-L740)
+
+## 设计取舍与技术权衡
+
+| 维度 | 当前方案（SQLite + numpy） | 替代方案（ChromaDB/FAISS） | 取舍理由 |
+|------|---------------------------|---------------------------|----------|
+| **依赖体积** | 仅需 numpy（纯 Python + C 扩展） | ChromaDB 需编译 ONNX Runtime / Rust | Android Termux 交叉编译困难 |
+| **检索速度** | 全量扫描 O(n)，万级向量约 10-50ms | FAISS IVF 索引 O(log n) | 记忆量级在千/万级，全量扫描可接受 |
+| **精度** | 精确余弦相似度（无量化损失） | IVF-PQ 有量化精度损失 | 精度优先于速度 |
+| **功能丰富度** | 仅余弦距离，不支持 metadata 过滤（由 SQL 层承担） | 内置 metadata 过滤、混合检索 | SQLite JOIN 即可覆盖过滤需求 |
+| **维护复杂度** | ~250 行代码，零隐式依赖 | ChromaDB 的 SQLAlchemy + pypika 抽象层 | KISS 原则优先 |
+
+当前方案的核心假设是：**向量的规模始终保持在可接受的全量扫描范围内**（系统设计目标为万级以下），且 Android 平台的编译约束使得引入 Rust 或 C++ 原生库的成本远高于收益。如果未来向量数量突破十万级，可在不改变接口的前提下，将 `VectorStore.query()` 的内部实现替换为 FAISS 索引，上游调用方感知不到变化。
+
+Sources: [embedding.py](agent/embedding.py#L96-L110), [embedding.py](agent/embedding.py#L216-L235)
+
+---
+
+**阅读导航**：理解向量语义搜索后，建议继续阅读 [RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue) 了解向量结果与 FTS5 结果如何融合排序，或阅读 [记忆工具使用（save_memory / search_memory / update_user_profile）](19-ji-yi-gong-ju-shi-yong-save_memory-search_memory-update_user_profile) 从工具调用视角看向量搜索的触发器。如需了解嵌入模型的部署细节，请参考 [Embedding 模型配置（BGE-M3 语义检索）](6-embedding-mo-xing-pei-zhi-bge-m3-yu-yi-jian-suo)。

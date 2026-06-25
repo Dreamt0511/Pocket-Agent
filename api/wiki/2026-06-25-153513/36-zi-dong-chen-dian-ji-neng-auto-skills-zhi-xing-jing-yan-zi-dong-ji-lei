@@ -1,0 +1,358 @@
+## 概述：经验驱动的技能自生长机制
+
+自动沉淀技能（auto-skills）是 Pocket-Agent 中最具「智能进化」特征的设计——它使得 Agent 能够**从每一次成功的任务执行中自动提炼经验**，形成可复用的知识文档。如果说手工编写的 `executor-skills` 和 `main-skills` 是「先验知识」，那么 `auto-skills` 就是 Agent 的「后验经验」：每一次成功的手机操控，都会留下结构化的操作记录，供未来的同类任务直接参考。
+
+这种机制的核心哲学是：**Agent 不止是执行者，更是经验的积累者**。随着使用时间的增长，auto-skills 池会不断扩容，Agent 对手机操控的熟练度也会随之提升——这本质上是代码层面的「学习能力」实现。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1920-L2040)
+
+---
+
+## 目录结构：两套沉淀空间
+
+```text
+agent/skills/auto-skills/
+├── executor/          ← 子Agent的操作经验沉淀区
+│   ├── deepseek-chat/
+│   │   └── SKILL.md
+│   ├── douyin-like-comment/
+│   │   └── SKILL.md
+│   ├── idlefish-shopping/
+│   │   └── SKILL.md
+│   ├── pinduoduo_buy_shoes/
+│   │   └── SKILL.md
+│   ├── miui-browser-bookmark/
+│   │   └── SKILL.md
+│   ├── xiaohongshu-post/
+│   │   └── SKILL.md
+│   ├── cainiao-check-and-calendar-reminder/
+│   │   └── SKILL.md
+│   ├── memo-write/
+│   ├── chinamobile_query_balance/
+│   ├── bosszhipin_search_jobs/
+│   ├── douyin-send-message/
+│   ├── xiaohongshu-browse-comment/
+│   ├── 打开计算器app并截图/
+│   ├── 搜集boss直聘上深圳地区agent开发实习岗位的jd信息/
+│   └── skill-deposit-log.md          ← 沉淀日志，记录每次评估决策
+├── main/             ← 主Agent沉淀区（当前预留，仅含 .gitkeep）
+```
+
+两个子目录分别对应主 Agent 和子 Agent 的沉淀空间：
+- **`executor/`**：子 Agent（手机操控执行者）的自动沉淀区，当前所有已沉淀技能都在此处。每个技能是一个独立目录，内含 `SKILL.md` 文档。
+- **`main/`**：主 Agent 技能的沉淀区，当前为空目录（预留扩展）。主 Agent 通常使用 `delegate_task()` 派发任务而非直接操作手机，因此沉淀需求较少。
+
+此外，根目录下的 `skill-deposit-log.md` 是**沉淀评估审计日志**，记录了每次任务完成后系统对技能沉淀的评估过程和决策依据。
+
+Sources: [目录结构](agent/skills/auto-skills) | [config.py](agent/config.py#L59-L60)
+
+---
+
+## 沉淀生命周期：从任务完成到技能入库
+
+自动沉淀并非盲目进行，而是遵循严格的触发条件和执行流程：
+
+```mermaid
+flowchart TD
+    A[子Agent完成多步骤任务] --> B{触发条件检查}
+    B -->|✅ steps >= 3| C{是否有执行失败?}
+    B -->|❌ steps < 3| D[跳过沉淀<br>步骤太少无沉淀价值]
+    C -->|❌ 有失败步骤| E[跳过沉淀<br>失败经验不沉淀]
+    C -->|✅ 全部成功| F{executor_step > 2?<br>是否实际调用了工具?}
+    F -->|❌ 仅1-2步| G[跳过沉淀<br>未执行有效操作]
+    F -->|✅ 有实际工具调用| H[生成技能名称]
+    
+    H --> I[构造沉淀指令]
+    I --> J[子Agent继续执行<br>使用已有上下文]
+    J --> K{检查 skill_path/SKILL.md}
+    K -->|文件存在且完整| L[跳过，无需更新]
+    K -->|文件不存在或不完整| M[file_write 创建/更新]
+    M --> N[格式合规性检查]
+    N -->|格式合规 ✅| O[完成沉淀]
+    N -->|格式不合规 ❌| P[读取 skill-creator 模板]
+    P --> Q[按模板重写 SKILL.md]
+    Q --> O
+```
+
+### 触发条件详解
+
+沉淀的触发由三个条件共同决定（代码见 `agent_langchain.py` 第 1939 行）：
+
+| 条件 | 阈值 | 目的 |
+|------|------|------|
+| 任务步骤数 | `steps >= 3` | 至少 3 步的操作才值得沉淀，单步操作（如"打开APP"）不具备复用价值 |
+| 执行结果 | 无失败步骤 | 失败的任务不可沉淀，避免将错误路径固化为「经验」 |
+| 实际工具调用 | `executor_step > 2` | 排除那些仅读取任务文件但未执行实际操作的「空转」情况 |
+
+只有当三个条件**全部满足**时，系统才会进入技能沉淀流程。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1935-L1955)
+
+---
+
+## 技能名称生成规则
+
+技能名称从任务目标（`objective`）中自动提取，生成逻辑位于代码第 1947 行：
+
+```python
+skill_name = "".join(c if c.isalnum() or c == '_' else '_'
+                    for c in objective.lower().replace(' ', '_')
+                    .replace('（', '_').replace('）', '_')
+                    .replace('(', '_').replace(')', '_'))[:50].strip('_')
+```
+
+这条规则的核心策略是：
+1. **小写 + 下划线**：统一风格，与 `executor-skills` 保持一致
+2. **中英文括号统一处理**：全角/半角括号均替换为下划线
+3. **截断长度**：最长 50 个字符，避免任务目标过长导致目录名失控
+4. **去首尾下划线**：`strip('_')` 确保名称以字母开头和结尾
+
+实际案例：
+- `"去拼多多买黑色的鞋子"` → `pinduoduo_buy_shoes`
+- `"抖音给周杰伦主页视频点赞和评论"` → `douyin-like-comment`
+- `"菜鸟快递查看 + 日历提醒"` → `cainiao-check-and-calendar-reminder`
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1947-L1949)
+
+---
+
+## 沉淀执行：子 Agent 的「自我镜像」
+
+技能沉淀的独特之处在于：它**不是由系统代码直接写入文件**，而是指挥刚刚完成任务的子 Agent **利用现有上下文继续执行**，让它自己将操作路径提炼为知识文档。
+
+沉淀指令（第 1955 行）的核心约束：
+
+```
+任务已完成。现在请沉淀本次任务的技能。
+
+**重要：只处理本次任务的技能，不要扫描其他目录或检查其他技能！**
+
+本次任务技能路径：`{skill_path}/SKILL.md`
+
+操作步骤：
+1. 用 `file_read('{skill_path}/SKILL.md')` 尝试读取
+2. 如果文件存在且内容完整 → 跳过，不做任何操作
+3. 如果文件不存在或内容不完整 → 用 `file_write` 创建/更新
+
+技能内容需包含：包名、关键坐标、操作步骤、失败经验。
+**禁止扫描目录 `agent/skills/auto-skills/executor/` 或检查其他技能！**
+```
+
+这里有一个关键设计细节：**沉淀不重新调用大模型**。子 Agent 的对话上下文中已经包含完整的执行过程（每一步的 UI 树分析、工具调用、错误处理），沉淀指令只是要求它「回顾并总结」刚才做过的事情。这意味着：
+- 沉淀消耗的 token 极少（仅工具调用开销）
+- 沉淀基于「第一手执行经验」，而非重新推理
+- 沉淀与任务执行共享同一 LLM 会话，保持上下文一致性
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1953-L1967)
+
+---
+
+## 格式合规性校验与自动修正
+
+子 Agent 完成 `file_write` 后，系统会进行**基本格式合规性检查**（第 2003 行）：
+
+```python
+_format_ok = (
+    _content.startswith("---")
+    and "name:" in _content
+    and "description:" in _content
+)
+```
+
+校验规则简单但有效：
+1. **必须包含 YAML frontmatter**：以 `---` 开头
+2. **必须有 `name:` 字段**：标识技能名称
+3. **必须有 `description:` 字段**：提供一句话摘要
+
+如果格式不合规，系统会触发**二次修正流程**：
+1. 指示子 Agent 先读取 `executor-skills/skill-creator/SKILL.md`（规范模板）
+2. 再读取自己刚写的技能文件
+3. 按模板规范重写
+
+这种「写→检→修」的三段式设计，确保了即使是不同 LLM 生成的技能文档，也能保持统一的格式标准。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L2003-L2029)
+
+---
+
+## SKILL.md 文档结构：沉淀技能的典型形态
+
+从已沉淀的技能文件可以归纳出 auto-skills 的文档结构特征。以 `douyin-like-comment` 为例：
+
+```markdown
+---
+name: douyin-like-comment
+description: 抖音APP点赞评论技能——搜索用户、进入主页、给视频点赞、写评论
+---
+
+# 抖音点赞评论技能
+
+## 一、基础信息
+- **包名**：`com.ss.android.ugc.aweme`
+- **启动命令**：`am start -p com.ss.android.ugc.aweme`
+- **应用类型**：混合应用（原生 + WebView）
+- **输入框类型**：原生 EditText
+
+## 二、核心操作流程
+### 1. 启动...
+### 2. 搜索用户...
+### 3. 进入用户主页...
+### 4. 给视频点赞...
+### 5. 滑动切换视频...
+### 6. 写评论...
+### 7. 返回上一页...
+
+## 三、关键资源ID
+| 元素 | 资源ID |
+
+## 四、失败经验
+1. 启动可能弹出选择对话框
+2. 搜索结果的标签页需切换
+3. 点赞状态验证...
+
+## 五、注意事项
+- 所有坐标需从UI树实时获取
+- 操作后调用 `android_wait_for_idle`
+```
+
+对比 `executor-skills/skill-creator` 中定义的模板格式：
+
+```markdown
+---
+name: <技能名称>
+description: <一句话描述>
+---
+
+# <技能名称>
+
+## 任务目标
+<原始任务目标>
+
+## 执行步骤
+- [completed] 步骤1描述
+- [completed] 步骤2描述
+
+## 关键操作
+- 包名
+- MCP工具
+- 注意事项
+
+## 适用场景
+```
+
+可以看出，实际沉淀的技能已经**超越了模板的基本要求**，进化出了更丰富的结构：增加了「基础信息」区块、细化了「核心操作流程」的分步描述、加入了「关键资源ID」表格和「失败经验」区块。这种进化源于 LLM 在沉淀过程中自然倾向于提供更完整的信息——而模板的约束确保了最低限度的格式一致性。
+
+Sources: [douyin-like-comment SKILL.md](agent/skills/auto-skills/executor/douyin-like-comment/SKILL.md) | [skill-creator 模板](agent/skills/executor-skills/skill-creator/SKILL.md)
+
+---
+
+## 加载机制：自动发现融入技能列表
+
+沉淀后的技能不会「沉睡」在目录中，而是通过 `load_skills_list()` 函数被**自动发现并加载**到子 Agent 的技能列表中：
+
+```python
+def load_skills_list(agent_type: str = "main") -> str:
+    skills_dir = SKILLS_DIR if agent_type == "main" else EXECUTOR_SKILLS_DIR
+    skills = _scan_skills(skills_dir)
+    
+    # executor 额外加载自动沉淀技能
+    if agent_type == "executor":
+        auto_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+        if os.path.exists(auto_dir):
+            skills.extend(_scan_skills(auto_dir))
+```
+
+这意味着：
+- **子 Agent 既有手工编写的 `executor-skills`，也有自动沉淀的 `auto-skills`**
+- 两者在技能列表中**完全平级**，不分优先级
+- 子 Agent 通过 `file_read` 读取 `SKILL.md` 来获取指导，不区分来源是手工还是自动
+
+同样的逻辑也体现在 `load_skills_for_completer()` 中——自动补全、技能列表展示均包含 auto-skills。
+
+扫描机制使用 `_scan_skills()` 函数（第 65 行），支持两种目录结构：
+- **flat 模式**：目录直接包含 `SKILL.md`（auto-skills 采用此模式）
+- **category 模式**：目录下有子目录，子目录包含 `SKILL.md`（main-skills/executor-skills 采用此模式）
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L120-L145) | [agent_langchain.py](agent/agent_langchain.py#L65-L115)
+
+---
+
+## 沉淀日志：审计与回溯的决策记录
+
+每个 auto-skills 目录下的 `skill-deposit-log.md` 是一份**持续的审计记录**，记录了每次任务完成后系统的沉淀评估过程：
+
+```markdown
+## 2026-05-24 技能沉淀
+
+### 最近执行任务
+1. **抖音给周杰伦主页视频点赞和评论**（已完成）
+2. **闲鱼搜索索尼a6000相机并沟通卖家**（已完成）
+
+### 本次评估结果
+| 技能 | 状态 | 操作 |
+|------|------|------|
+| `douyin-like-comment` | ❌ 不存在 | ✅ **新创建** |
+| `idlefish-shopping` | 已有，已补充完善 | ⏭️ 跳过 |
+| `pinduoduo_buy_shoes` | 已有，已覆盖 | ⏭️ 跳过 |
+```
+
+日志的价值在于：
+1. **决策透明**：每次为什么沉淀/跳过，都有明确记录
+2. **增量演进**：新技能创建、已有技能补充完善的过程可追溯
+3. **审计依据**：当技能质量出现问题时，可回溯当时的沉淀决策
+
+Sources: [skill-deposit-log.md](agent/skills/auto-skills/executor/skill-deposit-log.md)
+
+---
+
+## 设计哲学与最佳实践
+
+### 为什么需要自动沉淀？
+
+**纯手工维护技能的困境**：手机操控任务极度碎片化——不同 APP、不同版本、不同操作路径。如果每个技能都需要开发者手工创建，技能的覆盖范围将永远停留在「常见场景」。自动沉淀让**覆盖长尾场景的成本趋近于零**：只要成功执行了一次，经验就留下了。
+
+**经验即技能，技能即知识**：在 Pocket-Agent 的架构中，`SKILL.md` 不是代码，而是供 LLM 阅读的自然语言知识文档。自动沉淀本质上是**让 LLM 将自己的执行经验「翻译」成同类 LLM 可理解的知识**——这是一个自我知识蒸馏的过程。
+
+### 何时沉淀，何时跳过？
+
+| 场景 | 决策 | 理由 |
+|------|------|------|
+| 成功执行 3+ 步的任务 | ✅ 沉淀 | 有足够的操作路径值得记录 |
+| 成功但仅 1-2 步的任务 | ❌ 跳过 | 步骤太少，`打开APP` 这类操作已在基础技能中覆盖 |
+| 执行失败的任务 | ❌ 跳过 | 错误路径不应固化为「经验」 |
+| 已存在且内容完整的技能 | ✅ 跳过 | 避免重复覆盖，保留原有经验 |
+| 不存在但类似技能已覆盖 | ⏭️ 视情况更新 | 子 Agent 自行判断是否补充新操作路径 |
+
+### 沉淀技能的「复活」机制
+
+一个值得注意的设计细节是：沉淀指令中要求子 Agent **先读取已有文件再决定操作**。这意味着：
+- 如果某个技能已存在但内容不完整（例如只记录了包名，缺少操作步骤），子 Agent 会**更新补充**
+- 如果技能已完整覆盖当前任务的执行路径，则**跳过不更新**
+- 沉淀不是「覆盖式」的，而是「增量式」的——已有经验不会被轻易丢弃
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1955-L1965)
+
+---
+
+## 与周边模块的关系
+
+```mermaid
+flowchart LR
+    A[主 Agent] -->|delegate_task 派发| B[子 Agent]
+    B -->|执行任务| C[手机操控]
+    C -->|成功完成| D{沉淀触发检查}
+    D -->|通过| E[自动沉淀到<br>auto-skills/executor]
+    E --> F[skill-deposit-log.md]
+    E --> G[SKILL.md]
+    
+    H[手工编写的<br>executor-skills] -->|共同加载| I[load_skills_list]
+    G -->|自动发现| I
+    I -->|提供技能列表| B
+    J[skill-creator 模板] -->|格式参考| E
+```
+
+- **[子 Agent 执行系统](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu)**：auto-skills 的沉淀源——每次任务执行都可能触发沉淀
+- **[子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi)**：auto-skills 仅被子 Agent 加载，主 Agent 不会看到这些手机操控技能
+- **[技能系统概述](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)**：理解技能（SKILL.md）与工具（tools）的根本区别
+- **[技能自动发现与加载机制](37-ji-neng-zi-dong-fa-xian-yu-jia-zai-ji-zhi)**：auto-skills 如何被 `_scan_skills` 扫描并融入技能列表
+- **[子 Agent 技能（executor-skills）](35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan)**：手工编写的手机操控技能，与 auto-skills 互补

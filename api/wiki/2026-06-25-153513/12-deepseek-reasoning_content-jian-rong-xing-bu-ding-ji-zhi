@@ -1,0 +1,168 @@
+LangChain 的 `ChatOpenAI` 客户端严格遵循 OpenAI API 规范设计，对非标准 API 字段（如 DeepSeek 专有的 `reasoning_content`）原生不支持。该补丁机制以两处精准的 monkey-patch 在模块加载时注入，确保推理内容在请求-响应周期中完整保留，并最终转化为终端和 HTTP 客户端可消费的 `thinking` 事件。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L185-L217)
+
+## 问题根源：LangChain 对非标准 API 字段的过滤
+
+DeepSeek 模型的 API 响应中包含 `reasoning_content` 字段，记录模型在生成最终回答前的思维链（chain-of-thought）过程。这一字段对用户理解模型的推理逻辑具有重要价值，但 LangChain 的 `ChatOpenAI` 基类在设计上存在两处过滤：
+
+1. **流式响应入口被丢弃**：底层 `_convert_delta_to_message_chunk` 函数将 API 返回的原始 JSON dict 转换为 `AIMessageChunk` 对象时，仅提取 OpenAI 标准字段（`content`、`role`、`tool_calls` 等），对 `reasoning_content` 直接忽略。
+2. **请求出口无法回传**：在构建多轮对话的 API 请求时，`_convert_message_to_dict` 将 `AIMessage` 对象序列化为 JSON dict，但 `additional_kwargs` 中的自定义字段不会被写入请求体，导致推理内容在后续轮次丢失。
+
+这两处过滤使得 `reasoning_content` 在 LangChain 的请求-响应循环中"有去无回"——即便原始响应中携带了推理内容，也无法传递到应用层供前端展示。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L185-L189)
+
+## 补丁架构：双向拦截的双 monkey-patch 策略
+
+补丁机制采用 **导入时替换** 策略，在 `agent_langchain.py` 模块加载阶段（即 `import` 语句执行时）立即完成对 `langchain_openai.chat_models.base` 模块中两个内部函数的替换。这种设计确保在 `ChatOpenAI` 实例被创建之前，所有后续的 API 请求和响应处理路径已注入修复逻辑。
+
+```mermaid
+sequenceDiagram
+    participant DeepSeek as DeepSeek API
+    participant Patch1 as Patch 1<br/>_convert_delta_to_message_chunk
+    participant Chunk as AIMessageChunk<br/>(additional_kwargs)
+    participant Consumer as 流式消费者<br/>(stream_conversation)
+    participant Patch2 as Patch 2<br/>_convert_message_to_dict
+    participant Request as 下一轮 API 请求
+
+    Note over DeepSeek,Request: 流式响应阶段
+    DeepSeek->>Patch1: SSE delta chunk<br/>{content: "...", reasoning_content: "思考中..."}
+    Patch1->>Patch1: 调用原始函数创建 chunk<br/>→ 原始函数丢弃 reasoning_content
+    Patch1->>Patch1: 从原dict中提取 reasoning_content
+    Patch1->>Chunk: 存入 additional_kwargs["reasoning_content"]
+    
+    Note over DeepSeek,Request: 消费阶段
+    Chunk->>Consumer: 流式迭代 message_chunk
+    Consumer->>Consumer: 检查 additional_kwargs<br/>若有 reasoning_content → yield {"type": "thinking"}
+    Consumer->>Consumer: 输出 content 原文
+
+    Note over DeepSeek,Request: 请求出口阶段（多轮对话）
+    Chunk->>Patch2: AIMessage 被序列化
+    Patch2->>Patch2: 调用原始函数创建 dict
+    Patch2->>Patch2: 从 additional_kwargs 读取 reasoning_content
+    Patch2->>Request: 写入 dict["reasoning_content"]
+    Request->>DeepSeek: 发送完整请求体
+```
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L192-L216)
+
+### Patch 1：流式响应拦截（响应入口）
+
+```python
+# Patch 1: 流式响应中捕获 reasoning_content 存入 additional_kwargs
+_original_convert_delta = _chat_base._convert_delta_to_message_chunk
+
+def _patched_convert_delta(_dict, default_class):
+    chunk = _original_convert_delta(_dict, default_class)
+    if isinstance(chunk, AIMessageChunk):
+        rc = _dict.get("reasoning_content")
+        if rc:
+            chunk.additional_kwargs["reasoning_content"] = rc
+    return chunk
+
+_chat_base._convert_delta_to_message_chunk = _patched_convert_delta
+```
+
+该补丁的核心策略是 **先调用原始函数，再补充缺失字段**。`_dict` 参数是 API 返回的原始 JSON dict（已解析为 Python 字典），其中包含完整的 API 响应字段。原始函数 `_original_convert_delta` 将 OpenAI 标准字段提取到 `AIMessageChunk` 对象后，补丁代码直接从 `_dict` 中读取 `reasoning_content`，若存在则写入 `chunk.additional_kwargs`。这一设计利用了 `additional_kwargs` 作为 LangChain 预留的"逃生舱"——该字典专门用于存储非标准字段，虽然不会被核心消息处理逻辑使用，但可以被应用层代码按需读取。
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L192-L203)
+
+### Patch 2：请求出口拦截（请求出口）
+
+```python
+# Patch 2: 发送消息时把 additional_kwargs 中的 reasoning_content 传给 API
+_original_convert = _chat_base._convert_message_to_dict
+
+def _patched_convert_message_to_dict(message, api="chat/completions"):
+    result = _original_convert(message, api)
+    if isinstance(message, AIMessage):
+        for key in ('reasoning_content',):
+            if key in message.additional_kwargs:
+                result[key] = message.additional_kwargs[key]
+    return result
+
+_chat_base._convert_message_to_dict = _patched_convert_message_to_dict
+```
+
+Patch 2 解决的是多轮对话场景下的信息丢失问题。当 Agent 需要向 API 发送历史消息时（例如 DeepSeek 需要看到自己上一轮的推理内容来保持上下文连贯性），`_convert_message_to_dict` 将 `AIMessage` 对象序列化为请求体的 JSON dict。补丁代码在原始序列化结果的基础上，遍历 `additional_kwargs` 中的指定键（目前只有 `reasoning_content`），将其注入最终 dict。`api` 参数保留以兼容不同 API 端点的调用约定。
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L205-L216)
+
+## 下游消费链路：从 additional_kwargs 到 thinking 事件
+
+补丁机制仅在数据层面保留了 `reasoning_content`，将其从 API 响应传递到 `AIMessageChunk` 的 `additional_kwargs`。真正将推理内容转化为用户体验的是下游的两处消费代码。
+
+| 消费位置 | 场景 | 逻辑 | 产出事件 |
+|---------|------|------|---------|
+| `stream_conversation` L1350 | 主 Agent 流式对话 | 检查 `message_chunk.additional_kwargs` 中的 `reasoning_content`，非空则 yield | `{"type": "thinking"}` |
+| `_run_executor_foreground` L1714 | 子 Agent 前台执行 | 同上，在子 Agent 流式输出中检测 | `{"type": "thinking"}` |
+| `stream_conversation` L1404 | updates 分支（模型节点无工具调用） | 当 `source == "model"` 且消息不含 `tool_calls` 时 | `{"type": "thinking"}` |
+
+这两处消费代码的差异在于：流式分支（`messages` mode）中每个 chunk 是增量内容，`reasoning_content` 在每个 delta 中独立出现，因此能精确检测到推理阶段何时开始；而 `updates` 分支在每个模型调用完成后触发，用于兜底检测非流式场景。
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L1348-L1352), [agent/agent_langchain.py](agent/agent_langchain.py#L1713-L1716), [agent/agent_langchain.py](agent/agent_langchain.py#L1403-L1404)
+
+## 事件分发：thinking 信号的三条传播路径
+
+`{"type": "thinking"}` 事件被生成后，沿三条路径分发到不同的前端消费端：
+
+```mermaid
+graph LR
+    A["stream_conversation<br/>yield thinking 事件"] --> B{事件分发}
+    B --> C["app.py SSE 端点<br/>→ data: [TOOL] {{type: thinking}}"]
+    B --> D["main.py 终端模式<br/>→ push_response_event"]
+    B --> E["main.py 浏览器模式<br/>→ print_agent_thinking()"]
+
+    C --> F["Web 客户端<br/>显示'思考中...'指示器"]
+    D --> G["终端 UI<br/>Rich Panel: ⏳ 代理正在思考..."]
+    E --> H["浏览器 push 通道<br/>SSE thinking 事件"]
+```
+
+- **HTTP API 路径**（app.py L552）：`thinking` 事件与 `tool_end`、`executor_start` 等状态事件共用一个 SSE 通道，以 `[TOOL]` 前缀标识，Web 客户端据此显示思考状态指示器。
+- **终端 UI 路径**（agent/ui.py L157）：`print_agent_thinking()` 使用 Rich 库渲染黄色的 `Panel` 组件，显示"⏳ 代理正在思考..."，配合终端流式输出提供视觉反馈。
+- **浏览器消息路径**（main.py L475）：`push_response_event('thinking', {})` 通过 SSE 向浏览器推送思考状态，与 token 流和工具调用事件并列。
+
+Source: [app.py](app.py#L552), [agent/ui.py](agent/ui.py#L157-L165), [main.py](main.py#L475)
+
+## 设计考量与工程权衡
+
+该补丁机制体现了几个关键的设计决策：
+
+**为什么选择 monkey-patch 而非 fork LangChain？** 项目作为一个可维护的独立 Agent 框架，需要保持与 LangChain 上游的兼容性，以便通过 `pip install --upgrade` 获取新特性。Monkey-patch 在模块加载时以最小侵入性注入修复逻辑，不影响 LangChain 的其他功能，升级成本最低。
+
+**为什么只 patch 两个函数而非重写 ChatOpenAI？** 分析表明 `reasoning_content` 在整个请求-响应周期中只经过两处过滤点——响应反序列化和请求序列化。在这两点精准拦截，比重写整个 `ChatOpenAI` 类的 `_stream` 和 `_generate` 方法更简洁、更易维护。
+
+**为什么 `additional_kwargs` 是存储位置？** LangChain 的 `BaseMessage` 类为 `additional_kwargs` 定义了明确的角色——存储 AI 服务商特有的非标准字段。该字典不会被核心消息处理逻辑意外修改，但又可以通过标准 API（`message.additional_kwargs.get(...)`）被应用层访问，是承载供应商特定数据的理想位置。
+
+**局限性与维护负担**：补丁引用了 `langchain_openai.chat_models.base` 模块的私有函数（以单下划线开头），这些函数不在 LangChain 的公共 API 承诺范围内，上游版本更新时可能因函数签名或行为变更导致补丁失效。当前实现通过保留原始函数引用（`_original_convert_delta`、`_original_convert`）来隔离此类风险——即便原始函数行为变化，补丁代码仍能通过调用旧版引用保持稳定。
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L185-L217)
+
+## 与其他中间件的协作关系
+
+该补丁位于中间件链之外，属于 **模块级基础设施**，在 Agent 初始化之前就已经生效。它与中间件链中的其他组件形成互补：
+
+| 组件 | 作用层级 | 时序 | 关注点 |
+|------|---------|------|--------|
+| reasoning_content 补丁 | 模块导入时 | Agent 创建前 | 数据完整性（推理内容保活） |
+| SummarizationMiddleware | Agent 运行时 | 每次模型调用后 | 上下文窗口管理（tokens 压缩） |
+| ToolCallRepeatMiddleware | Agent 运行时 | 每次工具调用前 | 行为正确性（重复调用检测） |
+| ToolCallIdMiddleware | Agent 运行时 | 每次模型调用后 | 数据格式合规（tool_call_id 修复） |
+
+补丁确保原始数据不丢失，中间件链确保 Agent 行为可控——两者在不同维度保障系统的可靠性。
+
+Source: [agent/agent_langchain.py](agent/agent_langchain.py#L784-L806)
+
+## 后续维护建议
+
+当 LangChain 上游版本更新时，需关注以下风险点并执行回归验证：
+
+1. **函数签名变更**：`_convert_delta_to_message_chunk` 和 `_convert_message_to_dict` 的参数列表可能变化，`_patched_convert_delta` 中的 `_dict`、`default_class` 参数和 `_patched_convert_message_to_dict` 中的 `api` 参数需与新版本对齐。
+2. **内部函数重命名或移除**：LangChain 可能重构内部 API，将私有函数移至其他模块或改名，需更新 import 路径。
+3. **AIMessageChunk 结构调整**：`additional_kwargs` 的行为可能变化（例如被更严格的类型检查约束），需验证赋值操作是否仍被允许。
+4. **回归测试点**：升级后重点测试 DeepSeek 模型的流式对话，确认控制台和 HTTP 客户端能正确收到 `thinking` 事件，且多轮对话后推理内容不会丢失。
+
+---
+
+> **下一步阅读**：了解中间件链的整体设计，参见 [中间件链深度解析（上下文压缩、重复检测、模型调用限制）](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi)；了解流式对话的完整生命周期，参见 [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu)。

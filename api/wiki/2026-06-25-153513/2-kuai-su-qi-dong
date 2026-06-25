@@ -1,0 +1,342 @@
+欢迎使用 Pocket-Agent！这份指南将帮助你在 **5 分钟内**完成项目启动，体验一个运行在手机上的 AI Agent。Pocket-Agent 是一个基于 LangChain + LangGraph 构建的轻量级移动端 AI 代理，支持手机自动化控制、3D 虚拟身体交互、工具调用、子 Agent 委托、分层记忆和语音播报等能力。
+
+## 项目核心架构概览
+
+在开始之前，先了解 Pocket-Agent 的整体架构将帮助你更好地理解后续配置。项目采用 **LangChain Agent + LangGraph** 作为核心引擎，通过中间件链实现上下文压缩、重复检测、模型调用限制等功能。
+
+```mermaid
+graph TB
+    subgraph "用户交互层"
+        A[终端交互模式<br/>main.py] 
+        B[HTTP API 模式<br/>app.py]
+    end
+    
+    subgraph "Agent 引擎层"
+        C[LangChainPocketAgent<br/>agent_langchain.py]
+        D[中间件链<br/>6个中间件]
+        E[工具系统<br/>basic_tools.py]
+    end
+    
+    subgraph "存储层"
+        F[SQLite 数据库<br/>pocket_agent.db]
+        G[向量索引<br/>EmbeddingClient]
+        H[用户画像<br/>memory/]
+    end
+    
+    subgraph "扩展层"
+        I[技能系统<br/>SKILL.md]
+        J[子 Agent<br/>delegate_task]
+        K[MCP 服务<br/>NeuralBridge]
+    end
+    
+    A --> C
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    E --> H
+    C --> I
+    C --> J
+    C --> K
+```
+
+Sources: [main.py](main.py#L1-L200), [agent/agent_langchain.py](agent/agent_langchain.py#L1-L80), [README.md](README.md#L1-L100)
+
+## 环境要求
+
+Pocket-Agent 支持在以下环境运行：
+
+| 环境 | Python 版本 | 说明 |
+|------|-------------|------|
+| **Android Termux** | 3.10+ | 推荐在手机上运行，支持完整手机控制功能 |
+| **Windows (WSL2)** | 3.10+ | 建议使用 WSL2 避免编码问题 |
+| **Linux/macOS** | 3.10+ | 可直接运行，部分手机控制功能受限 |
+
+> **注意**：项目要求 Python 3.10 或更高版本，因为使用了 `match` 语句等新特性。
+
+Sources: [pyproject.toml](pyproject.toml#L1-L20)
+
+## 第一步：安装项目
+
+Pocket-Agent 提供两种安装方式，推荐使用 **pip 安装**（自动处理依赖）：
+
+### 方式一：pip 安装（推荐）
+
+```bash
+# 克隆项目到本地
+git clone <your-repo-url> Pocket-Agent
+cd Pocket-Agent
+
+# 使用 pip 安装（开发模式，修改代码后立即生效）
+pip install -e .
+```
+
+安装完成后，你可以在任意目录直接运行 `pocket-agent` 命令启动程序。
+
+### 方式二：手动安装依赖
+
+```bash
+# 进入项目目录
+cd Pocket-Agent
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+> **提示**：如果遇到依赖冲突，建议使用虚拟环境：
+> ```bash
+> python -m venv .venv
+> source .venv/bin/activate  # Linux/macOS
+> # 或 .venv\Scripts\activate  # Windows
+> ```
+
+Sources: [pyproject.toml](pyproject.toml#L40-L66), [requirements.txt](requirements.txt#L1-L36)
+
+## 第二步：配置环境变量
+
+Pocket-Agent 使用 `.env` 文件管理配置。项目提供了 `.env.example` 作为模板。
+
+### 复制配置模板
+
+```bash
+cp .env.example .env
+```
+
+### 配置 LLM（大语言模型）
+
+Pocket-Agent 支持两种 LLM 配置模式：
+
+| 模式 | 适用场景 | 配置示例 |
+|------|----------|----------|
+| **云端 API** | 快速测试、无需本地资源 | OpenAI、DeepSeek、LongCat 等 |
+| **本地模型** | 离线使用、隐私保护 | llama-server、Ollama 等 |
+
+#### 云端 API 配置（推荐新手）
+
+```env
+# OpenAI 兼容的 API（支持 DeepSeek、Qwen、LongCat 等）
+DEFAULT_LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-your-api-key
+LLM_MODEL=gpt-4o
+```
+
+#### 本地模型配置
+
+```env
+# llama-server 本地服务
+DEFAULT_LLM_BASE_URL=http://127.0.0.1:8080/v1
+LLM_API_KEY=dummy
+LLM_MODEL=your-model-name
+```
+
+> **提示**：本地模型需要先启动 llama-server 服务。详见 [本地大模型部署](5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su) 章节。
+
+### 配置 MCP 服务（可选）
+
+MCP 服务用于手机 UI 控制（点击、滑动、截图等），如果不需要手机控制功能可跳过。
+
+```env
+MCP_SERVER_URL=http://127.0.0.1:7474/mcp
+```
+
+Sources: [.env.example](.env.example#L1-L38), [agent/config.py](agent/config.py#L40-L50)
+
+## 第三步：运行 Pocket-Agent
+
+### 终端交互模式
+
+这是最简单的运行方式，直接在终端中与 AI Agent 对话：
+
+```bash
+# 方式一：使用全局命令（pip 安装后可用）
+pocket-agent
+
+# 方式二：直接运行 Python 脚本
+python main.py
+```
+
+启动后，你将看到类似以下界面：
+
+```
+╭─────────────────────────────────────────────╮
+│  🤖 Pocket-Agent 已启动                      │
+│  输入消息开始对话，/help 查看命令列表         │
+╰─────────────────────────────────────────────╯
+```
+
+### HTTP API 模式
+
+如果你需要为 Android App 或其他客户端提供 API 服务：
+
+```bash
+# 启动 FastAPI 服务
+python -m uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+服务启动后，可以通过以下地址访问：
+- API 文档：`http://localhost:8000/docs`
+- SSE 流式聊天：`http://localhost:8000/chat`
+
+Sources: [main.py](main.py#L1-L50), [app.py](app.py#L1-L50)
+
+## 快速验证
+
+安装完成后，可以通过以下步骤验证是否正常工作：
+
+### 测试 LLM 连接
+
+```bash
+# 运行测试脚本
+python test_llm.py
+```
+
+如果看到"LLM 响应正常"，说明配置正确。
+
+### 测试 Agent 功能
+
+启动 `pocket-agent` 后，尝试以下对话：
+
+```
+你: 你好，介绍一下你自己
+Agent: 你好！我是 Pocket-Agent，一个安装在手机上的 AI 助手...
+
+你: 帮我查看当前目录的文件
+Agent: [调用 directory_list 工具] 当前目录包含以下文件...
+
+你: 帮我写一个 Python Hello World
+Agent: [调用 file_write 工具] 已创建 hello.py 文件...
+```
+
+Sources: [agent/prompts/system_base.py](agent/prompts/system_base.py#L1-L20)
+
+## Embedding 模型配置（可选）
+
+Embedding 模型用于**语义记忆检索**，让 Agent 能够基于语义相似度搜索历史对话。如果不配置，系统将仅使用全文搜索（FTS5），功能完全可用。
+
+### 快速配置
+
+```env
+# 本地 llama-server（推荐）
+EMBEDDING_SERVER_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL=bge-m3
+EMBEDDING_MODEL_PATH=/sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf
+```
+
+### 下载模型
+
+```bash
+# 创建目录
+mkdir -p /sdcard/Pocket-Agent
+
+# 下载 BGE-M3 模型（约 1.2GB）
+wget -O /sdcard/Pocket-Agent/bge-m3-Q4_K_M.gguf \
+  https://hf-mirror.com/gpustack/bge-m3-GGUF/blob/main/bge-m3-Q4_K_M.gguf
+```
+
+> **注意**：配置 `EMBEDDING_MODEL_PATH` 后，Pocket-Agent 启动时会自动拉起 llama-server。未配置时，语义搜索功能自动跳过，全文搜索仍可用。
+
+Sources: [.env.example](.env.example#L25-L38), [agent/embedding.py](agent/embedding.py#L1-L50)
+
+## 常见问题排查
+
+### Q1: 启动报错 "ModuleNotFoundError"
+
+```bash
+# 确保使用 pip 安装模式
+pip install -e .
+
+# 或手动安装依赖
+pip install -r requirements.txt
+```
+
+### Q2: 中文乱码问题
+
+**Windows 用户**：
+```bash
+# 临时设置 UTF-8 编码
+set PYTHONUTF8=1
+
+# 或使用 WSL2 运行（推荐）
+```
+
+### Q3: LLM 连接失败
+
+1. 检查 `.env` 中的 API 地址和密钥是否正确
+2. 确认网络连接正常（云端 API）
+3. 确认本地服务已启动（本地模型）
+
+```bash
+# 测试 LLM 连接
+python test_llm.py
+```
+
+### Q4: MCP 服务连接失败
+
+MCP 服务（NeuralBridge）是可选的，不影响基本功能。如需使用：
+
+1. 确认 NeuralBridge 服务已启动
+2. 检查 `.env` 中的 `MCP_SERVER_URL` 配置
+3. 参考 [NeuralBridge MCP 服务](24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu) 章节
+
+### Q5: 语义搜索不生效
+
+1. 确认已配置 `EMBEDDING_MODEL_PATH` 且文件存在
+2. 检查 llama-server 是否正常启动
+3. 如未配置，系统自动降级为全文搜索，功能不受影响
+
+Sources: [docs/00-运行说明.md](docs/00-运行说明.md#L1-L111)
+
+## 项目结构概览
+
+了解项目结构有助于你深入探索：
+
+```
+Pocket-Agent/
+├── main.py                    # 终端交互模式入口
+├── app.py                     # HTTP API 模式入口
+├── .env                       # 环境变量配置（需手动创建）
+├── .env.example               # 配置模板
+├── requirements.txt           # Python 依赖
+├── pyproject.toml             # 项目配置
+├── pocket_agent.db            # SQLite 数据库（自动生成）
+│
+├── agent/                     # Agent 核心代码
+│   ├── agent_langchain.py     # LangChain Agent 实现
+│   ├── config.py              # 全局配置
+│   ├── embedding.py           # Embedding 客户端
+│   ├── memory.py              # 用户画像管理
+│   ├── task_manager.py        # 任务管理
+│   ├── logger.py              # 日志系统
+│   ├── ui.py                  # 终端 UI
+│   ├── tools/                 # 工具实现
+│   │   ├── basic_tools.py     # 基础工具集
+│   │   ├── body_control_tool.py  # 3D 身体控制
+│   │   └── body_server.py     # 身体控制服务
+│   ├── prompts/               # 提示词模板
+│   │   ├── system_base.py     # 基础人设
+│   │   ├── agent_enhance.py   # Agent 增强规则
+│   │   └── executor_*.py      # 子 Agent 提示词
+│   └── skills/                # 技能系统
+│       ├── main-skills/       # 主 Agent 技能
+│       ├── executor-skills/   # 子 Agent 技能
+│       └── auto-skills/       # 自动沉淀技能
+│
+├── memory/                    # 用户画像存储
+└── logs/                      # 日志文件
+```
+
+Sources: [README.md](README.md#L150-L250)
+
+## 下一步
+
+恭喜！你已经成功启动了 Pocket-Agent。以下是推荐的后续学习路径：
+
+1. **[项目概述](1-xiang-mu-gai-shu)** - 深入了解项目特性和设计理念
+2. **[Termux 安装与配置](3-termux-an-zhuang-yu-pei-zhi)** - 在手机上完整部署
+3. **[依赖安装与环境变量配置](4-yi-lai-an-zhuang-yu-huan-jing-bian-liang-pei-zhi)** - 详细配置说明
+4. **[本地大模型部署](5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su)** - 离线运行方案
+5. **[终端交互模式](7-zhong-duan-jiao-hu-mo-shi-main-py)** - 深入使用终端模式
+6. **[HTTP API 模式](8-http-api-mo-shi-fastapi-sse-liu-shi)** - 为 Android App 提供服务
+
+如果你想快速体验核心功能，建议从 [终端交互模式](7-zhong-duan-jiao-hu-mo-shi-main-py) 开始，了解 Agent 的对话和工具调用能力。

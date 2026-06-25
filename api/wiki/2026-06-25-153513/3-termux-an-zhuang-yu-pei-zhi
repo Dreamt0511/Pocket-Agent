@@ -1,0 +1,342 @@
+> **前置条件**：一台 Android 手机（Android 7.0+），约 2GB 可用存储空间。
+> **阅读路径**：如果你是第一次搭建 Pocket-Agent，建议按顺序阅读——先完成本页的 Termux 安装，再进入 [依赖安装与环境变量配置](4-yi-lai-an-zhuang-yu-huan-jing-bian-liang-pei-zhi)。
+
+---
+
+Termux 是 Pocket-Agent 在手机端的运行底座。它是一个 Android 终端模拟器和 Linux 环境，让你可以在手机上运行 Python、Git、llama.cpp 等完整的开发工具链。本项目从主程序入口到设备控制工具，全部依赖 Termux 环境运行。
+
+## 一、为什么选择 Termux
+
+Pocket-Agent 的核心架构决定了它必须运行在类 Linux 环境上。Termux 提供了以下几项关键能力：
+
+| 能力 | 在项目中的用途 | 相关源码 |
+|------|---------------|---------|
+| Python 3.10+ 运行时 | Agent 引擎、LangChain/LangGraph 框架运行的基础 | [pyproject.toml](pyproject.toml#L13) 声明 `requires-python = ">=3.10"` |
+| Termux:API 系统接口 | 获取电池状态、WiFi 信息、GPS 定位、发送通知、TTS 语音播报 | [config.py](agent/config.py#L93-L104) 定义 `TERMUX_API_CHECK_CMD` 等命令 |
+| 文件系统访问 | 读写 Android 共享存储（`/sdcard/`），管理模型文件、数据库 | [embedding.py](agent/embedding.py#L111-L130) 中嵌入式模型路径为 `/sdcard/Pocket-Agent/` |
+| `pkg` 包管理器 | 安装 Python、Git、llama-server、编译工具等依赖 | 全局依赖管理入口 |
+
+Termux 的另一个重要优势是**无需 root 权限**——普通用户即可通过 Termux:API 和应用商店安装的配套 App 获得丰富的设备操控能力。
+
+Sources: [config.py](agent/config.py#L93-L104), [pyproject.toml](pyproject.toml#L13), [embedding.py](agent/embedding.py#L111-L130)
+
+## 二、安装 Termux
+
+### 2.1 选择安装来源
+
+**强烈推荐使用 F-Droid 版本**，不要从 Google Play 商店安装。原因如下：
+
+- **Play 商店版本已停止更新**（最新版本停留在 0.118.0，2024 年以后不再维护）
+- **F-Droid 版本持续维护**，修复了大量重要 bug，支持 Android 12+
+- **F-Droid 版本不依赖 Google 服务**，运行更稳定
+
+安装步骤：
+
+1. **下载 F-Droid 客户端**：在手机浏览器打开 `https://f-droid.org`，下载并安装 F-Droid App
+2. **在 F-Droid 中搜索 Termux**：打开 F-Droid → 搜索栏输入 "Termux" → 找到 **Termux**（终端模拟器，包名 `com.termux`）→ 点击安装
+3. **同时安装 Termux:API 配套应用**：在 F-Droid 中搜索 "Termux:API"（包名 `com.termux.api`）→ 一并安装（这个稍后会用到）
+
+> **验证安装**：打开 Termux，看到类似 `~ $` 的提示符即表示安装成功。
+
+### 2.2 授权存储权限
+
+Termux 默认只能访问自己的私有目录，需要显式授权才能读写手机的共享存储（`/sdcard/`）。Pocket-Agent 的模型文件、数据库和日志文件都存放在共享存储中，因此这一步**必须执行**。
+
+在 Termux 终端中运行：
+
+```bash
+termux-setup-storage
+```
+
+执行后手机会弹出存储权限授权窗口，点击"允许"。成功后，`/sdcard/` 目录会以软链接形式出现在 `~/storage/` 下。
+
+Sources: [phone-control-guide SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L225)
+
+## 三、更新包管理器并安装基础工具
+
+### 3.1 更新包列表
+
+Termux 使用 `pkg`（apt 的封装）管理软件包。首次使用前务必更新：
+
+```bash
+pkg update && pkg upgrade -y
+```
+
+这个过程可能需要 2-5 分钟，取决于网络速度。中途如果看到 `Configuring` 提示，耐心等待即可。
+
+### 3.2 安装核心工具
+
+安装运行 Pocket-Agent 所需的基础工具：
+
+```bash
+pkg install python git openssl -y
+```
+
+各工具的用途：
+
+| 软件包 | 版本要求 | 用途 |
+|-------|---------|------|
+| `python` | ≥ 3.10 | Pocket-Agent 的运行时，LangChain/LangGraph 的依赖 |
+| `git` | 无特殊要求 | 从 GitHub 克隆/更新 Pocket-Agent 代码 |
+| `openssl` | 无特殊要求 | Python 包安装（`pip install`）时编译依赖的 SSL 库 |
+
+> **注意**：Termux 默认安装的 Python 通常为最新版（目前已到 3.12+），满足项目 `>=3.10` 的要求。安装后用 `python --version` 验证即可。
+
+Sources: [pyproject.toml](pyproject.toml#L13)
+
+## 四、安装 Termux:API（设备控制能力）
+
+Pocket-Agent 通过 Termux:API 获取手机硬件信息和执行设备控制。这是实现"手机自动化"功能的关键基础设施。
+
+### 4.1 安装 Termux:API 包
+
+在 Termux 终端中运行：
+
+```bash
+pkg install termux-api
+```
+
+### 4.2 安装 Termux:API Android 应用
+
+如果在第二步中已经通过 F-Droid 安装了 Termux:API App，跳过此步骤。否则：
+
+1. 打开 F-Droid（或手机应用商店）
+2. 搜索 **Termux:API**（包名 `com.termux.api`）
+3. 点击安装
+
+### 4.3 验证 Termux:API 是否可用
+
+安装完成后，在 Termux 中执行验证命令：
+
+```bash
+termux-battery-status
+```
+
+如果返回类似下面的 JSON 信息，说明安装成功：
+
+```json
+{
+  "health": "GOOD",
+  "percentage": 85,
+  "plugged": "UNPLUGGED",
+  "status": "DISCHARGING",
+  "temperature": 29.5
+}
+```
+
+如果提示 `command not found`，说明 `termux-api` 包未正确安装；如果提示权限错误，请检查 Termux:API App 的权限设置。
+
+### 4.4 Termux:API 为 Pocket-Agent 提供的核心能力
+
+| API 命令 | 项目中的使用场景 | 代码引用 |
+|---------|----------------|---------|
+| `termux-battery-status` | 获取电池百分比和充电状态 | [basic_tools.py](agent/tools/basic_tools.py#L222) |
+| `termux-wifi-connectioninfo` | 获取当前 WiFi 连接信息（SSID、IP） | [basic_tools.py](agent/tools/basic_tools.py#L243-L244) |
+| `termux-telephony-deviceinfo` | 获取设备 IMEI、网络运营商等 | [basic_tools.py](agent/tools/basic_tools.py#L248-L249) |
+| `termux-tts-speak` | Agent 通过语音播报通知用户 | [agent_langchain.py](agent/agent_langchain.py#L1682) |
+| `termux-notification` | 发送系统通知消息 | [SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L160) |
+| `termux-clipboard-get/set` | 读取和设置剪贴板内容 | [SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L167-L168) |
+| `termux-sensor` | 读取环境光传感器等数据 | [config.py](agent/config.py#L103-L104) |
+| `termux-location` | 获取 GPS 位置信息 | [agent_langchain.py](agent/agent_langchain.py#L687) |
+| `termux-setup-storage` | 授权共享存储访问 | [SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L225) |
+
+> **权限提示**：每个 Termux:API 命令首次使用时会弹出权限请求窗口。如果某条命令返回空值或报错，请检查 Android 系统设置中是否已为该应用授予对应权限（设置 → 应用管理 → Termux:API → 权限）。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L179-L222), [agent_langchain.py](agent/agent_langchain.py#L687-L1682), [config.py](agent/config.py#L93-L104)
+
+## 五、获取 Pocket-Agent 项目代码
+
+### 5.1 克隆项目到本地
+
+Pocket-Agent 推荐放在 Android 共享存储中，方便文件管理和模型文件访问：
+
+```bash
+cd /sdcard
+git clone https://github.com/你的仓库地址/Pocket-Agent.git
+cd Pocket-Agent
+```
+
+如果你的仓库是私有的，或者你想从本地拷贝已有的项目文件，也可以用 `cp` 或文件管理器将项目目录复制到 `/sdcard/Pocket-Agent/`。
+
+> **路径说明**：项目的运行路径会影响 `.env` 文件中的路径配置。项目根目录默认就是 `/data/data/com.termux/files/usr/...` 或 `/sdcard/Pocket-Agent/`，取决于你克隆的位置。官方推荐放置在 `/sdcard/` 下，这样 Android 端的其他应用也能访问到模型文件。
+
+### 5.2 项目关键文件和目录一览
+
+```
+Pocket-Agent/
+├── main.py                         # 终端交互模式入口（入口文件）
+├── app.py                          # FastAPI HTTP 服务（供 Android App 调用）
+├── .env.example                    # 环境变量配置模板（需复制为 .env）
+├── requirements.txt                # Python 依赖清单
+├── pyproject.toml                  # 项目打包配置
+├── agent/
+│   ├── agent_langchain.py          # Agent 核心引擎（LangChain + LangGraph）
+│   ├── config.py                   # 全局配置项（Termux API 命令在此定义）
+│   ├── embedding.py                # 向量嵌入服务管理
+│   ├── memory.py                   # 长期记忆管理
+│   ├── ui.py                       # 终端交互 UI（Rich 库）
+│   ├── logger.py                   # 结构化日志系统
+│   ├── prompts/                    # Agent 提示词模板
+│   ├── tools/                      # 内置工具（文件操作、Shell、MCP、3D身体控制等）
+│   └── skills/                     # 技能系统 SKILL.md 文档
+├── docs/                           # 文档目录
+└── memory/                         # 用户画像存储
+```
+
+Sources: [README.md](README.md#L1-L55)
+
+## 六、配置 Python 虚拟环境（推荐）
+
+在 Termux 中，建议使用 Python 虚拟环境来隔离项目依赖，避免与系统 Python 包产生冲突。
+
+### 6.1 创建虚拟环境
+
+在项目根目录下执行：
+
+```bash
+cd /sdcard/Pocket-Agent
+python -m venv .venv
+```
+
+### 6.2 激活虚拟环境
+
+```bash
+source .venv/bin/activate
+```
+
+激活后，终端提示符前面会出现 `(.venv)` 标识，表示当前在虚拟环境中。
+
+### 6.3 升级 pip
+
+```bash
+pip install --upgrade pip
+```
+
+## 七、安装 Python 依赖
+
+### 7.1 安装项目依赖
+
+确保虚拟环境已激活，然后运行：
+
+```bash
+pip install -r requirements.txt
+```
+
+这个过程可能需要 5-15 分钟（取决于手机性能和网络速度）。Termux 的 pip 会自动从 PyPI 下载预编译的 wheel 包，通常不需要本地编译。
+
+### 7.2 核心依赖说明
+
+| 依赖包 | 版本 | 用途 |
+|-------|------|------|
+| `langchain>=0.2.0` | ≥0.2.0 | Agent 框架核心 |
+| `langgraph>=0.2.0` | ≥0.2.0 | 多步骤 Agent 执行图 |
+| `langchain-openai>=0.1.0` | ≥0.1.0 | OpenAI 兼容 API 的 LLM 接口 |
+| `langgraph-checkpoint-sqlite>=2.0.0` | ≥2.0.0 | 对话历史持久化（AsyncSqliteSaver） |
+| `rich>=13.0.0` | ≥13.0.0 | 终端 UI 美化（进度条、Markdown 渲染） |
+| `prompt_toolkit>=3.0.0` | ≥3.0.0 | 交互式输入框（历史记录、Tab 补全） |
+| `fastapi>=0.115.0` | ≥0.115.0 | HTTP API 服务框架 |
+| `numpy>=1.24.0` | ≥1.24.0 | 向量相似度计算（替代 ChromaDB） |
+| `python-dotenv>=1.0.0` | ≥1.0.0 | 环境变量加载（`.env` 文件读取） |
+
+Sources: [requirements.txt](requirements.txt#L1-L36), [pyproject.toml](pyproject.toml#L14-L33)
+
+## 八、验证安装
+
+### 8.1 验证 Python 和依赖
+
+```bash
+python --version          # 应显示 Python 3.10.x 或更高
+pip list | grep langchain # 应显示 langchain 已安装
+```
+
+### 8.2 验证 Termux:API
+
+```bash
+termux-battery-status     # 应返回 JSON 格式的电池信息
+```
+
+### 8.3 验证项目文件结构
+
+```bash
+ls -la /sdcard/Pocket-Agent/
+# 应看到 main.py、app.py、requirements.txt、.env.example 等文件
+```
+
+## 九、常见问题排查
+
+### 9.1 `termux-battery-status` 报错
+
+**现象**：执行 `termux-battery-status` 返回 `command not found`。
+
+**原因**：Termux:API 未安装或安装不完整。
+
+**解决方法**：
+1. 确认已执行 `pkg install termux-api`
+2. 确认已安装 Termux:API Android 应用（包名 `com.termux.api`）
+3. 在 Android 设置中检查 Termux:API 是否有"显示在其他应用上层"和"通知"权限
+
+### 9.2 `pip install` 安装失败
+
+**现象**：安装过程中报 `error: command 'clang' failed` 或 `No module named '_ctypes'`。
+
+**原因**：某些依赖需要本地编译，缺少编译工具链。
+
+**解决方法**：
+```bash
+pkg install clang make cmake binutils
+pip install -r requirements.txt
+```
+
+以 `numpy` 为例，Termux 仓库中已提供预编译版本，通常不会需要编译。如果确实遇到编译失败，可以尝试安装对应软件包的 Termux 版本（如 `pkg install python-numpy`）。
+
+### 9.3 存储权限问题
+
+**现象**：Pocket-Agent 启动时提示无法读取 `/sdcard/Pocket-Agent/` 下的文件。
+
+**解决方法**：
+```bash
+# 重新授权存储
+termux-setup-storage
+# 检查是否已创建软链接
+ls -la ~/storage/
+```
+
+### 9.4 `pkg update` 报 GPG 错误
+
+**现象**：`pkg update` 时出现 GPG key 验证失败。
+
+**解决方法**：
+```bash
+# 更新 GPG 密钥
+pkg update --allow-unauthenticated
+pkg install termux-keyring
+# 再次正常更新
+pkg update
+```
+
+### 9.5 Python 版本低于 3.10
+
+**现象**：`python --version` 显示 3.9.x 或更低。
+
+**解决方法**：Termux 的 `pkg` 仓库默认提供最新版 Python。旧版本通常是因为未执行 `pkg upgrade`：
+
+```bash
+pkg upgrade -y
+# 升级后即可获得 Python 3.10+
+python --version
+```
+
+## 十、下一步
+
+Termux 安装配置完成后，你的手机已经具备了运行 Pocket-Agent 的基础环境。接下来请进入：
+
+- **[依赖安装与环境变量配置](4-yi-lai-an-zhuang-yu-huan-jing-bian-liang-pei-zhi)** —— 配置 `.env` 文件中的 LLM API 密钥、Embedding 模型路径、MCP 服务器地址等关键参数
+
+所有环境配置就绪后，你可以选择运行模式：
+
+- **[终端交互模式（main.py）](7-zhong-duan-jiao-hu-mo-shi-main-py)** —— 在 Termux 终端中直接与 AI Agent 对话
+- **[HTTP API 模式（FastAPI + SSE 流式）](8-http-api-mo-shi-fastapi-sse-liu-shi)** —— 启动 HTTP 服务供 Android App 或浏览器调用
+
+---
+
+> **提示**：如果你还没有 LLM API Key，建议先准备一个兼容 OpenAI 格式的 API Key（如 DeepSeek、OpenAI、LongCat 等），详细配置方法见[环境变量配置说明](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)。

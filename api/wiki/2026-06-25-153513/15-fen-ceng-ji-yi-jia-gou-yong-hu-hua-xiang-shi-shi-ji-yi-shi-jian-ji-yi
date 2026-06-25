@@ -1,0 +1,203 @@
+Pocket-Agent 的记忆系统采用三层金字塔结构，按信息的**持久性**和**使用方式**分为用户画像、事实记忆、事件记忆。这三层在存储机制、更新频率、检索方式上各有不同，共同构成了一个兼顾长期稳定和灵活检索的记忆体系。
+
+```mermaid
+graph TD
+    subgraph "三层记忆架构"
+        Profile["🧑 用户画像<br/>memory/user_profile.md"]
+        FactMem["📌 事实记忆<br/>memory_type='fact'"]
+        EpiMem["📝 事件记忆<br/>memory_type='episodic'"]
+    end
+
+    subgraph "存储层"
+        SQLite[("SQLite messages 表<br/>role='memory'")]
+        FTS5[("FTS5 全文索引<br/>messages_fts")]
+        VEC[("向量索引<br/>embeddings 表")]
+    end
+
+    Profile -->|"update_user_profile 工具"| ProfileFile["user_profile.md"]
+    FactMem -->|"save_memory(type='fact')"| SQLite
+    EpiMem -->|"save_memory(type='episodic')"| SQLite
+    
+    SQLite -->|"触发器自动同步"| FTS5
+    SQLite -->|"异步 embedding"| VEC
+
+    subgraph "上下文注入"
+        ProfileFile -->|"初始化时加载<br/>每次对话预置"| Context["用户消息前置<br/>用户画像+环境+相关记忆"]
+        FTS5 -->|"FTS5 trigram 搜索"| RRF["RRF 融合排序"]
+        VEC -->|"numpy 余弦相似度"| RRF
+        RRF -->|"top 3（排除 dance）"| Context
+    end
+```
+
+## 第一层：用户画像（用户本人的永久信息）
+
+用户画像是三层中最稳定、最持久的一层，存储**换了项目和场景仍然成立的个人信息**。
+
+### 存储方式
+
+用户画像以 Markdown 文件形式存储在 `memory/user_profile.md`，文件结构为预定义章节加自定义章节的组合。系统初始化时由 `LongTermMemory` 类管理：启动时创建默认模板，之后通过 `update_user_profile` 工具增量更新指定章节内容。
+
+Sources: [memory.py](agent/memory.py#L10-L18)
+
+```python
+# 默认模板结构
+## 基本信息      # 姓名、职业、位置、兴趣
+## 沟通偏好      # 回答风格、语言习惯、交互方式
+## 行为要求      # 对 agent 的约束和规则
+## 反馈          # 评价、建议、不满
+## 其他          # 不属于以上分类的信息
+```
+
+### 生命周期
+
+| 阶段 | 行为 |
+|------|------|
+| Agent 初始化 | `LongTermMemory(memory_dir)` 读取或创建 `user_profile.md` |
+| 每次对话 | 画像文本作为上下文前置注入（参见下文第三条） |
+| 需要更新时 | Agent 调用 `update_user_profile(section, content)` 工具 |
+| 文件持久化 | 内容追加或替换到对应章节，不丢失已有信息 |
+
+### 更新场景
+
+用户画像的更新由 `update_user_profile` 工具触发，仅在以下场景才会写入：
+- 用户明确说出个人信息（姓名、职业、位置等）
+- 用户表达偏好或习惯（沟通方式、饮食、作息等）
+- 用户提出行为要求
+- 用户反馈纠正 Agent 的行为
+
+普通闲聊、一次性任务指令、已在记忆中的重复信息**不写入**用户画像。这条约束由 Agent 的系统提示词强制执行。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L585-L622)
+
+## 第二层：事实记忆（项目上下文与技术决定）
+
+事实记忆存储的是**在某个项目或场景下成立的信息**，比用户画像更细粒度、更新频率更高。典型内容包括技术选型、项目架构决定、用户的工作上下文等。
+
+### 存储机制
+
+事实记忆通过 `save_memory(type="fact", importance=N)` 工具存入。每条记忆写入 SQLite `messages` 表，`role` 固定为 `"memory"`、`memory_type` 为 `"fact"`。写入后自动同步到 FTS5 全文索引（通过 SQLite 触发器），并异步生成向量嵌入存入 `embeddings` 表。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L753-L822)
+
+### 重要性评分体系
+
+每条事实记忆都有一个 1-10 的重要性评分，由 Agent 自行判断。评分直接影响后续检索排序时的权重：
+
+| 分值 | 含义 | 示例 |
+|------|------|------|
+| 1-2 | 临时性信息，很快就会过时 | 临时测试结果 |
+| 3-4 | 一般有用 | 用户的某个偏好、一次普通操作的结果 |
+| 5-6 | 比较重要 | 项目架构决定、关键技术选型 |
+| 7-8 | 很重要 | 影响后续多次决策的结论、重大问题根因 |
+| 9-10 | 极其重要 | 用户明确强调的关键需求、不可逆的重大决定 |
+
+## 第三层：事件记忆（操作结果与问题解决方案）
+
+事件记忆是三层中最动态的一层，存储**与时间紧密相关的具体事件**。典型内容包括部署成功/失败、问题解决方案、某次任务的执行结果等。
+
+```mermaid
+sequenceDiagram
+    participant Agent as Agent 执行
+    participant Tool as save_memory 工具
+    participant SQL as SQLite messages
+    participant FTS as FTS5 索引
+    participant VEC as 向量索引
+    
+    Agent->>Tool: save_memory(content="部署成功：...", type="episodic", importance=6)
+    Tool->>SQL: INSERT INTO messages (role='memory', memory_type='episodic')
+    SQL->>FTS: 触发器自动同步 content 到 messages_fts
+    SQL-->>Tool: 返回 msg_id (lastrowid)
+    Tool->>VEC: add(message_id=msg_id, text=提取后的语义文本)
+    VEC-->>Tool: 向量索引更新完成
+    Tool-->>Agent: ✅ "已保存事件记忆: ... (耗时 0.15s)"
+```
+
+### 记忆类型对照表
+
+| 维度 | 用户画像 | 事实记忆 (fact) | 事件记忆 (episodic) | 舞蹈记忆 (dance) |
+|------|----------|-----------------|---------------------|------------------|
+| **存储位置** | `memory/user_profile.md` | SQLite `messages` 表 | SQLite `messages` 表 | SQLite `messages` 表 |
+| **更新方式** | `update_user_profile` | `save_memory(type="fact")` | `save_memory(type="episodic")` | `save_memory(type="dance")` |
+| **持久性** | 永久（手动更新） | 中期（项目周期） | 短期（事件驱动） | 按需 |
+| **上下文注入** | 每次对话前置 | 自动 top 3（RRF 排序） | 自动 top 3（RRF 排序） | **不自动注入**，需显式搜索 |
+| **更新频率** | 极少 | 中 | 高 | 按需 |
+| **典型数据量** | 几十行 | 数百条 | 数千条 | 取决于编舞数量 |
+
+## 检索流水线：自动注入 + 手动搜索
+
+### 自动注入（每次对话的"隐形"前置）
+
+每次用户发送消息时，Agent 在后台并行执行三个动作，将结果合并到用户消息前：
+
+1. **读取用户画像**：从 `self._user_profile`（初始化时加载的缓存）获取画像文本
+2. **环境感知**：从 `_cached_env_tag`（后台定时刷新的传感器数据）获取环境信息
+3. **搜索相关记忆**：调用 `_search_relevant_memories(user_message)`，同时执行 FTS5 trigram 搜索和向量语义搜索，经 RRF 融合排序后取 top 3
+
+三段文本按顺序拼接为 `用户画像\n\n环境信息\n\n[相关记忆]\n- xxx\n- yyy` 后放置在用户消息之前（以 `---` 分隔）。Agent 只能通过上述"隐形注入"的方式感知到记忆内容，无需也无法直接访问数据库。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L987-L997)
+
+### 记忆检索的 RRF 融合排序
+
+当 Agent 自动搜索相关记忆（或用户手动调用 `search_memory`）时，检索过程分三步：
+
+**第一步：FTS5 Trigram 全文搜索** — 利用 SQLite FTS5 的 trigram tokenizer 对中文进行分词匹配。关键词长度 ≥3 字符时走 FTS5 索引；短词或 FTS5 无结果时回退到 `LIKE` 模糊匹配。
+
+**第二步：向量语义搜索** — 通过本地或远程 Embedding 服务生成查询文本的向量，与 `embeddings` 表中存储的所有记忆向量计算余弦相似度，返回 similarity ≥ 0.35 的结果。
+
+**第三步：RRF 融合排序** — 综合两种搜索结果的排序位置、语义相似度、时间衰减因子、重要性微调系数，按公式 `0.75 × RRF分数 × (0.5 + similarity) × importance_factor + 0.25 × recency_score` 计算最终得分，取 top N。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L525-L581)
+
+### 手动搜索（Agent 主动回溯）
+
+Agent 可以通过 `search_memory` 工具在对话中主动回溯历史：
+- `scope="session"`：搜索当前会话的原始对话记录（非 memory 类型）
+- `scope="memory"`（默认）：跨会话搜索记忆，可配合 `memory_type` 过滤特定类型
+- `days=N`：限定时间范围
+- 搜索结果会更新 `last_access_at` 时间戳，影响后续 RRF 排序中的时间衰减因子
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L826-L900)
+
+## 存储架构全景
+
+三种记忆类型的存储最终落在同一个数据库的同一张表上，通过 `role` 和 `memory_type` 字段区分：
+
+```
+数据库: pocket_agent.db
+├── conversations 表           # 会话元数据（id, title, 时间戳）
+├── messages 表                # 所有消息 + 记忆
+│   ├── role = 'user'         → 用户消息
+│   ├── role = 'assistant'    → AI 回复
+│   ├── role = 'memory'       → 记忆（由 memory_type 进一步区分）
+│   │   ├── memory_type = 'fact'     → 事实记忆
+│   │   ├── memory_type = 'episodic' → 事件记忆
+│   │   └── memory_type = 'dance'    → 舞蹈记忆
+│   └── 附加字段：importance, last_access_at, memory_type
+├── messages_fts (虚拟表)      # FTS5 trigram 全文索引（触发器自动同步）
+└── embeddings 表             # 向量索引（id → BLOB，独立异步维护）
+```
+
+用户画像文件: memory/user_profile.md ← 独立存储，不进入数据库
+
+Schema 定义参见 app.py 的 `_init_db()` 方法，FTS5 虚拟表使用 trigram tokenizer 以支持中文搜索，通过三个触发器（INSERT/DELETE/UPDATE）与 messages 表保持同步。
+
+Sources: [app.py](app.py#L64-L146)
+
+## 设计哲学
+
+这套分层记忆架构的核心设计原则可以概括为：
+
+**隔离持久性** — 用户画像是人的长期属性，与具体项目无关，独立存储避免污染。事实记忆和事件记忆随项目生命周期变化，统一存储在 SQLite 中便于管理。
+
+**语义优先排序** — RRF 融合排序以语义相关性为主排序信号，重要性仅作为微调因子（0.8-1.2 范围），避免低语义相关的内容因高分而错误出现在检索结果中。
+
+**自动与手动互补** — 系统自动注入 top 3 相关记忆覆盖 80% 的需求场景，剩余 20% 通过 `search_memory` 工具手动检索。舞蹈类记忆（数据量大）默认不自动注入，避免 token 浪费。
+
+**存储门禁** — Agent 的系统提示词严格禁止通过 `file_write` 绕过记忆系统直接操作文件。所有记忆写入必须走 `save_memory` 工具，确保 FTS5 索引和向量索引的一致性。
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L12-L23)
+
+## 总结
+
+分层记忆架构通过三类存储 — 文件化的用户画像、结构化的 SQLite 记忆表、双重索引（FTS5 + 向量）— 实现了从永久个人信息到临时事件记录的完整覆盖。自动注入机制让 Agent 在不感知数据库细节的情况下自然使用记忆，RRF 融合排序确保相关性最高的记忆被优先使用。这套架构的下一层是其存储与检索的具体实现，包括 [SQLite + FTS5 全文搜索（trigram 中文支持）](16-sqlite-fts5-quan-wen-sou-suo-trigram-zhong-wen-zhi-chi)、[向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du)、[RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue) 这三个专题。

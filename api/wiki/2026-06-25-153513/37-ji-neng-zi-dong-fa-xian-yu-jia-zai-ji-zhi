@@ -1,0 +1,264 @@
+Pocket-Agent 的技能系统采用**文件系统驱动**的自动发现模式——技能以 SKILL.md 知识文档的形式存放在约定目录中，Agent 启动时自动扫描目录树，将技能清单注入系统提示词，使 LLM 知晓可用技能并通过 `file_read` 工具按需读取执行指导。这一设计实现了"技能即文件"的极简扩展范式：添加一项技能只需在对应目录下创建一个符合格式的 SKILL.md 文件，系统无需重启、无需注册、无需修改代码。
+
+---
+
+## 技能目录布局与职责划分
+
+系统维护三个独立技能目录，分别服务于主 Agent、子 Agent 和自动沉淀流程，三者通过 `agent/config.py` 中的路径常量统一定义：
+
+| 目录 | 配置常量 | 用途 | 加载目标 |
+|------|----------|------|----------|
+| `agent/skills/main-skills/` | `SKILLS_DIR` | 主 Agent 的开发类、手机操控类技能 | 主 Agent 提示词 |
+| `agent/skills/executor-skills/` | `EXECUTOR_SKILLS_DIR` | 子 Agent 的快速模式、操控指南等 | 子 Agent 提示词 |
+| `agent/skills/auto-skills/executor/` | `AUTO_SKILLS_DIR` + `"executor"` | 执行经验自动沉淀的技能 | 子 Agent 提示词（叠加加载） |
+
+Sources: [config.py](agent/config.py#L34-L48)
+
+每个目录下的技能以**子目录 + SKILL.md** 的形式组织，支持两种布局模式：
+
+**平坦模式**（Flat）——子目录直接包含 SKILL.md，无分类层级。例如 `executor-skills/fast-mode/SKILL.md` 中，技能名称为 `fast-mode`，分类为空。
+
+**分类模式**（Category）——子目录作为分类名，其下再嵌套技能子目录。例如 `main-skills/dev/code-review/SKILL.md`，分类为 `dev`，技能名称为 `code-review`。该模式支持一层嵌套，更深层级不会被递归扫描。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L70-L113)
+
+---
+
+## 发现机制：`_scan_skills` 扫描算法
+
+核心扫描函数 `_scan_skills(scan_dir)` 在给定目录中执行**两阶段发现**，返回 `(category_name, skill_name, desc, skill_path)` 四元组列表：
+
+```
+扫描算法伪代码：
+
+for each entry in sorted(scan_dir):
+    if entry 不是目录: continue
+    
+    # 阶段一：平坦模式检查
+    if entry 下存在 SKILL.md (不区分大小写):
+        desc = 读取前20行中的 description: 字段
+        results.append(("", entry_name, desc, skill_path))
+        continue  # 跳过阶段二
+    
+    # 阶段二：分类模式检查
+    for each sub_entry in sorted(entry):
+        if sub_entry 下存在 SKILL.md:
+            desc = 读取 description 字段
+            results.append((entry_name, sub_entry_name, desc, skill_path))
+```
+
+关键细节：
+- **SKILL.md 文件名不区分大小写**：`SKILL_FILE_NAMES = ["SKILL.md", "skill.md"]`，兼容不同创建习惯
+- **目录排序**：使用 `sorted(os.listdir(...))` 保证扫描结果顺序稳定
+- **description 读取**：`_read_skill_desc()` 仅读取文件前 20 行中 `description:` 开头的行，避免大文件 I/O 开销
+- **支持空分类**：平坦模式中 `category_name` 为空字符串，在格式化输出时被忽略
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L55-L113)
+
+---
+
+## 加载机制：`load_skills_list` 格式化注入
+
+`load_skills_list(agent_type)` 是技能加载的对外接口，按 Agent 类型自动选择目录并格式化输出：
+
+- **主 Agent**（`agent_type="main"`）：仅扫描 `SKILLS_DIR`（`main-skills/`）
+- **子 Agent**（`agent_type="executor"`）：扫描 `EXECUTOR_SKILLS_DIR`（`executor-skills/`）**叠加** `AUTO_SKILLS_DIR/executor/`（自动沉淀技能）
+
+格式化输出示例结构：
+```
+【dev】
+- code-review: 执行全面的代码审查（路径：.../main-skills/dev/code-review/SKILL.md）
+- skill-creator: 创建和沉淀技能（路径：.../main-skills/dev/skill-creator/SKILL.md）
+
+【phone】
+- phone-control-quickref: 手机操控快速参考（路径：.../main-skills/phone/phone-control-quickref/SKILL.md）
+
+使用说明：需要用某个技能时，用file_read读取对应SKILL.md即可
+```
+
+输出末尾自动追加 `file_read` 使用示例，以第一个技能的路径为模板，引导 LLM 正确读取。
+
+此外，`load_skills_for_completer()` 提供了面向自动补全的结构化接口，返回 `(skill_names_list, descriptions_dict, info_dict)` 三元组，供终端 UI 的 Tab 补全功能使用。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L116-L178)
+
+---
+
+## 提示词注入：技能清单的系统级嵌入
+
+技能清单并非在运行时动态附加，而是在 Agent 创建/子 Agent 启动时**一次性注入系统提示词**，成为 LLM 认知的静态组成部分：
+
+**主 Agent 流程**（`_create_agent` 方法）：
+1. 调用 `load_skills_list("main")` 格式化技能清单
+2. 结合 `agent_enhance_prompt` 模板，将技能清单填入 `{skills_list}` 占位符
+3. 同时填入 `{tool_names}`（工具列表）和 `{tasks_dir}`/`{logs_dir}`（路径提示）
+4. 组合后的完整提示词作为 `system_prompt` 传入 `create_agent()`
+
+```python
+enhanced_system_prompt = self.base_system_prompt + "\n\n" + agent_enhance_prompt.format(
+    tool_names=tool_names,
+    skills_list=skills_list,
+    tasks_dir=TASKS_DIR,
+    logs_dir=LOGS_DIR
+)
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L773-L779)
+
+**子 Agent 流程**（`_run_executor_foreground` 方法）：
+1. 调用 `load_skills_list("executor")` 格式化技能清单（含自动沉淀技能）
+2. 填入 `executor_enhance_prompt` 的 `{skills_list}` 占位符
+3. 将增强后的内容替换 `executor_system_prompt` 中的 `{tool_rules_and_skills}` 占位符
+
+```python
+executor_skills = load_skills_list("executor")
+enhanced = executor_enhance_prompt.format(
+    tool_names=executor_tool_names_str,
+    skills_list=executor_skills,
+)
+system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1600-L1608)
+
+---
+
+## 自动沉淀：执行经验的闭环积累
+
+自动沉淀技能（auto-skills）是系统的**自我进化闭环**——子 Agent 每次执行多步骤任务后，自动将执行路径、包名、坐标、操作步骤、失败经验沉淀为 SKILL.md，供后续任务复用。
+
+**触发条件**（严格的三重门禁）：
+1. 任务步骤数 `>= 3`（单/两步简单任务无需沉淀）
+2. 任务目标 `objective` 非空
+3. 任务无失败（`has_failures == False`）
+4. 子 Agent 实际执行了有效操作（`executor_step > 2`，即至少调用过 3 次工具）
+
+**沉淀流程**：
+1. **技能名称生成**：从 `objective` 字符串提取字母数字和下划线，最长 50 字符。例如 "去拼多多买一双黑色的鞋" → `pinduoduo_buy_shoes`
+2. **子 Agent 继续执行**：不重新创建 LLM 调用，复用已有上下文，追加沉淀指令
+3. **增量写入**：先尝试 `file_read` 检查技能文件是否存在；存在且完整则跳过；不存在或不完整则 `file_write` 创建/更新
+4. **格式校验**：系统读取前 500 字符，检查是否以 `---` 开头且包含 `name:` 和 `description:` 字段
+5. **格式修正**：格式不合规时，指示子 Agent 读取 `skill-creator` 模板后重写
+
+```
+沉淀指令模板：
+"任务已完成。现在请沉淀本次任务的技能。
+本次任务技能路径：`agent/skills/auto-skills/executor/{skill_name}/SKILL.md`
+操作步骤：
+1. 用 file_read 尝试读取
+2. 如果文件存在且内容完整 → 跳过
+3. 如果文件不存在或内容不完整 → 用 file_write 创建/更新
+技能内容需包含：包名、关键坐标、操作步骤、失败经验。
+**禁止扫描目录或检查其他技能！**"
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1936-L2029)
+
+---
+
+## 技能消费：Agent 如何使用 SKILL.md
+
+技能清单被注入提示词后，LLM 知道存在哪些技能及其路径，但**内容需要按需读取**。这是技能（知识文档）与工具（可执行函数）的核心区别：
+
+1. **清单认知**：系统提示词中的技能清单让 LLM 知晓"有什么技能可用"
+2. **按需读取**：LLM 在执行相关任务时，调用 `file_read` 工具读取对应 SKILL.md 获取操作指导
+3. **禁止重复读取**：提示词中明确要求"已读过的技能不要重复读取"
+4. **多技能组合**：子 Agent 执行手机操控任务时，需同时读取 `phone-control-guide`、`neuralbridge-operation-standard` 和任务相关的技能
+
+这种设计避免了将完整技能内容塞入提示词导致的 token 浪费，仅在需要时才按路径读取，实现了知识面（大量技能可用）和上下文效率（仅加载用到的技能）的平衡。
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L59-L63)
+
+---
+
+## 架构总览
+
+以下时序图展示了技能从发现到消费的完整生命周期：
+
+```mermaid
+sequenceDiagram
+    participant FS as 文件系统<br/>(agent/skills/)
+    participant Scanner as _scan_skills()
+    participant Loader as load_skills_list()
+    participant Prompt as 系统提示词
+    participant LLM as 大语言模型
+    participant Tool as file_read 工具
+
+    Note over FS: 开发者/子Agent<br/>创建SKILL.md
+    
+    FS->>Scanner: 目录树扫描
+    Scanner->>Scanner: 平坦模式/分类模式检测
+    Scanner->>Scanner: 读取description字段(前20行)
+    Scanner-->>Loader: (category, name, desc, path) 列表
+    
+    Loader->>Loader: 按分类分组格式化
+    Loader->>Loader: 追加file_read使用说明
+    Loader-->>Prompt: 注入 {skills_list}
+    
+    Note over Prompt: Agent创建时一次性注入
+    
+    Prompt-->>LLM: 技能清单(名称+路径+描述)
+    
+    Note over LLM: 任务需要某个技能时
+    
+    LLM->>Tool: file_read('.../SKILL.md')
+    Tool-->>FS: 读取文件内容
+    FS-->>LLM: 完整的操作指导
+    LLM->>LLM: 按指导执行操作
+    
+    Note over FS: 子Agent执行完毕后
+    
+    subgraph 自动沉淀
+        LLM->>Tool: file_write 创建/更新 SKILL.md
+        Tool-->>FS: 写入自动沉淀技能
+        Scanner->>Scanner: 下次启动自动发现
+    end
+```
+
+---
+
+## 对比总结：技能 vs 工具
+
+| 维度 | 技能 (SKILL.md) | 工具 (Tool) |
+|------|-----------------|-------------|
+| **本质** | 知识文档 | 可执行函数 |
+| **消费方式** | `file_read` 读取 | `tool_call` 调用 |
+| **发现机制** | 文件系统扫描 | Python 代码注册 |
+| **添加方式** | 创建 SKILL.md 文件 | 编写函数 + `@tool` 装饰器 |
+| **内容存储** | 磁盘 Markdown 文件 | 运行时内存 |
+| **作用域** | 指导 Agent 如何做 | 替 Agent 直接做 |
+| **自动生成** | 子 Agent 可自动沉淀 | 需开发者手动编写 |
+
+---
+
+## 扩展实践：如何添加新技能
+
+添加一个主 Agent 技能只需三步：
+
+1. 在 `agent/skills/main-skills/` 下创建子目录（如 `my-skill/`）
+2. 在目录中创建 `SKILL.md`，包含 frontmatter 元数据
+3. 重启 Agent 即可自动发现
+
+```markdown
+---
+name: my-skill
+description: 一句话描述该技能的用途
+---
+
+# 我的技能
+
+## 执行步骤
+1. 步骤一描述
+2. 步骤二描述
+
+## 注意事项
+- 关键配置和参数
+```
+
+系统在下次 Agent 创建时自动扫描并加载，无需注册、无需导入、无需重启服务。
+
+Sources: [main-skills](agent/skills/main-skills/) | [executor-skills](agent/skills/executor-skills/) | [auto-skills](agent/skills/auto-skills/executor/)
+
+---
+
+> **下一步**：理解技能如何与提示词工程协作，参阅 [系统提示词结构（基础人设 + 增强规则 + 技能注入）](38-xi-tong-ti-shi-ci-jie-gou-ji-chu-ren-she-zeng-qiang-gui-ze-ji-neng-zhu-ru)。了解子 Agent 如何独立使用技能集，参阅 [子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi)。

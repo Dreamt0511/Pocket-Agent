@@ -1,0 +1,282 @@
+本页深入解析 Pocket-Agent 记忆系统中的关键词检索层——基于 SQLite FTS5 虚拟表与 trigram tokenizer 的全文搜索实现。这是分层记忆检索流水线的第一环（关键词匹配），与向量语义搜索（第二环）通过 RRF 融合排序策略形成混合检索体系。
+
+---
+
+## 架构概览：FTS5 外部内容表的中文全文检索方案
+
+Pocket-Agent 采用 SQLite FTS5 的**外部内容表（external content table）**模式：`messages_fts` 作为一个虚拟表，不实际存储文本副本，而是指向 `messages` 表的 `content` 列。这种设计避免了数据冗余，确保全文索引与源数据始终一致。
+
+```mermaid
+graph TD
+    subgraph "物理表 (messages)"
+        M1["messages 表<br/>id, conversation_id, role, content,<br/>timestamp, importance, memory_type"]
+    end
+
+    subgraph "FTS5 虚拟表 (messages_fts)"
+        F1["messages_fts<br/>content (指向 messages.content)<br/>content_rowid -> messages.id<br/>tokenize='trigram'"]
+    end
+
+    subgraph "同步触发器"
+        T1["AFTER INSERT →<br/>INSERT INTO messages_fts"]
+        T2["AFTER DELETE →<br/>'delete' 操作"]
+        T3["AFTER UPDATE →<br/>'delete' 旧值 + INSERT 新值"]
+    end
+
+    M1 -->|"INSERT"| T1
+    M1 -->|"DELETE"| T2
+    M1 -->|"UPDATE"| T3
+    T1 -->|"同步索引"| F1
+    T2 -->|"同步索引"| F1
+    T3 -->|"同步索引"| F1
+
+    subgraph "检索入口"
+        S1["_fts_search()<br/>basic_tools.py"]
+        S2["search_messages API<br/>app.py"]
+    end
+
+    F1 -->|"MATCH 查询<br/>ORDER BY rank"| S1
+    F1 -->|"MATCH 查询<br/>ORDER BY rank"| S2
+    M1 -->|"JOIN 获取完整行"| S1
+    M1 -->|"JOIN 获取完整行"| S2
+```
+
+外部内容表的核心优势在于：`messages` 表的数据修改**不需要双重写入**，触发器自动维护 FTS 索引，构建索引时 FTS5 直接读取 `messages.content` 列的原始内容。这意味着一份数据、两套访问路径（主键查询 + 全文搜索），存储开销仅体现在 FTS5 的倒排索引上。
+
+Sources: [app.py](../app.py#L105-L144), [main.py](../main.py#L74-L108), [basic_tools.py](../agent/tools/basic_tools.py#L386-L469)
+
+---
+
+## Trigram Tokenizer：中文全文搜索的关键技术
+
+### 为什么需要 trigram
+
+中文文本不同于英文，词与词之间**没有空格分隔**。FTS5 默认的 `unicode61` tokenizer 按空格和标点分词，对中文连续文本几乎失效——"我今天去了天安门"会被当作一个完整的 token，搜索"天安门"时无法匹配（除非字符串完全相等）。
+
+**Trigram（三字符组）** tokenizer 解决了这个问题：它将文本切分为所有连续的三个字符组成的滑动窗口。例如：
+
+```
+"我今天去了天安门"
+→ 【我今天, 今天去, 天去了, 去了天, 了天安, 天安门】
+```
+
+这样，搜索"天安门"时，FTS5 会在索引中匹配到 `天安门` 这个 trigram，实现中文子串级别的高效检索。
+
+### 精确匹配 vs 模糊匹配的权衡
+
+Trigram 的粒度介于单字（uni-gram）和整词（word）之间：
+- 比 uni-gram 更精确（"天安门"不会因为匹配"天"和"安"而误中无关内容）
+- 比 word 更灵活（不需要中文分词器，零依赖，覆盖所有中文文本）
+
+代价是索引体积稍大（约为原文的 2-3 倍），但对移动端记忆搜索的场景完全可以接受。
+
+### DDL 定义
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts 
+USING fts5(
+    content,              -- 索引的列名
+    content=messages,     -- 外部内容表
+    content_rowid=id,     -- 关联的行 ID
+    tokenize='trigram'    -- 三字符组分词器
+);
+```
+
+其中 `content` 既是虚拟表的列名，也是 `messages` 表中要被索引的列。FTS5 通过 `content=messages` 知道源表名，通过 `content_rowid=id` 知道主键映射。
+
+Sources: [app.py](../app.py#L118-L121), [main.py](../main.py#L85-L89)
+
+---
+
+## 三层触发器：增量索引同步的工程细节
+
+当 `messages` 表发生数据变更时，FTS5 索引不会自动更新。Pocket-Agent 通过三个 SQLite 触发器实现**实时增量同步**：
+
+| 触发器 | 触发时机 | 操作 |
+|--------|----------|------|
+| `messages_fts_ai` | AFTER INSERT | 直接 `INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content)` |
+| `messages_fts_ad` | AFTER DELETE | 调用 FTS5 删除命令：`INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content)` |
+| `messages_fts_au` | AFTER UPDATE | 先删除旧值，再插入新值（组合前两个操作） |
+
+其中 `'delete'` 是 FTS5 的内部命令语法——向 FTS 表插入特殊行来标记删除，而非真的 SQL DELETE。
+
+### 首次全量重建
+
+仅在**第一次建表时**执行全量重建：
+
+```python
+if fts_was_created:
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+```
+
+`'rebuild'` 命令指示 FTS5 扫描整个 `messages` 表，为所有已有数据构建倒排索引。后续的每次 INSERT/UPDATE/DELETE 都由触发器增量维护，不再需要全量扫描。
+
+### 旧表自动迁移
+
+系统内置了向后兼容检查：如果检测到已有的 `messages_fts` 表的 DDL 中不包含 `trigram`（说明是用旧的默认 tokenizer 创建的），会自动**先 DROP 再重建**，确保所有实例最终都使用 trigram tokenizer：
+
+```python
+existing_fts = conn.execute(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+).fetchall()
+
+if existing_fts and "trigram" not in (existing_fts[0][0] or ""):
+    conn.execute("DROP TABLE IF EXISTS messages_fts")
+    # ... 也删除三个触发器 ...
+    existing_fts = []  # 标记为不存在，强制重新建表
+```
+
+Sources: [app.py](../app.py#L107-L144), [main.py](../main.py#L75-L108)
+
+---
+
+## 双路径初始化：main.py 与 app.py 的同步策略
+
+Pocket-Agent 有两种运行模式（终端交互模式 `main.py` 和 HTTP API 模式 `app.py`），两种模式共享同一个 `pocket_agent.db` 数据库文件。因此，FTS5 的建表逻辑在**两个文件中独立实现**，但执行完全相同的 DDL：
+
+| 特征 | main.py | app.py |
+|------|---------|--------|
+| 数据库驱动 | `sqlite3`（同步） | `aiosqlite`（异步） |
+| 触发时机 | 函数入口 `_init_db()` | FastAPI startup 事件 |
+| 建表逻辑 | 完全一致 | 完全一致 |
+| WAL 模式 | `PRAGMA journal_mode=WAL` | `PRAGMA journal_mode=WAL` |
+
+这样的设计保证了无论以哪种方式启动系统，FTS5 索引都会被正确初始化。先启动的进程创建表，后启动的检测到已存在则跳过。
+
+Sources: [main.py](../main.py#L37-L111), [app.py](../app.py#L105-L146)
+
+---
+
+## 两级检索策略：FTS5 主攻 + LIKE 兜底
+
+`_fts_search()` 函数实现了智能的两级检索策略，优雅地处理中英文混合查询的边界情况。
+
+```mermaid
+flowchart TD
+    Q["用户查询"] --> S["按空格分词"]
+    S --> L{"关键词长度 >= 3?"}
+    L -->|"是"| FT["策略1: FTS5 trigram MATCH<br/>OR 连接所有长词<br/>ORDER BY rank LIMIT 20"]
+    L -->|"否"| FK["短词 < 3字符"]
+    FT --> R{"有结果?"}
+    R -->|"有"| DONE["返回结果"]
+    R -->|"无 或 有短词"| FB["策略2: LIKE 兜底"]
+    FK --> FB
+    FB --> SPLIT{"中文无空格连续文本<br/>>=4字?"}
+    SPLIT -->|"是"| CUT["按2字切分<br/>'动作舞蹈'→['动作','舞蹈']"]
+    SPLIT -->|"否"| ORIG["原词使用"]
+    CUT --> SQL_OR["OR 连接所有 LIKE 条件<br/>ORDER BY length ASC,<br/>timestamp DESC LIMIT 20"]
+    ORIG --> SQL_OR
+    SQL_OR --> DONE
+```
+
+### 策略 1：FTS5 trigram 精确搜索
+
+仅对长度 >= 3 字符的关键词执行 FTS5 MATCH 查询。多个关键词通过 `OR` 连接，FTS5 的 `rank`（内置 BM25 变体排序）保证相关性最高的结果排在最前。
+
+```python
+long_keywords = [k for k in keywords if len(k) >= 3]
+fts_query = " OR ".join(long_keywords)
+fts_rows = conn.execute(
+    """SELECT m.id, m.conversation_id, m.role, m.content, ...
+        FROM messages_fts fts JOIN messages m ON fts.rowid = m.id
+        WHERE fts MATCH ?{fts_where_extra}
+        ORDER BY rank LIMIT 20""",
+    [fts_query] + params
+).fetchall()
+```
+
+### 策略 2：LIKE 兜底搜索
+
+当存在短词（<3 字符，如"是""的""了"）或 FTS5 返回空结果时，自动降级为 `LIKE '%keyword%'` 模式匹配。对于连续中文（>=4 字），采用**滑动 2-gram 切分**：`"动作舞蹈"` → `["动作", "舞蹈"]`，用 `OR` 连接所有 2-gram 条件。
+
+```python
+# 中文查询分词：空格分割 + 无空格中文按2字切分
+def _split_chinese_query(query: str) -> list:
+    for part in query.split():
+        if re.search(r'[一-鿿]{4,}', part):
+            chars = re.findall(r'[一-鿿]', part)
+            if len(chars) >= 4:
+                for i in range(len(chars) - 1):
+                    tokens.append(chars[i] + chars[i + 1])
+```
+
+LIKE 查询的结果按 `length(m.content) ASC, m.timestamp DESC` 排序——优先返回较短的消息（更可能精确匹配），同长度则按时间倒序。
+
+Sources: [basic_tools.py](../agent/tools/basic_tools.py#L386-L469), [basic_tools.py](../agent/tools/basic_tools.py#L368-L383)
+
+---
+
+## HTTP API 层的 FTS5 搜索
+
+`app.py` 暴露了一个 GET 端点用于全文搜索：
+
+```
+GET /conversations/{conversation_id}/search?q=关键词&cross_session=true
+```
+
+参数设计：
+- `conversation_id`：路径参数，指定会话上下文
+- `q`：查询字符串（FTS5 通配符语法）
+- `cross_session`：布尔值，`false`（默认）仅搜索当前会话，`true` 跨所有会话搜索
+
+FTS5 特殊字符通过双引号包裹整个查询来转义：
+
+```python
+safe_q = f'"{q}"'
+```
+
+搜索结果按 `importance DESC, rank` 排序——重要性高的记忆优先，同重要性下按 BM25 相关性排序，取前 20 条。
+
+Sources: [app.py](../app.py#L754-L781)
+
+---
+
+## 混合检索集成：agent 层如何使用 FTS5
+
+FTS5 全文搜索在 Agent 运行时有两个集成入口：
+
+### 自动记忆注入
+
+每次用户发送消息时，`_search_relevant_memories` 方法会自动触发混合检索：
+
+```python
+def _do_search():
+    fts_results = _fts_search(query, msg_type="memory")    # 关键词检索
+    vec_results = _vector_search(query, msg_type="memory")  # 语义检索
+    return _rrf_merge(fts_results, vec_results, top_n=3)   # RRF 融合
+```
+
+FTS5 和向量搜索的结果通过 RRF（Reciprocal Rank Fusion）融合排序，取 top 3 注入到 Agent 的上下文提示中（排除 dance 类型的记忆以节省 token）。
+
+### 主动记忆搜索工具
+
+`search_memory` 工具允许 Agent 在对话中主动搜索更多记忆：
+- `scope="memory"`（默认）：跨会话搜索 → 同时执行 FTS5 + 向量搜索 → RRF 融合，返回 top 5
+- `scope="session"`：仅搜索当前会话原始对话 → 纯 FTS5 关键词搜索（排除 memory 类型）
+
+搜索到的记忆（role = "memory"）还会更新 `last_access_at` 时间戳，支持后续的记忆清理策略判断。
+
+Sources: [agent_langchain.py](../agent/agent_langchain.py#L711-L730), [basic_tools.py](../agent/tools/basic_tools.py#L825-L899)
+
+---
+
+## 边界情况与设计权衡
+
+| 场景 | 处理方式 | 说明 |
+|------|----------|------|
+| 中文单字搜索（如"好"） | 降级到 LIKE | FTS5 trigram 至少需要 3 字符，单/双字自动走 LIKE 兜底 |
+| 超长中文无空格文本 | 2-gram 切分 | 连续 4 字以上自动拆成相邻 2 字组合，覆盖多数中文双字词 |
+| FTS5 特殊字符（`*`, `"`, `(` 等） | 全局双引号包裹 | API 层统一处理，将整个查询转为精确短语匹配 |
+| 同时搜索多个类型 | 过滤条件叠加 | `conversation_id`、`days`、`msg_type`、`memory_type` 可任意组合 |
+| 并发访问下的性能 | WAL 模式 + busy_timeout | SQLite WAL 模式支持读写并发，`busy_timeout=5000` 避免锁冲突 |
+| 数据库损坏恢复 | 兼容重建 | 检测到非 trigram 旧表时自动 DROP 重建，重新 `rebuild` |
+
+---
+
+## 下一步阅读
+
+完整的记忆检索流程并非只有 FTS5。理解以下相邻页面的内容将帮助你掌握整个分层记忆架构：
+
+- **[向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du)** — FTS5 的互补层，处理同义词、语义近似的搜索需求
+- **[RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue)** — 将 FTS5（关键词）和向量搜索（语义）的结果融合为统一的排序列表
+- **[记忆工具使用（save_memory / search_memory / update_user_profile）](19-ji-yi-gong-ju-shi-yong-save_memory-search_memory-update_user_profile)** — Agent 调用记忆系统的实际工具接口
+- **[记忆清理与向量索引维护](21-ji-yi-qing-li-yu-xiang-liang-suo-yin-wei-hu)** — FTS5 索引的长期维护与过期数据清理

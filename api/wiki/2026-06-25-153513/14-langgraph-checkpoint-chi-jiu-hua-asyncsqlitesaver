@@ -1,0 +1,277 @@
+LangGraph 的 Checkpoint 机制是对话状态持久化的基石——它将每一轮交互后的 Agent 状态（消息历史、工具调用中间结果）以结构化方式写入存储，使得服务重启后能够无缝恢复对话上下文。Pocket-Agent 采用 **AsyncSqliteSaver** 作为生产级持久化方案，同时保留了到 **MemorySaver** 的优雅降级路径，兼顾可靠性与部署灵活性。
+
+## 架构定位：双层级持久化模型
+
+理解 AsyncSqliteSaver 的角色，需要先区分 Pocket-Agent 中的两层持久化：
+
+```mermaid
+flowchart TB
+    subgraph "应用层持久化（app.py 维护）"
+        A1[conversations 表<br/>会话元数据] 
+        A2[messages 表<br/>每条消息明文存储]
+        A3[messages_fts FTS5 全文索引<br/>支持中文搜索]
+    end
+
+    subgraph "LangGraph Checkpoint 层（AsyncSqliteSaver 维护）"
+        B1[checkpoints 表<br/>每个 thread_id 的状态快照]
+        B2[writes 表<br/>状态变更的增量写入]
+    end
+
+    subgraph "降级路径"
+        C[MemorySaver<br/>内存状态，重启丢失]
+    end
+
+    Agent[LangChainPocketAgent] -->|通过 create_agent 注入| B1
+    Agent -->|astream / aget_state 自动读写| B1
+    A1 ---|thread_id == conversation_id| B1
+    
+    B1 -.->|异常降级| C
+```
+
+**关键设计决策**：应用层（`messages` 表）和 Checkpoint 层（`checkpoints`/`writes` 表）共用同一个 SQLite 数据库文件 `pocket_agent.db`，但由不同的代码路径管理。应用层负责消息的明文存储和全文搜索，Checkpoint 层负责 LangGraph 内部的状态机恢复。两者通过 `thread_id`（即 `conversation_id`）关联。
+
+Sources: [app.py](app.py#L30-L31), [app.py](app.py#L67-L84), [app.py](app.py#L179-L193)
+
+## AsyncSqliteSaver 初始化流程
+
+AsyncSqliteSaver 的初始化在两个入口点完全一致地实现：`app.py`（HTTP API 模式）和 `main.py`（终端交互模式）。
+
+```mermaid
+sequenceDiagram
+    participant App as app.py / main.py
+    participant SQLite as aiosqlite 连接
+    participant Saver as AsyncSqliteSaver
+    participant LangGraph as LangGraph 内部表
+
+    App->>SQLite: aiosqlite.connect(DB_PATH)
+    App->>SQLite: PRAGMA journal_mode=WAL
+    App->>SQLite: PRAGMA busy_timeout=30000
+    App->>Saver: AsyncSqliteSaver(conn)
+    App->>Saver: await saver.setup()
+    Saver->>LangGraph: CREATE TABLE IF NOT EXISTS checkpoints
+    Saver->>LangGraph: CREATE TABLE IF NOT EXISTS checkpoint_writes
+    LangGraph-->>App: ✅ 持久化就绪
+    
+    Note over App, LangGraph: 若任一环节抛出异常
+    
+    App->>App: 捕获 Exception
+    App->>App: 降级为 MemorySaver()
+    App->>App: ⚠️ 记录日志警告
+```
+
+核心的初始化代码展示了**双重保障**策略：
+
+```python
+# app.py 第179-193行
+try:
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    _checkpoint_conn = await aiosqlite.connect(DB_PATH)
+    await _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+    await _checkpoint_conn.execute("PRAGMA busy_timeout=30000")
+    _checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
+    await _checkpoint_saver.setup()
+except Exception as e:
+    from langgraph.checkpoint.memory import MemorySaver
+    _checkpoint_saver = MemorySaver()
+```
+
+Sources: [app.py](app.py#L179-L193), [main.py](main.py#L122-L136)
+
+### `setup()` 的内部机制
+
+`AsyncSqliteSaver.setup()` 是 LangGraph 框架的方法，它在底层 SQLite 连接上执行 DDL，自动创建两张内部表：
+- **`checkpoints`**：存储每个 `thread_id` 的最新状态快照，包含完整的消息列表和配置信息
+- **`checkpoint_writes`**（或简称 `writes`）：存储状态变更的增量写入日志，支持并发写入时的冲突解决
+
+这两张表由 LangGraph 框架管理，Pocket-Agent 不直接操作其模式，仅在清理会话时执行 `DELETE` 操作。
+
+Sources: [app.py](app.py#L186-L187), [app.py](app.py#L845-L846)
+
+## 基于 thread_id 的会话隔离
+
+Pocket-Agent 在 HTTP API 模式下维护一个**单例 Agent 实例**，通过不同的 `thread_id` 实现多会话隔离。这种设计的核心优势是：多个用户或会话共享同一个 Agent 对象，但 Checkpoint 机制确保各自的状态互不干扰。
+
+```python
+# app.py 第254-282行（简化）
+_agent_instance = None  # 单例 Agent
+
+def _get_or_create_agent(llm_config):
+    global _agent_instance
+    # LLM 配置未变化时复用已有实例
+    if _agent_instance is not None and config_key matches:
+        return _agent_instance
+    _agent_instance = LangChainPocketAgent(
+        llm_config=llm_config, 
+        checkpointer=_checkpoint_saver  # 共享 checkpointer
+    )
+    return _agent_instance
+```
+
+在 Agent 内部，`stream_conversation()` 方法根据传入的 `thread_id` 决定加载哪个会话的 Checkpoint：
+
+```python
+# agent/agent_langchain.py 第1284-1292行
+actual_thread_id = thread_id or self.config["configurable"]["thread_id"]
+config = {
+    "configurable": {"thread_id": actual_thread_id},
+    "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+}
+```
+
+当 LangGraph 的 `astream()` 使用这个 `config` 运行时，Checkpoint 机制自动将 `thread_id` 作为状态隔离键——不同 `thread_id` 拥有独立的消息历史。这意味着：
+
+| 场景 | thread_id 策略 | Checkpoint 行为 |
+|------|----------------|-----------------|
+| 新对话 | 生成新 UUID | 从空状态开始，首次写入时创建 checkpoint |
+| 恢复对话 | 使用已有 conversation_id | 加载该 thread_id 的最新 checkpoint |
+| 清空历史 | 旧 thread_id → 映射到新 UUID | 旧 checkpoint 变为孤儿数据，新消息写入新 thread_id |
+
+Sources: [app.py](app.py#L263-L282), [agent/agent_langchain.py](agent/agent_langchain.py#L1284-L1292)
+
+## 会话切换与历史恢复
+
+### switch_conversation：加载已有 Checkpoint
+
+当用户在终端模式下执行 `/resume` 命令时，系统调用 `switch_conversation()` 将 Agent 的 `config` 切换到目标会话的 `thread_id`：
+
+```python
+# agent/agent_langchain.py 第1540-1551行
+def switch_conversation(self, thread_id: str) -> None:
+    """切换到指定会话（恢复 checkpoint 中的对话历史）"""
+    # 清除该 thread_id 的重映射（如果有），恢复原始 thread_id
+    self._thread_id_map.pop(thread_id, None)
+    self.config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+    }
+```
+
+切换后，下一次 `astream()` 调用时，LangGraph 会从 `checkpoints` 表中读取该 `thread_id` 对应的历史状态，Agent 自动"恢复记忆"。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1540-L1551), [main.py](main.py#L321-L346)
+
+### clear_history：生成新会话隔离
+
+`clear_history()` 采用**映射重定向**策略——不为旧 `thread_id` 删除任何数据，而是将其映射到一个新生成的 UUID：
+
+```python
+# agent/agent_langchain.py 第1524-1537行
+def clear_history(self, thread_id: str = None) -> None:
+    if thread_id:
+        self._thread_id_map[thread_id] = str(uuid.uuid4())
+    else:
+        self.config["configurable"]["thread_id"] = str(uuid.uuid4())
+```
+
+这种设计的好处是：旧数据物理存在，可通过 `switch_conversation()` 恢复；新对话不会受旧状态干扰。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L1524-L1538)
+
+### MemorySaver 降级时的回退策略
+
+当 AsyncSqliteSaver 初始化失败（例如缺少 `aiosqlite` 依赖或 SQLite 权限不足），系统降级为 `MemorySaver()`——所有 Checkpoint 数据存储在内存中，服务重启即丢失。
+
+为了弥补这一损失，HTTP API 模式（`app.py`）在每次对话前从 `messages` 表显式加载历史消息：
+
+```python
+# app.py 第521-533行
+history = []
+async with get_db() as db:
+    rows = await db.execute_fetchall(
+        "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
+        (conversation_id,)
+    )
+    for row in rows[:-1]:  # 排除最后一条（当前消息）
+        history.append({"role": row[0], "content": row[1]})
+```
+
+这段代码从**应用层的 `messages` 表**读取明文历史，传入 `stream_conversation()` 的 `history` 参数，由 Agent 将其作为上下文注入。这意味着即使 Checkpoint 层不可用，**重启后仍能通过应用层存储恢复对话上下文**，只是失去了工具调用中间状态等精细粒度。
+
+Sources: [app.py](app.py#L521-L533)
+
+## WAL 模式与并发性能优化
+
+两个核心 PRAGMA 配置确保了 SQLite 在多线程异步环境下的稳定性：
+
+| PRAGMA | 值 | 作用 |
+|--------|-----|------|
+| `journal_mode` | `WAL` | Write-Ahead Logging：读写不互斥，读操作不阻塞写操作 |
+| `busy_timeout` | `30000`（30秒） | 遇到锁冲突时自动重试，避免立即返回 `SQLITE_BUSY` |
+
+WAL 模式对 Pocket-Agent 尤其重要，因为单例 Agent 实例可能同时处理多个会话的 Checkpoint 写入（不同 `thread_id`），而 `aiosqlite` 的异步连接在事件循环中共享同一个数据库文件。WAL 模式允许多个并发读取器与单个写入器共存，显著减少了锁争用。
+
+同步强制设置 WAL 模式的步骤（`app.py` 第172-177行）确保在异步连接建立之前，数据库文件级别已锁定 WAL 模式：
+
+```python
+_sync_conn = sqlite3.connect(DB_PATH, timeout=30)
+_sync_conn.execute("PRAGMA journal_mode=WAL")
+_sync_conn.close()
+```
+
+Sources: [app.py](app.py#L172-LL177), [app.py](app.py#L35-L38)
+
+## 状态回查：get_context_usage
+
+Checkpoint 机制还支撑了一个关键功能——**上下文 Token 用量估算**。通过 `agent.aget_state()` 从 Checkpoint 中读取当前会话的状态，获取完整的消息列表：
+
+```python
+# agent/agent_langchain.py 第914-920行
+state = await self.agent.aget_state(self.config)
+state_messages = state.values.get("messages", []) or []
+
+full_messages = []
+sys_prompt = getattr(self, '_system_prompt', '')
+if sys_prompt:
+    full_messages.append(SystemMessage(content=sys_prompt))
+full_messages.extend(state_messages)
+```
+
+`aget_state()` 从 AsyncSqliteSaver 中读取指定 `thread_id` 的最新 Checkpoint，无需重新执行任何模型调用，即可精确获知当前会话已占用的 Token 数。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L914-L928)
+
+## 会话与 Checkpoint 的清理操作
+
+HTTP API 提供了两个清理端点，它们**同时操作应用层表和 Checkpoint 层表**：
+
+```python
+# app.py 第841-847行 — 清空所有
+await db.execute("DELETE FROM messages")
+await db.execute("DELETE FROM conversations")
+await db.execute("DELETE FROM checkpoints")
+await db.execute("DELETE FROM writes")
+
+# app.py 第856-861行 — 删除单个会话
+await db.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+await db.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+await db.execute("DELETE FROM checkpoints WHERE thread_id = ?", (conversation_id,))
+await db.execute("DELETE FROM writes WHERE thread_id = ?", (conversation_id,))
+```
+
+这种**双表同步删除**的策略确保不会产生孤立的 Checkpoint 数据。注意 `writes` 表（增量写入日志）也需要清理，否则 LangGraph 在下次读取时可能因增量数据不完整而报错。
+
+Sources: [app.py](app.py#L841-L864)
+
+## 与记忆系统的边界
+
+Checkpoint 持久化与记忆系统（Memory System）有明确的职责分工：
+
+| 维度 | Checkpoint 持久化 | 记忆系统 |
+|------|-------------------|---------|
+| **作用范围** | 对话状态（当前 session 内） | 跨会话的长期记忆 |
+| **存储内容** | 消息列表 + 工具调用中间状态 | 用户画像 + 事实记忆 + 事件记忆 |
+| **生命周期** | 与 conversation 共存亡 | 持久保留（30天后低重要性自动遗忘） |
+| **检索方式** | 按 thread_id 精确加载 | RRF 融合搜索（FTS5 + 向量） |
+| **清理策略** | 用户主动删除会话 | 自动遗忘（重要性 + 时间窗口） |
+
+AsyncSqliteSaver 存储的是 Agent 运行的**即时状态**，确保对话连续性；记忆系统存储的是 Agent 学习的**长期知识**，确保个性化体验。两者共用同一个 SQLite 数据库文件，但表空间完全隔离。
+
+Sources: [app.py](app.py#L149-L166), [app.py](app.py#L845-L846)
+
+## 下一步阅读
+
+- [对话生命周期与流式输出](13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu) — 了解 Checkpoint 如何在 `astream` 流程中被自动读写
+- [分层记忆架构（用户画像 + 事实记忆 + 事件记忆）](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi) — 对比 Checkpoint 层与记忆系统的职责边界
+- [SQLite + FTS5 全文搜索（trigram 中文支持）](16-sqlite-fts5-quan-wen-sou-suo-trigram-zhong-wen-zhi-chi) — 深入了解应用层持久化中的全文搜索能力
+- [agent/config.py 核心配置项](42-agent-config-py-he-xin-pei-zhi-xiang) — 查看 `MAX_ITERATIONS` 和 `RECURSION_LIMIT` 等配置

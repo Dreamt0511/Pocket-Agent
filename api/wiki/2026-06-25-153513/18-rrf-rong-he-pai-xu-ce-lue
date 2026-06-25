@@ -1,0 +1,129 @@
+RRF（Reciprocal Rank Fusion，倒数排序融合）是 Pocket-Agent 记忆检索系统的**排序决策层**，负责将 FTS5 全文搜索（关键词精确匹配）与向量语义搜索（BGE-M3 语义相似度）两条检索管道的候选结果合并为单一排序列表。其设计哲学是：**让两个互补的检索信号通过倒数排名机制公平竞争，再以语义相关性为主、时间衰减和重要性微调为辅，输出最终排序**。
+
+Sources: [agent/tools/basic_tools.py#L525-L568](agent/tools/basic_tools.py#L525-L568), [README.md#L20](README.md#L20)
+
+## 双通道检索的融合困境
+
+FTS5 trigram 搜索擅长**关键词精确命中**——用户说"实习安排"，它能找到包含"实习"或"安排"的消息。向量搜索擅长**语义概念匹配**——用户说"我之前提过的暑期计划"，即使原文从未出现"暑期计划"四字，只要语义向量空间相近就能命中。两条管道各有盲区：FTS5 对同义词和语境变化不敏感，向量搜索对罕见关键词和精确短语不敏感。
+
+问题在于两条管道返回的分数不可直接比较：FTS5 返回 BM25 排序位置（rank），向量搜索返回余弦距离（0~1 的 distance 值）。RRF 的核心作用正是将这两个**异构排序信号**映射到统一的排序框架中，让它们能进行公平的加权竞争。
+
+Sources: [agent/tools/basic_tools.py#L525-L528](agent/tools/basic_tools.py#L525-L528), [agent/tools/basic_tools.py#L430-L490](agent/tools/basic_tools.py#L430-L490)
+
+## RRF 算法核心实现
+
+`_rrf_merge()` 函数位于 `agent/tools/basic_tools.py`，是整个排序策略的具体实现。它的执行分为三个逻辑阶段。
+
+```python
+def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 3) -> list:
+```
+
+**阶段一：RFF 基础分计算**。对 FTS5 结果按其在 BM25 排序中的位置（`rank`）计算倒数分，对向量结果按其相似度降序排列后的位置计算倒数分。`k=60` 是一个平滑常数，防止排名靠后的结果分数骤降为零——排在 60 位的结果仍有 `1/(60+60+1) ≈ 0.008` 的分数，保证低排名条目也有理论上的参赛资格。
+
+**阶段二：去重合并**。两条管道返回的结果可能包含同一条消息（FTS5 和向量同时匹配了），此时将该消息的 RRF 分数累加，提高其在最终排序中的权重。这是 RRF 的天然优势：**双通道同时命中的消息获得叠加分数，自然会排在单通道命中的消息前面**。
+
+**阶段三：综合评分**。在基础 RRF 分数之上叠加三条辅助信号，形成最终排序依据：
+
+| 信号 | 权重 | 计算方式 | 设计意图 |
+|------|------|----------|----------|
+| 语义相关性 | 75% | `RRF分数 × (0.5 + similarity)` | **主排序信号**，FTS5 结果使用 0.5 兜底 |
+| 时间衰减 | 25% | `0.995^{小时数}` | 新近访问的记忆加分 |
+| 重要性微调 | 乘法因子 | `0.8 + importance × 0.04` | 范围 0.92~1.12（importance=3~8） |
+
+最终分数公式：`final_score = 0.75 × weighted_semantic × importance_factor + 0.25 × recency_score`
+
+Sources: [agent/tools/basic_tools.py#L525-L568](agent/tools/basic_tools.py#L525-L568)
+
+### 参数设计推敲
+
+`k=60` 的选择并非随意——它控制着排名靠后结果的**衰减坡度**。k 值越小，排名靠前的结果优势越明显；k 值越大，排名靠后的结果越有机会。标准 RRF 论文中 k=60 是广泛应用的经验值，在信息检索领域经过大量验证。Pocket-Agent 继承此值，并在其上叠加了加权信号来增强排序精度。
+
+`importance_factor` 被有意限制在 ±20% 范围内（`0.8 + importance × 0.04`）。这意味着一条 importance=8 的高重要性记忆，其语义分数只放大 12%；而一条 importance=3 的低重要性记忆也只衰减 8%。**重要性不成为主导排序的因素**，这是系统设计中的关键防御机制——防止用户随意标注高重要性的无关内容爬到检索结果前列。
+
+`DECAY_RATE = 0.995/小时` 意味着一条记忆超过 7 天未被访问后，其时间衰减因子降至 0.995^(168) ≈ 0.43，时间信号对最终分数的贡献从 0.25 降至约 0.11。这保证了陈旧记忆不会因高频访问而长期占据检索结果前列。
+
+Sources: [agent/tools/basic_tools.py#L530-L537](agent/tools/basic_tools.py#L530-L537), [agent/tools/basic_tools.py#L558-L560](agent/tools/basic_tools.py#L558-L560)
+
+## 三级调用场景
+
+RRF 融合在系统中被三种不同场景调用，各自使用不同的 `top_n` 参数：
+
+### 场景一：自动上下文注入（top_n=3）
+
+Agent 处理每条用户消息前，自动通过 `_search_relevant_memories()` 搜索相关记忆并注入到系统提示词中。这是 RRF 最频繁的调用场景，每次对话都要执行一次。注入时会**过滤 `memory_type="dance"` 类型的记忆**——舞蹈动作数据量大（动作序列可能包含数百行坐标），对普通对话理解无益，且会占用大量 token。
+
+```python
+async def _search_relevant_memories(self, query: str, top_n: int = 3) -> str:
+    fts_results = _fts_search(query, msg_type="memory")
+    vec_results = _vector_search(query, msg_type="memory")
+    return _rrf_merge(fts_results, vec_results, top_n=top_n)
+```
+
+Sources: [agent/agent_langchain.py#L711-L719](agent/agent_langchain.py#L711-L719), [agent/agent_langchain.py#L988](agent/agent_langchain.py#L988)
+
+### 场景二：search_memory 工具调用（top_n=5）
+
+当 Agent 主动调用 `search_memory` 工具进行深入搜索时（比如用户明确说"记得我上次..."），RRF 输出 top 5 结果。此处比上下文注入多两条结果的容差，因为工具调用是有意识的信息寻找行为，用户愿意阅读更多候选。
+
+两种搜索范围模式下 RRF 的参与不同：
+- `scope="memory"`（默认）：双通道检索 → RRF 融合 → top 5
+- `scope="session"`：仅 FTS5 搜索当前会话原始对话（不搜索记忆表，不做 RRF）
+
+Sources: [agent/tools/basic_tools.py#L861-L867](agent/tools/basic_tools.py#L861-L867)
+
+### 场景三：向量搜索的过滤前置
+
+在 RRF 融合之前，向量搜索结果会经过一道**最低相似度门槛过滤**：`MIN_SIMILARITY = 0.35`（余弦相似度低于 0.35 的结果被丢弃）。这个门槛确保低质量语义匹配不会污染 RRF 排序结果。实际测试中，0.35 的阈值在保持召回率和精确率之间取得了平衡——太低会有噪声进入排序，太高会丢失 FTS5 可以兜底的边缘情况。
+
+Sources: [agent/tools/basic_tools.py#L476-L478](agent/tools/basic_tools.py#L476-L478)
+
+## 排序后的副作用：last_access_at 更新
+
+检索完成后，系统会更新被检索到的记忆的 `last_access_at` 时间戳。这一操作直接影响 **RRF 排序中的时间衰减因子**：被频繁检索到的记忆保持较高的 recency_score，从而在后续排序中获得优势。这是一个**自我强化的反馈循环**——被检索到的记忆更容易被再次检索到。但时间衰减的权重要求语义相关性更高才不会被覆盖。
+
+```python
+for msg in results:
+    if msg.get("role") == "memory":
+        conn.execute(
+            "UPDATE messages SET last_access_at = ? WHERE id = ?",
+            (current_timestamp, msg["id"])
+        )
+```
+
+Sources: [agent/tools/basic_tools.py#L878-L889](agent/tools/basic_tools.py#L878-L889), [agent/tools/basic_tools.py#L540-L542](agent/tools/basic_tools.py#L540-L542)
+
+## 从设计稿到实现的演进
+
+对比设计文档 `2026-05-29-memory-retrieval-enhancement-design.md` 中的初始方案和最终实现，可以看到三个关键演变：
+
+1. **权重结构调整**：设计稿采用 `alpha=0.45（语义）、beta=0.25（时间）、gamma=0.30（重要性）` 的三元线性加权，实现版改为 **0.75 语义 + 0.25 时间** 的二元结构，重要性降级为乘法微调因子。
+2. **去重策略变化**：设计稿以 `(conversation_id, content[:50])` 作为去重键，实现版直接用 `message_id` 去重，更精确可靠。
+3. **兜底策略删除**：设计稿中的 `importance_score` 归一化（除以 10）被移除，改为重要性因子作为乘法微调（0.8~1.2 范围），对排序的影响力受到更严格的限制。
+
+这些演变反映了从"尝试多种信号"到"语义优先、其他信号辅助"的设计思路收敛。
+
+Sources: [docs/superpowers/specs/2026-05-29-memory-retrieval-enhancement-design.md#L137-L181](docs/superpowers/specs/2026-05-29-memory-retrieval-enhancement-design.md#L137-L181), [agent/tools/basic_tools.py#L555-L566](agent/tools/basic_tools.py#L555-L566)
+
+## 与标准 RRF 的差异
+
+标准 Reciprocal Rank Fusion 定义只有倒数排名求和：`score(d) = Σ 1/(k + rank_i(d))`。Pocket-Agent 的实现是**带权重的增强版 RRF**，在基础分数之上叠加了三条领域特定的排序信号。这种改良是必要的——纯 RRF 只考虑排名位置，忽略了记忆系统中天然存在的时间衰减（新记忆更相关）和重要性（高价值记忆更关键）两个关键维度。
+
+差异总结如下：
+
+| 维度 | 标准 RRF | Pocket-Agent 增强版 |
+|------|----------|---------------------|
+| 分数来源 | 仅排名位置 | 排名位置 + 相似度 + 时间 + 重要性 |
+| 通道公平性 | 各通道等权 | FTS5 结果无 similarity 时用 0.5 兜底 |
+| 去重策略 | 累加分数 | 累加分数 + 合并消息对象 |
+| 输出限制 | 无 | top_n 截断（3 或 5） |
+
+Sources: [agent/tools/basic_tools.py#L525-L568](agent/tools/basic_tools.py#L525-L568)
+
+## 阅读导航
+
+RRF 融合排序是记忆检索流水线的最后一道工序，上游两道工序分别是 FTS5 关键词搜索和向量语义搜索，下游则是记忆的工具调用层：
+
+- **上游一**：[SQLite + FTS5 全文搜索（trigram 中文支持）](16-sqlite-fts5-quan-wen-sou-suo-trigram-zhong-wen-zhi-chi) — 理解 RRF 的输入之一 FTS5 结果如何生成
+- **上游二**：[向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du) — 理解 RRF 的另一个输入向量结果如何计算
+- **下游**：[记忆工具使用（save_memory / search_memory / update_user_profile）](19-ji-yi-gong-ju-shi-yong-save_memory-search_memory-update_user_profile) — 看到 RRF 排序结果如何被工具层使用
+- **全貌**：[分层记忆架构](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi) — 了解 RRF 在整体记忆系统中的位置

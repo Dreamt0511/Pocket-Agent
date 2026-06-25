@@ -1,0 +1,215 @@
+Pocket-Agent 的 Agent 引擎基于 **LangChain 官方 `create_agent`** 构建，参考 EchoMind 架构设计，通过**中间件链（Middleware Chain）** 解决了工具调用递归死循环、上下文溢出、多模态大体积数据等实际部署中的关键问题。本文深入剖析 `LangChainPocketAgent` 类的构造、初始化流程、中间件编排机制，以及它与 LangGraph Checkpoint 持久化的集成方式。
+
+## 架构总览：create_agent 的组装线
+
+`LangChainPocketAgent` 的初始化遵循一条清晰的**四步组装线**：初始化 LLM → 构建增强系统提示词 → 配置中间件链 → 调用 `create_agent` 组装。这个顺序保证了每个环节的产物都可以被下一个环节引用。
+
+```mermaid
+flowchart TD
+    A["LangChainPocketAgent.__init__()"] --> B["_init_llm()<br/>初始化 ChatOpenAI 客户端"]
+    B --> C["加载技能列表<br/>load_skills_list('main')"]
+    C --> D["格式化增强提示词<br/>base_system_prompt + agent_enhance_prompt"]
+    D --> E["配置中间件链<br/>6 个中间件按序排列"]
+    E --> F["create_agent()<br/>传入 model + tools + system_prompt<br/>+ checkpointer + middleware"]
+    F --> G["LangGraph Compile<br/>生成可执行的 agent"]
+```
+
+核心源码位于 `agent/agent_langchain.py` 第 770-822 行，`_create_agent()` 方法完成最终组装：
+
+```python
+self.agent = create_agent(
+    model=self.llm,
+    tools=ALL_TOOLS,
+    system_prompt=enhanced_system_prompt,
+    checkpointer=self.checkpointer,
+    middleware=middleware,
+)
+```
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L770-L822)
+
+## LLM 客户端初始化：从配置到 ChatOpenAI
+
+`_init_llm()` 方法（第 738-768 行）负责将配置 dict 转化为 `langchain_openai.ChatOpenAI` 实例。默认配置指向本地 llama.cpp 服务（`http://127.0.0.1:8080/v1`），但可通过 `llm_config` 参数完全覆盖。
+
+**关键配置项：**
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `base_url` | `http://127.0.0.1:8080/v1` | OpenAI 兼容 API 地址 |
+| `model` | `gelab-zero-4b-preview` | 模型名称 |
+| `temperature` | `0.7` | 生成随机性 |
+| `max_tokens` | `8000` | 单次最大输出 token |
+| `timeout` | `30` | 总超时秒数 |
+| `max_retries` | `1` | 失败重试次数 |
+| `streaming` | `True` | 强制开启流式 |
+
+`api_key` 为空或 `"dummy"` 时自动降级为 mock 配置（`http://mock.localhost:9999/v1`），避免 OpenAI 客户端验证报错——这是针对本地无认证 llama.cpp 服务的兼容设计。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L738-L768)
+
+## 增强系统提示词：技能注入 + 规则叠加
+
+Agent 的系统提示词由**基础人设**（`system_base.py`）和**增强规则**（`agent_enhance.py`）拼接而成。`_create_agent()` 第 772-782 行动态注入两个关键信息：
+
+- **工具列表**：从 `ALL_TOOLS` 提取所有工具名，格式化后写入提示词，让模型知道可用工具的精确名称。
+- **技能列表**：通过 `load_skills_list("main")` 扫描 `agent/skills/main-skills/` 目录，将 `SKILL.md` 的描述信息整理成结构化文本。
+
+增强提示词定义了**五类规则**：工具使用规范（含记忆系统约束）、回答与执行规则（简洁/禁止提及背景/多步骤任务分解）、子Agent 派发规则、技能系统使用说明、身体动作控制规范。这些规则在运行时以自然语言形式嵌入系统提示词，引导模型行为。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L770-L782) | [agent/prompts/agent_enhance.py](agent/prompts/agent_enhance.py#L1-L122)
+
+## 中间件链：六层防护体系
+
+这是整个 Agent 引擎最具工程价值的设计。中间件链在 `_create_agent()` 第 785-806 行按**严格顺序**组装，每个中间件负责一个正交的关注点，形成从工具调用到模型调用的多层防护：
+
+```mermaid
+flowchart LR
+    subgraph Input["用户输入"]
+        A["HumanMessage"]
+    end
+
+    subgraph MiddlewareChain["中间件链 (顺序执行)"]
+        direction TB
+        M1["① MCPToolResultMiddleware<br/>MCP 图片结果 → 文本描述<br/>避免 base64 导致 token 爆炸"]
+        M2["② ImageOptimizationMiddleware<br/>历史图片数据 → '[截图已保存]'<br/>防止累积溢出"]
+        M3["③ ToolCallRepeatMiddleware<br/>连续重复工具调用 → 警告<br/>打破递归死循环"]
+        M4["④ ToolCallIdMiddleware<br/>缺失 tool_call_id → UUID 补全<br/>兼容 GLM 等非标 LLM"]
+        M5["⑤ SummarizationMiddleware<br/>token 超 64K → 自动压缩<br/>保留最近 20 条消息"]
+        M6["⑥ ModelCallLimitMiddleware<br/>运行达 MAX_ITERATIONS → 优雅结束<br/>兜底防护"]
+    end
+
+    subgraph Output["Agent 执行"]
+        B["工具调用 / 文本生成"]
+    end
+
+    Input --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> B
+```
+
+### ① MCPToolResultMiddleware（第 369-520 行）
+
+处理 MCP 工具返回的图片数据。由于手机截图通常为 JPEG base64（数百 KB 级别），直接传给 LLM 会迅速撑爆上下文窗口。该中间件在 `wrap_tool_call` 拦截 `ToolMessage`，识别多种图片格式（MCP 标准 `{"type": "image", "data": "base64"}` 格式、OpenAI `image_url` 格式、纯文本 base64），将其替换为文本描述（如 `✅ 已成功截取当前页面的截图，分辨率：1080 x 2400`），**彻底阻断图片二进制数据进入 LLM 的上下文**。
+
+### ② ImageOptimizationMiddleware（第 311-366 行）
+
+在 `wrap_model_call` 阶段处理**请求中的历史消息**，遍历所有消息对象，移除 Markdown 图片和 multimodal content list 中的图片数据。这是对 MCPToolResultMiddleware 的补充——后者处理的是即将返回的工具结果，而前者清理的是已存入历史的旧图片数据，形成双层防护。
+
+### ③ ToolCallRepeatMiddleware（第 226-270 行）
+
+解决工具调用递归死循环的**核心设计**。某些场景下 LLM 会重复调用完全相同的工具（相同的名称和参数），导致无限循环。该中间件维护一个 `_last_tool_call` 缓存，检测到连续两次完全相同的工具调用时，不执行调用，而是返回一条警告消息（`⚠️ 你刚刚已经调用过 ... 请勿重复调用`），让模型基于已有结果继续下一步。实现同时支持同步（`wrap_tool_call`）和异步（`awrap_tool_call`）路径。
+
+### ④ ToolCallIdMiddleware（第 273-308 行）
+
+某些 LLM（如 GLM 系列）生成的 `tool_call` 缺少 `id` 字段，导致 LangGraph 的 `ToolNode` 在创建 `ToolMessage` 时报错（`tool_call_id` 为空）。该中间件在 `wrap_model_call` / `awrap_model_call` 后拦截 `ModelResponse`，扫描所有 `AIMessage` 中的 `tool_calls`，为缺失 id 的调用生成 `call_{uuid_hex[:12]}` 格式的 UUID 补丁。
+
+### ⑤ SummarizationMiddleware（LangChain 内置）
+
+当上下文 token 数超过 `MAX_CONTEXT_TOKENS // 2`（即 64K）时自动触发历史消息压缩。策略是保留最近 20 条消息，对更早的历史进行摘要压缩。压缩过程使用当前配置的 LLM 模型进行重写，保留关键信息的同时大幅降低 token 消耗。
+
+### ⑥ ModelCallLimitMiddleware（LangChain 内置）
+
+设置单次运行的最大模型调用次数为 `MAX_ITERATIONS`（300 次）。达到限制后以 `exit_behavior="end"` 方式优雅结束，不抛出异常。这一定时炸弹式的兜底防护确保即使前面所有中间件失效，Agent 也绝不会无限循环下去。
+
+**LangGraph 层面还有第二层递归防护**：`config["recursion_limit"]` 设为 `RECURSION_LIMIT`（600），是 ModelCallLimitMiddleware 的 2 倍，作为图执行层的最后防线。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L226-L520) | [agent/config.py](agent/config.py#L14-L18)
+
+## Checkpointer 持久化：会话状态的双路径设计
+
+Checkpointer 是 LangGraph 状态持久化的核心机制。`LangChainPocketAgent` 支持两种实现：
+
+```mermaid
+flowchart TD
+    subgraph AgentInit["Agent 初始化"]
+        A["checkpointer 参数"]
+    end
+
+    A --> B{"是否为 None？"}
+    B -->|"是"| C["MemorySaver()<br/>内存存储，进程重启即丢失"]
+    B -->|"否"| D["使用外部传入的 checkpointer"]
+
+    D --> E{"实例类型"}
+    E -->|"AsyncSqliteSaver"| F["SQLite 持久化<br/>文件: pocket_agent.db<br/>支持 WAL + busy_timeout"]
+    E -->|"其他"| G["自定义 checkpointer"]
+
+    C --> H["会话历史仅存于运行内存"]
+    F --> I["会话历史跨进程/服务重启持久化"]
+```
+
+**app.py 启动时**（第 179-193 行）尝试初始化 `AsyncSqliteSaver`：
+
+```python
+_checkpoint_conn = await aiosqlite.connect(DB_PATH)
+await _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+await _checkpoint_conn.execute("PRAGMA busy_timeout=30000")
+_checkpoint_saver = AsyncSqliteSaver(_checkpoint_conn)
+await _checkpoint_saver.setup()
+```
+
+失败时降级为 `MemorySaver`。这种**优雅降级**设计确保即使 SQLite 初始化失败，Agent 仍可正常运行（仅丢失会话持久化能力）。
+
+**main.py 终端模式**则直接使用 `MemorySaver()` 默认值，不依赖 SQLite 持久化。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L808-L811) | [app.py](app.py#L179-L193)
+
+## DeepSeek reasoning_content 兼容补丁
+
+LangChain 的 `ChatOpenAI` 客户端**不识别非标准 API 字段**，导致两个问题：
+1. 流式响应中的 `reasoning_content` 被 `_convert_delta_to_message_chunk` 丢弃
+2. 非 OpenAI 标准字段无法通过 `_convert_message_to_dict` 传回 API
+
+解决方案是两处 **monkey-patch**（第 190-216 行）：
+
+- **Patch 1**（流式接收）：拦截 `_convert_delta_to_message_chunk`，从原始 dict 中提取 `reasoning_content` 存入 `AIMessageChunk.additional_kwargs`
+- **Patch 2**（消息发送）：拦截 `_convert_message_to_dict`，将 `additional_kwargs` 中的 `reasoning_content` 写回请求 dict
+
+这保证了 DeepSeek 类模型的思考过程在请求-响应周期中完整保留，后续可在 UI 层选择性地展示"思考中"状态。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L186-L216)
+
+## 两种运行模式：run_conversation vs stream_conversation
+
+`LangChainPocketAgent` 提供了两套执行入口，共享同一个 `self.agent` 实例，通过不同的 `thread_id` 隔离会话历史：
+
+| 方法 | 返回类型 | 适用场景 | 特殊功能 |
+|---|---|---|---|
+| `run_conversation` | `(str, bool, int)`（同步返回） | 终端交互（main.py） | Rich Markdown Live 渲染、进度显示、前后台子Agent同步执行 |
+| `stream_conversation` | `AsyncGenerator[dict]`（流式 yield） | FastAPI SSE 端点（app.py） | 结构化事件推送（token/tool_start/tool_end/thinking/done/error） |
+
+**`run_conversation` 的执行流程**（第 941-1267 行）：
+
+1. 注入上下文：用户画像 → 环境感知 → 相关记忆，合并到用户消息中
+2. 混合流式处理：同时监听 `stream_mode=["messages", "updates"]`
+3. 流式渲染：使用 `rich.live.Live` 实现增量 Markdown 渲染
+4. 工具调用统计：计数 + 参数缓存 + 日志记录
+5. 消费后台任务：执行 `consume_pending_tasks()` 中的子Agent派发
+6. 清理 `delegate_task` 相关消息：避免历史中的 tool_call/tool_message 配对问题
+7. 后处理去重：检测输出中前 80 字符的重复出现
+8. 空响应回退：如果流式未产生任何内容，回退到 `ainvoke`
+
+**`stream_conversation` 的执行流程**（第 1269-1522 行）：
+- 支持 `thread_id` 参数实现会话隔离
+- 支持 `history` 参数传入历史消息列表
+- 额外监听 `stream_mode=["custom"]` 获取工具执行进度
+- 所有事件通过 `yield` 结构化 dict 供 FastAPI 的 SSE 端点消费
+
+两种模式都实现了**取消机制**（`cancel()` + `_check_cancel()`），通过标志位检测和 `asyncio.CancelledError` 传播支持外部中断。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L941-L1522)
+
+## 配置驱动：config.py 的核心参数
+
+Agent 的行为由 `agent/config.py` 中的常量控制：
+
+| 参数 | 值 | 作用 |
+|---|---|---|
+| `MAX_ITERATIONS` | 300 | 单次对话最大模型调用次数 |
+| `RECURSION_LIMIT` | 600 | LangGraph 底层递归限制（兜底防护） |
+| `MAX_CONTEXT_TOKENS` | 128000 | 上下文窗口上限（适配 128K 模型） |
+| `SKILL_FILE_NAMES` | `["SKILL.md", "skill.md"]` | 技能文件名称（大小写兼容） |
+
+Sources: [agent/config.py](agent/config.py#L14-L24)
+
+---
+
+**继续阅读**：深入理解中间件链中各中间件的实现细节和交互关系，请查看 [中间件链深度解析（上下文压缩、重复检测、模型调用限制）](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi)。了解 DeepSeek reasoning_content 补丁机制的完整实现，请查看 [DeepSeek reasoning_content 兼容性补丁机制](12-deepseek-reasoning_content-jian-rong-xing-bu-ding-ji-zhi)。

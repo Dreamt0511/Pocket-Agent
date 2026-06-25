@@ -1,0 +1,206 @@
+手机操纵是 Pocket-Agent 最独特也最核心的能力——Agent 直接运行在 Android Termux 中，可以像人类一样操控手机上的任何应用。本章系统化阐述其操纵策略体系、包名管理机制、以及三层技能栈的设计逻辑。目标是让读者理解"什么样的操作走什么路径"以及"包名为什么是操控的第一块基石"。
+
+---
+
+## 操纵策略三層金字塔
+
+Pocket-Agent 的手机操控遵循严格的优先级降级策略：**零依赖 Shell → Termux API → NeuralBridge MCP**。这个优先级不是随意定的，而是基于三个维度权衡：执行成本（是否消耗 token）、可靠性（Android 版本兼容性）、能力边界（能否完成复杂 UI 交互）。
+
+```mermaid
+flowchart TB
+    subgraph 第一层["第一层：Shell 命令（零 token）"]
+        direction LR
+        A1["系统信息<br/><code>getprop</code>"]
+        A2["包管理<br/><code>pm list packages</code>"]
+        A3["应用启动<br/><code>am start -p</code>"]
+    end
+
+    subgraph 第二层["第二层：Termux API（零 token）"]
+        direction LR
+        B1["交互通知<br/>notification/tts/toast"]
+        B2["系统功能<br/>battery/volume/wifi"]
+        B3["传感器外设<br/>camera/sensor/torch"]
+    end
+
+    subgraph 第三层["第三层：NeuralBridge MCP（消耗 token）"]
+        direction LR
+        C1["UI 树分析<br/>get_ui_tree"]
+        C2["点击滑动<br/>tap/swipe/input"]
+        C3["截图验证<br/>screenshot"]
+    end
+
+    A1 -->|"不可用"| B1
+    B1 -->|"不可用"| C1
+    A2 -->|"不可用"| B2
+    B2 -->|"不可用"| C2
+    A3 -->|"失败"| B3
+    B3 -->|"失败"| C3
+
+    style A1 fill:#4CAF50,color:#fff
+    style A2 fill:#4CAF50,color:#fff
+    style A3 fill:#4CAF50,color:#fff
+    style B1 fill:#FF9800,color:#fff
+    style B2 fill:#FF9800,color:#fff
+    style B3 fill:#FF9800,color:#fff
+    style C1 fill:#f44336,color:#fff
+    style C2 fill:#f44336,color:#fff
+    style C3 fill:#f44336,color:#fff
+```
+
+**第一层（绿色）**：Shell 原生命令。`getprop` 获取设备信息、`pm list packages` 搜索包名、`am start -p` 启动应用，全部零外部依赖，直接在 Termux 环境中执行。但 Android 16 大幅收紧了 shell 权限——`wm`、`dumpsys`、`settings`、`svc`、`input keyevent`、`screencap`、`screenrecord` 均不可用。这意味着传统 ADB 调试的很多捷径在 Android 16 上行不通。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L1-L18)
+
+**第二层（橙色）**：Termux API。当 Shell 命令无法满足需求时（如发送通知、TTS 朗读、读取传感器），使用 `termux-xxx` 系列命令。这需要安装 Termux:API 配套应用并首次授权。核心命令按功能分为四类：交互与通知（`termux-notification`、`termux-tts-speak`、`termux-clipboard-get/set`）、系统功能（`termux-battery-status`、`termux-volume`、`termux-wifi-*`）、传感器与外设（`termux-camera-photo`、`termux-sensor`、`termux-torch`）、通讯与媒体（`termux-telephony-deviceinfo`、`termux-media-player`）。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L77-L199)
+
+**第三层（红色）**：NeuralBridge MCP 服务。这是终极方案——只有 Shell 和 Termux API 都无法完成的操作（核心是 UI 自动化：点击、滑动、输入、UI 树分析、截图）才降级到这里。NeuralBridge 提供 32 个 MCP 工具，但调用会消耗 LLM token（UI 树和截图的 token 开销不菲），因此必须优先尝试前两层。Sources: [neuralbridge-operation-standard](agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md#L1-L8)
+
+这条策略链的内核是经济学问题：**零 token 的操作永远优先**，只有真正需要视觉理解或 UI 交互时才动用大模型资源。
+
+---
+
+## 包名管理体系
+
+包名（package name）是 Android 应用操控的第一把钥匙——你想启动一个应用、检查它是否安装、或者关闭它，都必须知道它的包名。Pocket-Agent 的包名管理遵循"先查后启、禁止猜测"的铁律。
+
+### 三层包名获取策略
+
+```
+第一层：内置对照表（直接使用，零开销）
+  └─ 60+ 常用应用的包名硬编码在 SKILL.md 中
+  └─ 覆盖：社交（微信/QQ/抖音/B站）、AI（DeepSeek/ChatGPT/豆包）、
+         工具（Chrome/支付宝/WPS）、生活（美团/淘宝/京东/12306）、
+         系统（设置/相机/相册/计算器）、娱乐（网易云/王者荣耀）等
+
+第二层：pm list packages 搜索（一次 shell_exec，零 token）
+  └─ pm list packages | grep <关键词>    # 搜已安装应用
+  └─ pm list packages -3                 # 所有第三方应用
+  └─ pm path <包名>                      # 查看 APK 路径确认
+
+第三层：NeuralBridge android_list_apps（消耗 token）
+  └─ 当前两层都找不到时，降级到 MCP 工具
+  └─ mcp_call(tool_name="android_list_apps", arguments={"filter": "关键词"})
+```
+
+**核心约束**：禁止 Agent 猜测包名。猜测包名会导致应用启动失败、UI 树获取不到正确页面、以及后续一连串操作的连锁错误。如果内置对照表找不到，必须通过 `pm list packages` 搜索；如果搜索也找不到（应用未安装），直接告知用户。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L20-L60)
+
+### 常用包名对照表结构
+
+内置对照表涵盖 8 大类 60+ 个应用，按使用频率分层的设计意图很清晰：
+
+| 类别 | 频率场景 | 典型应用与包名 |
+|------|---------|---------------|
+| **社交类** | 高频，对话/内容消费 | 微信 `com.tencent.mm`、抖音 `com.ss.android.ugc.aweme`、B站 `tv.danmaku.bili` |
+| **AI 类** | 中频，对话/查询 | DeepSeek `com.deepseek.chat`、ChatGPT `com.openai.chatgpt`、豆包 `com.doubao.android` |
+| **工具类** | 高频，浏览/支付 | Chrome `com.android.chrome`、支付宝 `com.eg.android.AlipayGphone` |
+| **生活服务** | 中低频，购物/出行 | 淘宝 `com.taobao.taobao`、拼多多 `com.xunmeng.pinduoduo`、12306 `com.MobileTicket` |
+| **办公类** | 低频，文档/会议 | WPS `cn.wps.moffice_eng`、腾讯会议 `com.tencent.wemeet.app` |
+| **系统类** | 高频，设备控制 | 设置 `com.android.settings`、相机 `com.android.camera` |
+| **娱乐类** | 低频，音乐/游戏 | 网易云 `com.netease.cloudmusic`、王者荣耀 `com.tencent.tmgp.sgame` |
+| **开发类** | 中频，调试 | Termux `com.termux`、MT管理器 `bin.mt.plus` |
+
+这个对照表不是一次性写死的——随着 auto-skills 系统的自动沉淀，每次成功执行的任务都会记录包名，形成经验复用。例如 auto-skills 中沉淀的 `deepseek-chat` 技能明确记录了包名 `com.deepseek.chat` 和启动策略，后续同类任务直接复用。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L20-L58), [deepseek-chat](agent/skills/auto-skills/executor/deepseek-chat/SKILL.md#L1-L10)
+
+### 应用启动协议
+
+拿到包名后的启动流程，有三条路径：
+
+```bash
+# 推荐路径（Android 10+）
+am start -p <包名>
+
+# 精确路径（需要 Activity 名）
+am start -n <包名>/<Activity名>
+
+# 兜底路径（MCP 调用）
+mcp_call(tool_name="android_launch_app", arguments={"package_name": "<包名>"})
+```
+
+`am start -p` 是 Termux 包装版的命令（位于 `/data/data/com.termux/files/usr/bin/`），已适配 SELinux 上下文。失败后先尝试通过 `pm dump <包名> | grep -A 5 LAUNCHER` 查找主 Activity 进行精确启动，仍失败再降级到 NeuralBridge 的 `android_launch_app`。每次启动后必须用 UI 树验证是否确实进入了目标应用——因为启动可能因为各种原因（权限、应用崩溃、Intent 冲突）静默失败。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L60-L74)
+
+---
+
+## 技能四层架构
+
+包名只是入口，真正的手机操控能力分布在四个技能文件中，形成从简单到复杂的知识分层：
+
+```mermaid
+flowchart LR
+    subgraph 主Agent["主Agent"]
+        Q["phone-control-quickref<br/>单步操作速查"]
+    end
+
+    subgraph 子Agent["子Agent（executor）"]
+        A["phone-control-guide<br/>全量操控指南"]
+        B["neuralbridge-operation-standard<br/>MCP 操作规范"]
+        C["fast-mode<br/>高速执行规范"]
+    end
+
+    Q -->|"简单操作自已做"| A
+    A -->|"降级路径"| B
+    B -->|"提速优化"| C
+
+    style Q fill:#e3f2fd,stroke:#1565c0
+    style A fill:#e8f5e9,stroke:#2e7d32
+    style B fill:#fff3e0,stroke:#e65100
+    style C fill:#f3e5f5,stroke:#6a1b9a
+```
+
+**`phone-control-quickref`（主 Agent 专用）**：只包含单步 Termux API 和 Shell 命令。设计原则是——如果主 Agent 自己就能完成的操作（查通知、调音量、启动应用等），就不需要派发给子 Agent。但这里有个边界判断：如果整个任务是复杂的 UI 交互流程（如"去拼多多买双鞋"），主 agent 不得提前做任何准备工作（查包名、启动应用等），必须全盘委托给 executor。Sources: [phone-control-quickref](agent/skills/main-skills/phone/phone-control-quickref/SKILL.md#L1-L12)
+
+**`phone-control-guide`（子 Agent 主技能）**：这是手机操控的百科全书。包含完整的包名对照表、Shell 命令速查、Termux API 全分类手册、降级场景定义、执行规则。子 Agent 在接到手机操控任务时，第一步就是 file_read 这个文件，从中获取操作指导。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md)
+
+**`neuralbridge-operation-standard`（MCP 操作规范）**：定义所有 NeuralBridge MCP 工具的调用规范、三原则（坐标不猜测、操作后直接验证、专用工具优先）、四套输入方案（A/B/C/D）、弹窗处理流程、故障排查体系。这是最 detail-heavy 的技能文件——因为它面对的是需要 token 消耗的"昂贵操作"，必须一次做对，避免浪费。Sources: [neuralbridge-operation-standard](agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md)
+
+**`fast-mode`（高速执行规范）**：在保证任务完整性的前提下，通过"一次扫描多次复用""链式点击压缩间隔""剪贴板粘贴替代打字""只在关键节点验证"等策略，将执行速度提升 3-10 倍。典型购物流程从人类手动 60-90s 压缩到约 22s。Sources: [fast-mode](agent/skills/executor-skills/fast-mode/SKILL.md)
+
+### 输入方案四选一（核心难点）
+
+UI 自动化中最棘手的是文本输入。不同应用的渲染引擎不同，输入方案各异。`neuralbridge-operation-standard` 定义了四级降级方案：
+
+| 方案 | 适用场景 | 核心操作 | 成功率 |
+|------|---------|---------|:------:|
+| **方案A** | 原生 EditText | `android_input_text` 直接填入 | 最高 |
+| **方案B** | 标准 WebView | 点击聚焦 → 设置剪贴板 → `press_key paste` | 高 |
+| **方案C** | UCWebView/Rax 特殊容器 | 坐标计算键盘粘贴建议按钮位置 | 中 |
+| **方案D** | 所有方案失败 | OCR 识别剪贴板文字坐标后点击 | 低（终极降级） |
+
+实际执行中，约 80% 的应用可用方案A（拼多多搜索框是例外，它是 WebView），方案B覆盖了大部分 WebView 应用（DeepSeek、ChatGPT 等），方案C和D极少触发。Sources: [neuralbridge-operation-standard](agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md#L75-L130)
+
+---
+
+## Android 16 兼容性要點
+
+Android 16 对 shell 命令权限的收紧是整个手机操纵策略必须重新设计的根本原因。关键变化：
+
+| 命令类别 | Android 15 及之前 | Android 16 |
+|---------|:---------------:|:----------:|
+| `wm size/density` | ✅ 可用 | ❌ 拒绝 |
+| `dumpsys` | ✅ 可用 | ❌ 拒绝 |
+| `settings get/put` | ✅ 可用 | ❌ INTERACT_ACROSS_USERS 拒绝 |
+| `svc wifi/data` | ✅ 可用 | ❌ /system/bin 不可访问 |
+| `input keyevent/tap` | ✅ 可用 | ❌ 无 INJECT_EVENTS 权限 |
+| `screencap` | ✅ 可用 | ❌ 拒绝 |
+| `am start -p` | ✅ 可用 | ✅ 可用（Termux 包装版） |
+| `pm list packages` | ✅ 可用 | ✅ 可用 |
+| `getprop` | ✅ 可用 | ✅ 可用（最可靠） |
+| Termux API 命令 | ✅ 可用 | ✅ 可用（推荐方案） |
+
+这意味着传统依赖 ADB shell 的操控方案在 Android 16 上基本失效，Termux API 成为最可靠的操控途径。`getprop` 成为获取系统信息的最佳选择——零权限、零依赖、始终可用。Sources: [phone-control-guide](agent/skills/executor-skills/phone-control-guide/SKILL.md#L15-L18, L78-L89)
+
+---
+
+## 经验自动沉淀闭环
+
+包名管理不是静态的——每次成功执行的手机操控任务，都会通过 auto-skills 系统自动沉淀到 `agent/skills/auto-skills/executor/` 目录。沉淀的内容包含：任务包名、操作流程、关键坐标参考、失败经验、注意事项。Sources: [skill-deposit-log](agent/skills/auto-skills/executor/skill-deposit-log.md)
+
+以 `pinduoduo_buy_shoes` 为例，沉淀的技能不仅记录了包名 `com.xunmeng.pinduoduo`，还记录了输入框是 WebView 类型（不能用方案A，必须用方案B剪贴板+paste）、筛选面板的操作细节、下单前必须选择颜色尺码、联系客服优先用快捷按钮等关键经验。后续 Agent 再处理拼多多购物任务时，直接读取这份经验文档，避免了重新试错。Sources: [pinduoduo_buy_shoes](agent/skills/auto-skills/executor/pinduoduo_buy_shoes/SKILL.md)
+
+这种"执行 → 沉淀 → 复用"的闭环，是 Pocket-Agent 手机操控能力持续进化的核心机制。对照表是骨架，但真正让操控变得流畅的是 auto-skills 积累的肉身经验。
+
+---
+
+## 延伸阅读
+
+- [NeuralBridge MCP 服务（UI 树分析、点击滑动、截图）](24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu)：MCP 工具的完整调用规范和三原则
+- [主 Agent 技能（main-skills：开发类、手机操控类）](34-zhu-agent-ji-neng-main-skills-kai-fa-lei-shou-ji-cao-kong-lei)：phone-control-quickref 在主 Agent 中的定位
+- [子 Agent 技能（executor-skills：快速模式、操控指南）](35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan)：子 Agent 如何加载手机操控技能
+- [自动沉淀技能（auto-skills：执行经验自动积累）](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)：经验闭环机制的完整说明

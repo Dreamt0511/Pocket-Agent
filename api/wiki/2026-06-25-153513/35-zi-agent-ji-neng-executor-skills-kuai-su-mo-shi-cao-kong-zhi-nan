@@ -1,0 +1,120 @@
+子 Agent（Executor）技能系统是其独立于主 Agent 的知识与操作指南体系，存储于 `agent/skills/executor-skills/` 目录下。与主 Agent 的 `main-skills` 不同，executor-skills 聚焦于 **手机操控的执行层知识**——从如何用 Shell 命令启动应用到高速链式点击的优化策略，再到 NeuralBridge MCP 的降级操作规范，以及任务完成后的技能自动沉淀模板。这四个技能共同构成了子 Agent 执行手机任务的完整知识闭环。
+
+Sources: [config.py](agent/config.py#L56-L60), [agent_langchain.py](agent/agent_langchain.py#L119-L133)
+
+## 技能全景：执行层知识闭环
+
+```mermaid
+flowchart TD
+    subgraph "executor-skills（预置技能）"
+        A[phone-control-guide<br/>Shell + Termux API 操控指南]
+        B[neuralbridge-operation-standard<br/>NeuralBridge MCP 降级规范]
+        C[fast-mode<br/>高速执行加速策略]
+        D[skill-creator<br/>执行经验沉淀模板]
+    end
+
+    subgraph "auto-skills/executor（自动积累）"
+        E[沉淀技能 1]
+        F[沉淀技能 2]
+        G[...]
+    end
+
+    H[task.json 任务文件] -->|读取步骤| 子Agent
+    子Agent -->|优先| A
+    A -->|失败降级| B
+    C -->|覆盖加速| A
+    C -->|覆盖加速| B
+    子Agent -->|执行完成| D
+    D -->|生成| E
+    E -.->|下次自动加载| 子Agent
+```
+
+**技能优先级**：子 Agent 执行手机操控任务时，强制遵循 `phone-control-guide`（零 token 消耗的 Shell/Termux API）→ `neuralbridge-operation-standard`（需 MCP 调用的 UI 自动化）的降级链路。`fast-mode` 则作为跨层加速策略，覆盖前两者的执行节奏。
+
+Sources: [phone-control-guide/SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L1-L9), [neuralbridge-operation-standard/SKILL.md](agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md#L1-L8)
+
+## 技能一：phone-control-guide —— 零依赖操控首选
+
+这是子 Agent 执行手机操控任务时 **最先查阅** 的技能文档，核心价值在于完全不依赖 NeuralBridge MCP，所有操作通过 Termux 原生能力完成，零额外 token 消耗。
+
+**应用启动三步骤**：查包名 → 启动 → 验证。技能中预置了 70+ 常用应用的包名对照表（微信 `com.tencent.mm`、淘宝 `com.taobao.taobao`、拼多多 `com.xunmeng.pinduoduo` 等），覆盖社交、AI、工具、生活服务、办公、系统、游戏七大类别。对照表查不到时使用 `pm list packages | grep <关键词>` 搜索已安装应用。启动命令统一用 `am start -p <包名>`（Android 10+ 推荐方式），失败后逐级降级到 `am start -n <包名>/<Activity名>` 和 NeuralBridge 的 `android_launch_app`。
+
+**Shell 命令速查**：文档强调 Android 16 对调试命令的权限收紧——`dumpsys`、`wm`、`settings`、`svc`、`screencap` 等传统调试命令在 Termux SSH 中均不可用。可靠途径是 `getprop` 读取设备信息（无需权限），以及标准 Linux 命令（`top`、`ps`、`free`、`df`）查询系统资源。
+
+**Termux API 命令矩阵**：技能文档以表格形式分类整理了 30+ 个 Termux API 命令，分为交互与通知、传感器与外设、通讯、媒体与音频、系统功能五类，并标注了每项命令的执行类型（静默执行 ✅ / 需弹窗确认 ⚠️ / 阻塞等待 ⏳ / 系统阻止 ❌）。这是子 Agent 调用 Termux API 的精确知识库，包含参数格式和权限提示。
+
+**降级边界清晰**：Shell/Termux API 无法完成的操作包括截图分析、UI 树获取、坐标点击滑动、系统导航（返回/桌面/最近任务）、应用启动兜底、等待元素等——这些场景直接跳转到 NeuralBridge。
+
+Sources: [phone-control-guide/SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L14-L253)
+
+## 技能二：neuralbridge-operation-standard —— MCP 降级操作规范
+
+当 phone-control-guide 的零 token 方案无法完成任务时，子 Agent 查阅此技能，使用 NeuralBridge MCP 的 32 个工具进行 UI 自动化操作。
+
+**核心三原则**（强制执行）：坐标 100% 来自 `android_get_ui_tree` 返回的 bounds，禁止从截图估算；操作后直接验证（一般操作无需等待），仅页面加载场景使用 `android_wait_for_idle`（timeout ≤ 2000ms，极端 3000ms）；专用工具优先于通用点击（如启动应用用 `android_launch_app`、按键用 `android_press_key`、查找元素用 `android_find_elements`）。
+
+**等待策略矩阵**：技能文档规定了严格的等待时间——点击/滑动/输入/按键后**不等待**直接获取 UI 树验证；启动应用、页面跳转、网络请求触发的页面变化用 `android_wait_for_idle(timeout_ms=2000)`。禁止每步都等、禁止 timeout 超过 3000、禁止用 `time.sleep()` 替代。
+
+**通用输入方案（四层降级）**：这是技能中最精妙的部分——针对 Android 输入框的多样性设计了逐级降级的四层方案。方案 A（原生 EditText）直接用 `android_input_text`；方案 B（通用三步法）用 `tap` 聚焦 → `set_clipboard` 写入 → `press_key paste` 粘贴，适用于大多数 WebView；方案 C（UCWebView/Rax）通过 UI 树 bounds 计算键盘建议栏粘贴按钮的相对坐标；方案 D（OCR 动态定位）用 tesseract 截图 OCR 识别粘贴按钮位置作为终极降级。
+
+**故障排查流程**：文档还内置了分场景排查策略——点不动时重获 UI 树检查可点击属性；找不到元素时检查弹窗遮挡并尝试 `scroll_to_element`；输入失败时确认聚焦并按方案降级链路重试；启动失败时通过 `list_apps` 验证包名并用 `am start` 兜底。
+
+Sources: [neuralbridge-operation-standard/SKILL.md](agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md#L6-L195)
+
+## 技能三：fast-mode —— 高速执行加速策略
+
+如果说 phone-control-guide 和 neuralbridge-operation-standard 解决的是"能不能做"的问题，fast-mode 解决的是"如何做得更快"的问题。它将常规 Agent 每步验证等待的保守模式，优化为"信任计算、减少人肉验证"的高速模式。
+
+**速度瓶颈分析**：文档精准量化了每个环节的耗时——UI 树获取 ~50ms、坐标计算 ~10ms（几乎免费）、tap 执行 ~6ms（硬件延迟无法优化）、App 加载 1-3s（硬性等待）、验证 ~50ms、剪贴板粘贴 ~200ms（比逐字输入快 20 倍）。由此提炼出核心策略：消除人的决策等待和多余的验证。
+
+**五条加速原则**（可量化可执行）：
+1. **一次扫描多次复用**——任务开始时用 `filter="all"` 一次性获取完整 UI 树，计算所有目标元素的 bounds，连续操作，只在页面重大变化时重新获取
+2. **链式点击压缩间隔**——同一页面内连续操作间隔压缩至 0.3-0.5s，仅大页面跳转等待 2s（`android_wait_for_idle(timeout_ms=2000)`），App 冷启动极端等待 3s
+3. **剪贴板粘贴替代打字**——任何超过 2 个字符的文本输入一律用 `set_clipboard` + `press_key paste`，约 200ms 完成，比逐字输入快 20 倍
+4. **只验证关键节点**——必须验证的节点包括页面跳转后、支付/下单前、提交信息前；可跳过验证的包括同一页面内的标签切换、输入框点击、滚动操作
+5. **Termux 浮窗前置处理**——每次任务开始第一个动作即检查并关闭 Termux 浮窗，避免中途被遮挡
+
+**典型任务量化时间**：以"搜索商品→咨询客服→看评价→下单→通知"为例，全流程约 22 秒（人类手动 60-90 秒，常规 Agent 120 秒+）。技能文档将整个过程拆解为三个阶段，精确到每步的耗时合计。同时给出了不同应用类型的速度分级——标准原生 App（拼多多/淘宝/京东）最快，WebView 混合次之，自定义渲染（微信/小红书）和游戏/SurfaceView 最慢需降级到 VLM 视觉分析。
+
+**安全约束**：高速模式并未放弃安全。技能中硬编码了禁止操作——禁止点击付款/支付/确认支付等按钮（除非任务明确要求）、禁止点击直接成团/发起拼单/立即购买等购买按钮（除非用户确认）、禁止自动输入密码或支付信息。到达涉及金钱的页面时强制先 `get_ui_tree` 确认。链式操作失败时允许 1 次重扫 UI 树，仍失败则停止报告。
+
+Sources: [fast-mode/SKILL.md](agent/skills/executor-skills/fast-mode/SKILL.md#L1-L172)
+
+## 技能四：skill-creator —— 执行经验自动沉淀模板
+
+子 Agent 完成多步骤任务后，通过此技能将执行路径沉淀为可复用的 SKILL.md 文档，写入 `agent/skills/auto-skills/executor/` 目录下。这是系统自我进化的关键机制——每次执行都是知识积累的一次机会。
+
+**沉淀规则**：任务不足 3 步则跳过（太简单无需沉淀）、任务失败则跳过（错误路径不值得记录）、沉淀不阻塞汇报（先生成技能文件，再返回最终摘要给用户）。技能名称从任务目标中提取最多 3 个关键词，用下划线连接（如 `pinduoduo_buy_shoes`）。
+
+**SKILL.md 模板**：包含任务目标、执行步骤（标注 completed 状态）、关键操作（包名、MCP 工具和参数、注意事项与坑的解决方法）、适用场景。注意在 executor_system_prompt 中强制要求：沉淀前必须先 `file_read` 读取 skill-creator/SKILL.md，严格按其格式编写。
+
+Sources: [skill-creator/SKILL.md](agent/skills/executor-skills/skill-creator/SKILL.md#L1-L46), [executor_system.py](agent/prompts/executor_system.py#L17)
+
+## 技能发现与加载机制
+
+子 Agent 的技能发现机制与主 Agent 统一，但额外加载自动沉淀技能。`load_skills_list("executor")` 函数扫描 `EXECUTOR_SKILLS_DIR`（executor-skills/）下所有含 SKILL.md 的子目录，同时合并 `AUTO_SKILLS_DIR/executor/`（auto-skills/executor/）下的沉淀技能。扫描支持扁平模式（子目录直接含 SKILL.md）和分类模式（子目录下再嵌套一级子目录）。扫描结果以分类列表形式注入到 `executor_enhance_prompt` 的 `{skills_list}` 占位符中，最终通过 `executor_system_prompt` 的 `{tool_rules_and_skills}` 成为系统提示词的一部分。
+
+这意味着子 Agent 的技能集是**动态扩展**的——预置的 4 个 executor-skills 提供底层框架能力，而 auto-skills/executor/ 下的沉淀技能随执行经验不断积累，形成"执行→沉淀→复用"的正循环。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L70-L113), [agent_langchain.py](agent/agent_langchain.py#L116-L160), [agent_langchain.py](agent/agent_langchain.py#L1598-L1607)
+
+## 技能对比总结
+
+| 维度 | phone-control-guide | neuralbridge-operation-standard | fast-mode | skill-creator |
+|:---|:---|:---|:---|:---|
+| **定位** | 首选操控方案 | 降级操控方案 | 加速优化策略 | 经验沉淀模板 |
+| **依赖** | Shell + Termux API | NeuralBridge MCP | 覆盖前两者 | file_write |
+| **Token 消耗** | 零 | 有（MCP 调用） | 零 | 零 |
+| **核心价值** | 包名查询 + 命令速查 | 四层输入降级 + 等待策略 | 速度提升 3-10 倍 | 知识闭环 |
+| **调用时机** | 每次手机操控任务开始 | phone-control-guide 不可行时 | 覆盖所有操控场景 | 任务完成后 |
+| **影响范围** | 当前任务 | 当前任务 | 当前任务 | 未来所有任务 |
+
+Sources: 综合自四个 SKILL.md 和 agent_langchain.py 的加载逻辑
+
+## 下一步阅读
+
+- **子 Agent 的运行时机制**：了解 executor 如何被创建、task.json 如何驱动执行流程 → [子 Agent 前台同步执行与流式输出](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu)
+- **独立配置与技能隔离**：了解 executor 如何使用独立的 LLM 配置和工具集 → [子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi)
+- **自动沉淀技能**：了解 auto-skills 目录中积累的执行经验如何被后续任务复用 → [自动沉淀技能（auto-skills：执行经验自动积累）](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)
+- **技能系统全景**：了解 skill 与 tool 的本质区别，以及知识文档如何改变 Agent 行为 → [技能系统概述（SKILL.md 知识文档 vs 工具）](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)
+- **技能自动发现机制**：了解 `_scan_skills` 和 `load_skills_list` 的完整实现 → [技能自动发现与加载机制](37-ji-neng-zi-dong-fa-xian-yu-jia-zai-ji-zhi)

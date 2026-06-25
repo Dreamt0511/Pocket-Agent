@@ -1,0 +1,337 @@
+无线 ADB（Android Debug Bridge）是 Pocket-Agent 开发与运维的**基础连接层**——它是在电脑端对手机进行初始环境搭建、代码推送、故障恢复的核心通道。在 Pocket-Agent 的远程连接体系中，无线 ADB 处于最底层的位置：**没有 ADB，就无法配置 SSH 服务、无法安装 NeuralBridge、无法调试 llama.cpp 的启动参数**。理解无线 ADB 的配置与工作原理，是高效使用 Pocket-Agent 的前提。
+
+## 无线 ADB 在 Pocket-Agent 中的角色
+
+Pocket-Agent 的远程开发涉及三种不同的连接方式，它们各有分工，构成**分层连接体系**：
+
+| 连接方式 | 端口 | 用途 | 使用方 | 重启后是否需要重配 |
+|---------|------|------|--------|:----------------:|
+| 无线 ADB | 5555 | 初始环境搭建、代码推送、应用安装、故障恢复 | 开发者（电脑终端） | 需要（USB 重配） |
+| SSH | 8022 | 远程命令行操作、运行 Termux 命令 | 开发者（电脑终端） | 需要（重新 `sshd`） |
+| NeuralBridge MCP | 7474 | Agent 运行时 UI 自动化控制 | Agent（运行时调用） | 需要（重启 App） |
+
+**关键区别**：ADB 是**开发者工具**，用于在电脑上操作手机系统底层（安装应用、查看日志、文件传输）；而 Agent 运行时操控手机使用的是 **Termux Shell 命令** + **NeuralBridge MCP**，不依赖 ADB。Agent 的 `phone-control-guide` 技能明确指出"零 ADB 即可操控手机"，说明 ADB 不是 Agent 运行时的依赖。
+
+Sources: [phone-control-guide SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L1-L5), [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L1-L10)
+
+## 前提条件
+
+在开始配置无线 ADB 之前，需要确认以下条件已满足：
+
+- **一台 Android 手机**（API 24+，Android 7.0 以上），已开启**开发者选项**和 **USB 调试**
+- **一条 USB 数据线**，用于首次配置和重启后的恢复
+- **一台电脑**（Windows / macOS / Linux），已安装 ADB 工具
+- **同一个网络**：手机和电脑连接在同一个 WiFi 下，或手机开启**个人热点**让电脑连接
+
+### 手机端准备（首次一次性配置）
+
+在手机「设置 → 关于手机」中连续点击「版本号」7 次激活开发者选项，然后进入「开发者选项」开启：
+
+1. **USB 调试** — 允许通过 USB 连接调试
+2. **"仅充电"模式下允许 ADB 调试** — 非必需但推荐开启
+3. **关闭「监控 ADB 安装应用」** — 避免安装时频繁弹窗确认
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L1-L30)
+
+## 完整配置流程
+
+配置无线 ADB 遵循「USB 初始化 → TCP/IP 切换 → 无线连接」的三步流程，重启后需重复步骤一至三。
+
+```mermaid
+flowchart TD
+    A[USB 数据线连接手机与电脑] --> B[adb devices - 确认设备已识别]
+    B --> C{设备状态为 device?}
+    C -->|是| D[adb tcpip 5555 - 切换到 TCP/IP 模式]
+    C -->|否| E[检查驱动/USB 调试开关/重新插拔]
+    E --> B
+    D --> F[拔掉 USB 数据线]
+    F --> G[adb connect 手机IP:5555]
+    G --> H{连接成功?}
+    H -->|是| I[✅ 无线 ADB 就绪]
+    H -->|否| J[检查网络连通性<br>ping 手机IP]
+    J --> K{能 ping 通?}
+    K -->|是| L[检查端口占用<br>netstat -an]
+    K -->|否| M[确认手机与电脑<br>在同一网络]
+    L --> G
+    M --> G
+```
+
+### 步骤一：USB 初始化连接
+
+用 USB 数据线将手机连接到电脑，手机端会弹出「允许 USB 调试」的授权弹窗，勾选「一律允许使用这台计算机进行调试」后点击确定。
+
+在电脑终端验证设备识别状态：
+
+```bash
+adb devices
+```
+
+预期输出：
+```
+List of devices attached
+0123456789ABCDEF    device
+```
+
+状态为 `device` 表示正常；状态为 `unauthorized` 表示未授权，请检查手机屏幕上的授权弹窗；状态为 `offline` 表示连接异常，尝试重新插拔数据线。
+
+### 步骤二：切换到 TCP/IP 模式
+
+保持 USB 连接，在电脑终端执行：
+
+```bash
+adb tcpip 5555
+```
+
+输出 `restarting in TCP mode port: 5555` 表示切换成功。此时手机的 ADB 守护进程已从 USB 通道切换到网络端口 5555 上监听。注意，此命令只需在首次配置或手机重启后执行一次。
+
+### 步骤三：拔线并无线连接
+
+拔掉 USB 数据线，从电脑侧发起无线连接：
+
+```bash
+adb connect 手机IP地址:5555
+```
+
+手机 IP 地址可通过以下方式获取：
+- 手机「设置 → 关于手机 → 状态信息 → IP 地址」
+- 或在 Termux 中执行 `ifconfig`，查找 `wlan0`（WiFi）或 `wlan2`（热点）接口的 `inet` 地址
+
+连接成功输出 `connected to 手机IP:5555`。验证连接状态：
+
+```bash
+adb devices
+```
+
+此时应看到设备列表中出现 `手机IP:5555 device` 的记录。
+
+### 步骤四：日常使用
+
+配置成功后，每次电脑连接上手机所在的网络（热点或同一 WiFi），只需直接执行：
+
+```bash
+adb connect 手机IP:5555
+```
+
+即可恢复无线连接。确认连接后即可通过 ADB 进行文件传输、应用安装、日志查看等操作。
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L1-L50), [06-NeuralBridge配置SKILL.md](docs/经验/06-NeuralBridge配置SKILL.md#L1-L30)
+
+## 网络拓扑分析
+
+无线 ADB 的连接取决于手机与电脑之间的网络可达性。Pocket-Agent 的开发环境有两种典型网络拓扑：
+
+### 拓扑 A：手机开启热点，电脑连接
+
+```
+┌──────────────────┐          WiFi 热点          ┌──────────────────┐
+│      Android 手机  │ ◄─────────────────────────► │      电脑        │
+│   IP: 10.143.89.72 │        AP 模式             │  IP: 10.143.89.x │
+│   ADB 端口: 5555   │                            │                  │
+└──────────────────┘                              └──────────────────┘
+```
+
+- **优点**：手机 IP 固定，不依赖外部路由器，适用于户外或无 WiFi 环境
+- **缺点**：手机无法同时上网（热点和移动数据通常不能共存），手机耗电较快
+- **适用场景**：现场调试、户外开发、临时连接
+
+### 拓扑 B：手机和电脑连接同一个路由器 WiFi
+
+```
+┌──────────┐         ┌──────────────┐         ┌──────────┐
+│  Android 手机 │─────►│   路由器/AP    │◄─────│    电脑    │
+│            │     │  (无 AP 隔离)  │     │          │
+└──────────┘         └──────────────┘         └──────────┘
+```
+
+- **优点**：手机可同时上网，连接更稳定
+- **缺点**：部分公共 WiFi 或公司网络启用了 **AP 隔离**（客户端间隔离），导致 ADB 无法连接
+- **适用场景**：家庭开发环境、办公室内部网络
+
+**故障判断**：如果 `adb connect` 长时间无响应或返回 `cannot connect to 手机IP:5555: 无法连接`，先执行 `ping 手机IP`，能 ping 通则说明网络正常、问题在 ADB 端口；ping 不通则说明网络隔离或 IP 错误。
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L80-L120), [06-NeuralBridge配置SKILL.md](docs/经验/06-NeuralBridge配置SKILL.md#L55-L80)
+
+## 手机重启后的恢复流程
+
+手机重启后，ADB 的 TCP/IP 模式和 ADB 守护进程都会恢复到初始状态，无线连接失效。恢复流程如下：
+
+```mermaid
+flowchart LR
+    A[手机重启] --> B[USB 连接电脑]
+    B --> C[adb tcpip 5555]
+    C --> D[拔掉 USB 线]
+    D --> E[adb connect 手机IP:5555]
+    E --> F[恢复无线 ADB]
+```
+
+注意：重启后 `adb tcpip 5555` 必须从 USB 有线连接执行，因为手机重启后 ADB 默认只在 USB 通道监听。这是一个**一次性操作**，之后的重启都需要重复此流程。建议将这条命令贴在 Termux 的备忘脚本中，或在手机桌面创建快捷方式。
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L25-L45)
+
+## 与 Pocket-Agent 工具链的集成
+
+无线 ADB 虽然不是 Agent 运行时的直接依赖，但在 Pocket-Agent 的**开发与运维**中不可或缺：
+
+### 初始环境搭建
+
+执行 `adb install` 安装 Termux、NeuralBridge Companion App 等基础应用，这是后续所有操作的起点：
+
+```bash
+# 安装 Termux（如果尚未安装）
+adb install termux-app.apk
+
+# 安装 NeuralBridge Companion
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# 推送模型文件到手机
+adb push bge-m3-Q4_K_M.gguf /sdcard/Pocket-Agent/
+adb push gelab-zero-4b-preview.gguf /sdcard/Pocket-Agent/
+```
+
+Sources: [06-NeuralBridge配置SKILL.md](docs/经验/06-NeuralBridge配置SKILL.md#L20-L25)
+
+### 代码同步与更新
+
+在电脑上开发 Pocket-Agent 代码后，通过 ADB 无线推送到手机：
+
+```bash
+# 推送项目目录
+adb push Pocket-Agent /sdcard/手机agent开发/
+
+# 或通过 SCP（需要先配好 SSH）
+# scp -P 8022 -r Pocket-Agent u0_a391@手机IP:~/storage/shared/手机agent开发/
+```
+
+### 调试信息采集
+
+当 Agent 运行时出现异常，通过 ADB 获取系统日志：
+
+```bash
+# 查看 Pocket-Agent 进程日志
+adb logcat | grep -E "pocket-agent|python|Pocket-Agent"
+
+# 查看 Termux 崩溃日志
+adb logcat -b crash | grep termux
+
+# 查看 ANR（应用无响应）信息
+adb logcat -b events | grep am_anr
+```
+
+### 查看 NeuralBridge 连接状态
+
+当 Agent 的 MCP 调用失败时，通过 ADB 检查 NeuralBridge 服务是否正常：
+
+```bash
+# 查看 NeuralBridge 进程是否存在
+adb shell ps | grep neuralbridge
+
+# 查看服务是否在监听端口
+adb shell netstat -an | grep 7474
+
+# 重新启动 NeuralBridge App
+adb shell am start -p com.neuralbridge.companion
+```
+
+Sources: [06-NeuralBridge配置SKILL.md](docs/经验/06-NeuralBridge配置SKILL.md#L85-L110)
+
+## 故障排查指南
+
+### 连接层问题
+
+| 症状 | 原因 | 解决方案 |
+|------|------|---------|
+| `adb devices` 显示 `unauthorized` | 手机端未授权电脑调试 | 查看手机屏幕，点击「允许 USB 调试」并勾选「一律允许」 |
+| `adb devices` 显示 `offline` | USB 连接不稳定或驱动问题 | 重新插拔数据线，或更换数据线（部分充电线不支持数据传输） |
+| `cannot connect to IP:5555: No route to host` | 网络不通 | 执行 `ping 手机IP`，若 ping 不通则检查网络连接和 AP 隔离 |
+| `cannot connect to IP:5555: Connection refused` | ADB 守护进程未在 TCP 端口监听 | 重新用 USB 执行 `adb tcpip 5555` |
+| 连接成功但几秒后断开 | WiFi 信号弱或手机进入省电模式 | 关闭手机省电模式，确保信号稳定 |
+| `more than one device/emulator` | 同时连接了多个设备 | 使用 `adb -s 设备ID connect` 指定具体设备 |
+
+### 网络层问题
+
+最常见的原因是 **AP 隔离**（客户端隔离），常见于：
+- 公司 / 学校公共 WiFi
+- 酒店 WiFi
+- 开启了「客户端隔离」功能的路由器
+
+**验证方法**：在电脑上 ping 手机 IP，如果 ping 不通但手机确实在同一网络，则大概率启用了 AP 隔离。
+
+**解决方案**：
+1. 使用手机个人热点（热点模式下手机是 AP，电脑是客户端，不存在隔离问题）
+2. 使用 USB 网络共享（手机通过 USB 为电脑提供网络，延迟最低、最稳定）
+3. 更换为家庭个人路由器（通常默认不开启 AP 隔离）
+
+### 特殊场景：IP 变更
+
+手机更换 WiFi 网络后 IP 会变更。使用 `adb connect` 之前，先通过 Termux 中的 `ifconfig` 命令或手机设置确认当前 IP，使用新 IP 重新连接。
+
+```bash
+# 断开旧连接（如果连接了错误的 IP）
+adb disconnect
+
+# 查看当前所有已注册的设备
+adb devices -l
+
+# 用新 IP 重新连接
+adb connect 新IP:5555
+```
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L50-L75), [06-NeuralBridge配置SKILL.md](docs/经验/06-NeuralBridge配置SKILL.md#L55-L80)
+
+## 常用 ADB 命令速查
+
+以下命令在 Pocket-Agent 开发和调试中最常用：
+
+### 应用管理
+
+```bash
+adb install -r app.apk                    # 安装/覆盖安装 APK
+adb uninstall 包名                        # 卸载应用
+adb shell pm list packages | grep 关键词   # 搜索已安装应用
+adb shell pm path 包名                    # 查看 APK 安装路径
+adb shell pm clear 包名                   # 清除应用数据（类似重装）
+```
+
+### 文件操作
+
+```bash
+adb push 本地文件 /sdcard/Pocket-Agent/   # 电脑 → 手机
+adb pull /sdcard/Pocket-Agent/文件 ./     # 手机 → 电脑
+```
+
+### 调试与分析
+
+```bash
+adb logcat -s Python:*                    # 过滤 Python 日志
+adb logcat | grep -E "ERROR|FATAL"        # 只看错误信息
+adb shell dumpsys battery                 # 电池状态
+adb shell top -n 1                        # CPU/内存实时状态
+adb shell df -h /data                     # 存储空间
+adb shell getprop                         # 设备属性列表
+```
+
+### 系统控制（注意：Android 16 限制部分命令）
+
+```bash
+adb shell input keyevent KEYCODE_BACK     # 返回键
+adb shell input keyevent KEYCODE_HOME     # 桌面
+adb shell am start -p 包名                # 启动应用
+adb shell am force-stop 包名              # 强制停止应用
+```
+
+> ⚠️ 在 Android 16 上，部分 `dumpsys`、`wm`、`svc`、`settings` 命令的权限已被收紧，Termux 环境中不可用。ADB 层面的命令不受此限制影响，但 Agent 运行时不使用 ADB，而是通过 Termux API 和 NeuralBridge 完成操控。
+
+Sources: [07-无线 ADB 调试完整指南.md](docs/经验/07-无线%20ADB%20调试完整指南.md#L100-L170), [phone-control-guide SKILL.md](agent/skills/executor-skills/phone-control-guide/SKILL.md#L30-L35)
+
+## 安全注意事项
+
+无线 ADB 的存在意味着手机的网络端口 5555 对同一网络的所有设备开放。在不信任的网络（如公共 WiFi）上使用无线 ADB 存在安全风险：
+
+- **及时断开**：调试完成后执行 `adb disconnect` 关闭无线 ADB 连接
+- **关闭调试**：不再需要时，在开发者选项中关闭「USB 调试」即可彻底禁用
+- **避免默认 5555**：在有条件的情况下，可使用 `adb tcpip 自定义端口` 更改监听端口
+- **热点更安全**：手机热点网络下，只有连接了热点的设备能访问，相对安全
+
+## 下一步
+
+配置好无线 ADB 后，建议接着配置 [SSH 远程连接](3-ssh-lian-jie-shou-ji-zhong-duan-shuo-ming) 来获得更流畅的远程终端体验，或配置 [NeuralBridge MCP 服务](24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu) 来为 Agent 提供完整的 UI 自动化能力。完整的配置顺序建议：无线 ADB → SSH → NeuralBridge MCP → 本地模型部署。

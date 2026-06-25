@@ -1,0 +1,161 @@
+子 Agent（Executor）并非主 Agent 的简单复制品，而是一个经过**严格裁剪与独立配置**的轻量执行引擎。这种设计遵循最小权限原则——每一个 Agent 实例只拥有完成任务所必需的上下文、工具和能力，从而在保证功能完整性的前提下，最大限度降低 Token 消耗和状态空间复杂度。本文将从 LLM 配置、工具集过滤、技能目录隔离、系统提示词独立四个维度，解析子 Agent 的配置隔离机制。
+
+## 独立 LLM 配置：可复用亦可分离
+
+子 Agent 拥有完全独立的 LLM 配置通道，通过 `.env` 文件中的 `EXECUTOR_*` 系列环境变量控制。在 `agent/config.py` 中，`EXECUTOR_LLM_CONFIG` 字典从环境变量读取所有子 Agent 专属配置：
+
+```python
+EXECUTOR_LLM_CONFIG = {
+    "base_url": os.getenv("EXECUTOR_LLM_BASE_URL"),
+    "api_key": os.getenv("EXECUTOR_API_KEY"),
+    "model": os.getenv("EXECUTOR_MODEL"),
+    "temperature": os.getenv("EXECUTOR_TEMPERATURE"),
+    "max_tokens": os.getenv("EXECUTOR_MAX_TOKENS"),
+}
+```
+
+这些配置的默认值均为 `None`，子 Agent 初始化时的关键逻辑在于**未显式配置的字段自动继承主 Agent**。在 `agent_langchain.py` 的 `_run_executor_foreground` 方法中，当首次创建子 Agent 的 LLM 实例时（`self._executor_llm is None`），会逐字段检查配置是否有效——base_url 为空则使用主 Agent 的 `self.llm.openai_api_base`，api_key 为空则使用 `self.llm.openai_api_key`，model 为空则使用 `self.llm.model_name`，temperature 缺省时默认 0.5，max_tokens 缺省时默认 16000。这种"可选独立、默认共用"的配置策略使部署者可以灵活决定：高性能场景下子 Agent 使用更经济的轻量模型，而低延迟场景下复用主 Agent 的同一 API 端点和模型实例。
+
+值得注意的是，子 Agent LLM 实例的超时设置与主 Agent 不同——`timeout=30` 秒（主 Agent 默认 10 秒），这是因为子 Agent 的核心任务（手机操控、UI 树分析）通常涉及多步交互和等待，需要更长的响应容忍窗口。
+
+Sources: [config.py](agent/config.py#L29-L39), [agent_langchain.py](agent/agent_langchain.py#L585-L586,L1610-L1635)
+
+## 工具集白名单隔离：能力范围精确限定
+
+子 Agent 可用的工具集是主 Agent 全部工具的一个**严格子集**，通过白名单机制实现过滤。在 `_run_executor_foreground` 方法中，执行器仅允许以下六类工具：
+
+```python
+executor_tool_names = {"shell_exec", "file_read", "file_write", "file_search", "mcp_call", "system_info", "tts_speak"}
+executor_tools = [t for t in ALL_TOOLS if t.name in executor_tool_names]
+```
+
+这组工具的选择暗含对子 Agent 职责边界的精确判断：
+- **shell_exec** + **mcp_call**：完成手机操控核心操作——执行 Shell 命令、调用 NeuralBridge 进行 UI 树分析和点击滑动
+- **file_read** + **file_write** + **file_search**：读取任务文件、写入执行进度、搜索相关技能文档
+- **system_info**：获取设备状态，辅助调试
+- **tts_speak**：人工介入时通过语音通知用户
+
+被排除的工具则对应主 Agent 专属能力：
+- **save_memory** / **search_memory** / **update_user_profile**：记忆系统应由主 Agent 管理，子 Agent 不感知用户画像和跨会话记忆
+- **delegate_task**：子 Agent 是执行终点，不能再递归派发子任务
+- **control_body** / **move_body** / **body_script** / **body_idle**：3D 身体控制属于主 Agent 的交互层
+
+这种白名单隔离机制在代码层面通过循环 `ALL_TOOLS` 并匹配白名单集合实现，简单高效，且易于扩展——新增工具只需在 `ALL_TOOLS` 中注册，而子 Agent 的可见性由 `executor_tool_names` 集合独立控制。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1591-L1594), [basic_tools.py](agent/tools/basic_tools.py#L994-L1002)
+
+## 技能目录独立加载：知识文档的完全隔离
+
+技能隔离是子 Agent 配置最体现架构设计意图的维度。主 Agent 和子 Agent 各自维护完全独立的技能目录树，互不可见。
+
+| Agent 类型 | 技能根目录 | 自动沉淀目录 | 加载函数 |
+|---|---|---|---|
+| 主 Agent | `agent/skills/main-skills/` | `agent/skills/auto-skills/main/` | `load_skills_list("main")` |
+| 子 Agent | `agent/skills/executor-skills/` | `agent/skills/auto-skills/executor/` | `load_skills_list("executor")` |
+
+这种隔离的语义价值在于：主 Agent 的技能（开发规范、代码审查、3D 身体动作编排等）对于执行手机操控的子 Agent 毫无意义，反之亦然。子 Agent 的技能只包含手机操控场景的知识文档，包括：
+- **phone-control-guide**：Termux Shell 命令与包名管理指南
+- **neuralbridge-operation-standard**：NeuralBridge MCP 调用规范
+- **fast-mode**：高速模式操作规范
+- **skill-creator**：执行完毕后自动沉淀技能时的格式模板
+
+`load_skills_list` 函数通过参数 `agent_type` 区分加载路径，内部调用 `_scan_skills` 递归扫描目录，支持扁平模式（子目录直接含 SKILL.md）和分类模式（子目录下再含子目录有 SKILL.md）。对于子 Agent，还会额外扫描 `auto-skills/executor/` 目录下的自动沉淀技能，这些技能是子 Agent 历史上执行过的多步骤任务的"经验记录"，供后续同类任务复用。
+
+Source: [agent_langchain.py](agent/agent_langchain.py#L46-L121)
+
+## 系统提示词独立设计：人设、规则与执行流程定制
+
+子 Agent 拥有完全独立于主 Agent 的系统提示词体系，由 `executor_system_prompt`（基础人设）和 `executor_enhance_prompt`（增强规则）两层构成。这两者通过格式化拼接动态注入工具列表和技能列表：
+
+```python
+enhanced = executor_enhance_prompt.format(
+    tool_names=executor_tool_names_str,
+    skills_list=executor_skills,
+)
+system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
+```
+
+对比主 Agent 和子 Agent 的系统提示词设计，可以清晰看到职责边界的差异：
+
+**主 Agent 人设（system_base.py）**：强调全方位的智能助手形象——文件操作、系统命令、手机控制、3D 身体控制、记忆力、任务分解能力。关键规则是"判断复杂操作后派发给 executor"。
+
+**子 Agent 人设（executor_system.py）**：定位为"手机操控执行助手"——所有规则围绕执行的精确性和完整性展开：
+- **强制完成**：必须完成 task.json 中的所有步骤才能停止，禁止提前终止
+- **禁止纯文本**：每一步都必须通过工具调用完成，禁止只输出文字描述
+- **逐步标记**：每完成一步立即用 file_write 更新 task.json 状态
+- **坐标来源**：所有点击坐标必须来自 UI 树返回的 bounds，禁止猜测
+- **禁止过度等待**：操作后直接获取 UI 树验证结果，无需无脑 sleep
+
+**增强规则（executor_enhance.py）**：补充执行流程规范和技能使用指引——先读技能再执行、失败后最多换一个替代方案、仍然失败则人工介入（tts_speak 通知用户并等待 30 秒）。
+
+子 Agent 的提示词不包含任何关于记忆系统、用户画像、3D 身体控制、或任务再分解的内容，这与其工具集的白名单设计完全对应。
+
+Sources: [executor_system.py](agent/prompts/executor_system.py#L1-L23), [executor_enhance.py](agent/prompts/executor_enhance.py#L1-L35), [system_base.py](agent/prompts/system_base.py#L1-L20), [agent_enhance.py](agent/prompts/agent_enhance.py#L1-L122)
+
+## 自动技能沉淀：经验的自生长
+
+子 Agent 在执行完任务后，会自动触发技能沉淀流程，将本次执行路径写入 `auto-skills/executor/<技能名称>/SKILL.md`。触发条件需同时满足：步骤数 ≥ 3、有明确目标、没有步骤失败、且实际执行的操作步数 > 2（排除只读取 task.json 就结束的空跑情况）。
+
+沉淀流程的完整链路是：
+1. 子 Agent 读取 skill-creator 技能模板获取格式规范
+2. 读取目标路径 `auto-skills/executor/<skill_name>/SKILL.md`
+3. 如果文件存在且内容完整 → 跳过（避免重复覆盖）
+4. 如果不存在或不完整 → 用 file_write 写入新技能文档
+5. 系统校验基本格式（是否有 frontmatter + name + description）
+6. 格式不合规时提示子 Agent 参照模板重写
+
+这个机制使子 Agent 系统具备了执行经验的**自生长能力**——随着时间的推移，`auto-skills/executor/` 目录中积累的技能越来越多，后续同类任务可以直接复用历史经验，大幅提升执行效率。
+
+Source: [agent_langchain.py](agent/agent_langchain.py#L1950-L2085)
+
+## 架构总览
+
+以下时序图展示主 Agent 委托任务、子 Agent 独立执行并沉淀技能的全流程：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Main as 主 Agent<br/>(main-skills)
+    participant Exec as 子 Agent<br/>(executor-skills)
+    participant Tool as 工具层<br/>(7种白名单工具)
+    participant Skill as 技能仓库<br/>(auto-skills/executor/)
+
+    User->>Main: 执行复杂手机操作
+    Main->>Main: delegate_task() 分解任务
+    Main->>Exec: 派发 task.json
+    Note over Exec: 独立 LLM 实例<br/>独立系统提示词<br/>独立技能目录
+    Exec->>Skill: 读取相关 executor-skill
+    Exec->>Tool: shell_exec / mcp_call
+    Tool-->>Exec: 执行结果
+    Exec->>Exec: 逐步标记完成状态
+    Exec->>Main: 流式输出执行过程
+    Exec->>Skill: 自动沉淀经验 → auto-skills/executor/
+    Main->>User: 汇报任务完成
+```
+
+## 子 Agent 与主 Agent 配置对比一览
+
+| 维度 | 主 Agent | 子 Agent (Executor) |
+|---|---|---|
+| LLM 配置 | `LLM_*` 环境变量，默认 temperature=0.7, max_tokens=8000 | `EXECUTOR_*` 环境变量，未设置继承主 Agent，默认 temperature=0.5, max_tokens=16000 |
+| LLM 超时 | 10秒 | 30秒 |
+| 可用工具 | 全部 12+ 工具（含记忆、身体控制、委托等） | 7 种工具白名单（无记忆/身体/委托工具） |
+| 技能目录 | `main-skills/` + `auto-skills/main/` | `executor-skills/` + `auto-skills/executor/` |
+| 系统提示词 | 智能助手人设 + 增强规则 + 技能列表 | 手机操控执行助手人设 + 强制执行规则 + 流程规范 |
+| 对话历史 | LangGraph Checkpoint 持久化到 SQLite | MemorySaver（仅内存，不持久化） |
+| 中间件链 | 上下文压缩 + 重复检测 + 模型调用限制 + 图片优化 | ToolCallIdMiddleware + ModelCallLimitMiddleware |
+| 自学习能力 | 无自动沉淀 | 执行完毕自动沉淀技能到 auto-skills |
+
+子 Agent 的独立性体现在从 LLM 到底层技能文档的**全链路隔离**，这种架构设计确保了多层 Agent 系统中每个层次只关注自己的职责边界，避免了状态膨胀和能力越界。
+
+Sources: [config.py](agent/config.py#L29-L49), [agent_langchain.py](agent/agent_langchain.py#L1591-L1645), [executor_system.py](agent/prompts/executor_system.py#L1-L23)
+
+## 深入阅读
+
+子 Agent 独立配置与技能隔离机制与以下页面紧密相关：
+
+- **[子 Agent 委托机制](29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa)**：主 Agent 如何通过 delegate_task 工具将任务分解并派发给子 Agent
+- **[子 Agent 技能](35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan)**：executor-skills 目录下各技能的具体内容和使用场景
+- **[自动沉淀技能](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)**：auto-skills/executor 中自动沉淀技能的管理与复用
+- **[子 Agent 提示词设计](39-zi-agent-ti-shi-ci-she-ji-du-li-xi-tong-ren-she-yu-zhi-xing-liu-cheng)**：子 Agent 系统提示词与增强规则的深度解析
+- **[环境变量配置说明](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)**：子 Agent 独立 LLM 配置的完整环境变量参考

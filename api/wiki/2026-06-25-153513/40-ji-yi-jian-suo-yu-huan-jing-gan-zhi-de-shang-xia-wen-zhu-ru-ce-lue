@@ -1,0 +1,295 @@
+本文深入剖析 Pocket-Agent 如何将**用户画像**、**环境状态**和**历史记忆**三类异构上下文，在非阻塞架构下无缝注入到每一次 LLM 调用中。这是系统实现"感知智能"的核心机制——让 Agent 不仅知道"用户说了什么"，还能感知"用户身处的环境"和"过去发生过什么"，而无需用户重复提供背景信息。
+
+## 三层上下文注入架构
+
+Pocket-Agent 的上下文注入分为**系统级**、**会话级**和**运行时级**三个层次，各层职责明确、互不干扰：
+
+| 层级 | 注入时机 | 数据来源 | 作用域 | 实现位置 |
+|------|---------|---------|--------|---------|
+| **系统级** | Agent 创建时 | `system_base.py` + `agent_enhance.py` + 技能列表 | 全局生命周期 | `_create_agent()` 中的 `system_prompt` |
+| **会话级** | 每次用户消息前 | 用户画像 + 环境标签 + Top-3 相关记忆 | 单次对话轮次 | `run_conversation()` / `stream_conversation()` 的 `combined_message` |
+| **运行时级** | 工具调用过程中 | 中间件链实时处理 | 单次工具调用 | `MCPToolResultMiddleware` / `ImageOptimizationMiddleware` 等 |
+
+**系统级注入**发生在 `_create_agent()` 方法中：将 `system_base.py` 的基础人设、`agent_enhance.py` 的增强规则（含工具列表、技能列表、记忆使用规范）拼接为完整的系统提示词，传递给 `create_agent()`。这部分内容在 Agent 整个生命周期内固定不变，占据约 2-4K tokens 的上下文窗口。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L802-L828), [prompts/system_base.py](agent/prompts/system_base.py#L1-L20), [prompts/agent_enhance.py](agent/prompts/agent_enhance.py#L1-L122)
+
+**会话级注入**是本文的核心关注点。在 `run_conversation()` 方法的每次对话轮次中，系统会收集三类数据并合并到用户消息之前：
+
+```python
+# 三层上下文的动态装配
+combined_context = "\n\n".join(filter(None, [
+    profile_text,     # 用户画像（静态文件）
+    env_text,         # 环境标签（缓存）
+    memory_text       # 相关记忆（按需检索）
+]))
+combined_message = f"{combined_context}\n\n---\n{user_message}"
+```
+
+这三层上下文通过分隔符 `---` 与用户原始消息隔离，既保证 LLM 能区分"背景信息"和"当前输入"，又避免修改 LangGraph 的状态图结构——所有上下文都以 HumanMessage 的内容前缀形式注入。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L992-L1007), [agent_langchain.py](agent/agent_langchain.py#L1340-L1353)
+
+## 环境感知系统：无阻塞传感器管道
+
+环境感知系统的设计哲学是**"后台采集、缓存复用、绝不阻塞对话"**。其数据流如下：
+
+```mermaid
+flowchart TB
+    subgraph 采集层["采集层（后台线程）"]
+        TIME["date +%H:%M"]
+        TZ["getprop persist.sys.timezone"]
+        LIGHT["termux-sensor 光照传感器"]
+        ACCEL["termux-sensor 加速度计"]
+        BATT["termux-battery-status"]
+        LOC["termux-location 网络定位"]
+    end
+
+    subgraph 推理层["推理层"]
+        HOUR["时段推断<br/>（上午/下午/傍晚/深夜）"]
+        LUX["光照判断<br/>（极暗/较暗/正常/明亮）"]
+        MOVE["活动判断<br/>（静止/轻微/移动中）"]
+        PWR["电量分析<br/>（低电量/充电/未充电）"]
+    end
+
+    subgraph 输出层["输出层"]
+        CACHE["_cached_env_tag<br/>（文本标签缓存）"]
+        TAG["[环境状态感知] 现在是XX，XX时段；<br/>光线正常；手机静止；<br/>电量85%未充电..."]
+    end
+
+    TIME --> HOUR
+    TZ --> HOUR
+    LIGHT --> LUX
+    ACCEL --> MOVE
+    BATT --> PWR
+    LOC --> TAG
+
+    HOUR --> TAG
+    LUX --> TAG
+    MOVE --> TAG
+    PWR --> TAG
+
+    TAG --> CACHE
+
+    CACHE -->|"每次对话读取"| RUN["run_conversation()"]
+    RUN -->|"对话结束后<br/>异步刷新"| REFRESH["_refresh_env_cache()"]
+    REFRESH -->|"后台 asyncio.create_task"| TIME
+```
+
+`_sense_environment()` 方法负责完整的数据采集和推理。它依次执行五个 Termux 传感器命令，每个命令都有 3-5 秒的独立超时，任一命令失败不会影响其他数据的采集：
+
+- **时间与时区**：`date +"%H:%M"` + `getprop persist.sys.timezone`，按小时分为 5 个时段（上午/中午/下午/傍晚/深夜）
+- **光照传感器**：`termux-sensor -s "tcs3760 Ambient Light Sensor Non-wakeup"`，阈值分为 <1lux（极暗）、<50lux（较暗）、<500lux（正常）、≥500lux（明亮）
+- **加速度计**：`termux-sensor -s "lsm6dsv Accelerometer Non-wakeup" -n 3`，采集 3 组样本，计算 x/y/z 轴最大差异值，<0.3 判定静止、<2.0 判定轻微活动、≥2.0 判定移动中
+- **电池状态**：`termux-battery-status`，低电量（<20%）会提示"建议简短回复"
+- **网络定位**：`termux-location -p network`（超时 3 秒），仅采集经纬度
+
+最终的输出格式为：`[环境状态感知] 现在是14:30(Asia/Shanghai)，下午工作时段；光线正常，室内；手机静止，用户可能坐着或没在使用手机；电量85%未充电；定位(22.54,114.06)。（仅供内部参考，不要在回复中提及此信息）`
+
+其中末尾的"仅供内部参考"约束是提示词工程技巧，防止 LLM 在回复中暴露环境数据。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L700-L795), [config.py](agent/config.py#L93-L107)
+
+**缓存刷新策略**采用"对话结束时异步刷新"模式：每次 `run_conversation()` 返回前，通过 `asyncio.create_task(self._refresh_env_cache())` 在后台启动一次环境采集。这样下一次对话开始时 `_cached_env_tag` 已经是最新数据，无需等待传感器响应。`asyncio.Lock()` 确保即使并发触发也只有一个刷新任务在执行。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L797-L802), [agent_langchain.py](agent/agent_langchain.py#L1225-L1227)
+
+## 记忆检索系统：RRF 融合与智能过滤
+
+记忆检索的核心是 `_search_relevant_memories()` 方法，它在每次对话轮次中自动搜索与用户消息语义相关的 Top-3 记忆，以 `[相关记忆]` 标记注入上下文：
+
+```mermaid
+flowchart LR
+    subgraph 用户输入["用户输入"]
+        QUERY["用户消息文本"]
+    end
+
+    subgraph 检索管道["检索管道（在线程池中执行）"]
+        FTS["FTS5 trigram<br/>全文搜索"]
+        VEC["Embedding API + numpy<br/>向量语义搜索"]
+    end
+
+    subgraph 融合排序["融合排序"]
+        RRF["RRF 融合<br/>k=60"]
+        WEIGHT["综合性加权<br/>语义×0.75 + 时间×0.25"]
+    end
+
+    subgraph 注入层["注入层"]
+        FILTER["过滤 dance 类型<br/>（防 token 浪费）"]
+        TRUNC["截断每条约150字符"]
+        FORMAT["格式化为<br/>[相关记忆]\\n- 内容1\\n- 内容2\\n- 内容3"]
+    end
+
+    QUERY --> FTS
+    QUERY --> VEC
+
+    FTS -->|"id + rank"| RRF
+    VEC -->|"id + similarity"| RRF
+
+    RRF --> WEIGHT
+    WEIGHT --> FILTER
+    FILTER --> TRUNC
+    TRUNC --> FORMAT
+
+    FORMAT -->|"注入到<br/>combined_message"| CTX["会话级上下文"]
+```
+
+检索在异步线程池中执行以避免阻塞事件循环：
+
+```python
+async def _search_relevant_memories(self, query: str, top_n: int = 3) -> str:
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, lambda: _rrf_merge(
+        _fts_search(query, msg_type="memory"),
+        _vector_search(query, msg_type="memory"),
+        top_n=top_n
+    ))
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L804-L821)
+
+### 双通道检索详解
+
+**通道一：FTS5 trigram 全文搜索**。`_fts_search()` 利用 SQLite FTS5 的 trigram tokenizer 实现中文支持。搜索分两轮：先尝试对长度 ≥3 的关键词做 FTS5 `MATCH` 查询，再用 LIKE 子句对短词（<3字符）做补充。中文无空格的长句（如"动作舞蹈编排"）会被自动按 2 字切分为 ["动作","舞蹈","编排"] 进行 LIKE 匹配。返回结果按 FTS5 rank 排序，取 Top-20。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L340-L398), [basic_tools.py](agent/tools/basic_tools.py#L299-L338)
+
+**通道二：向量语义搜索**。`_vector_search()` 调用 `VectorStore.query()` 方法：先通过 `EmbeddingClient` 生成查询文本的 1024 维向量（BGE-M3 模型），然后在 `embeddings` 表中用 numpy 批量计算余弦相似度，保留 `distance < 0.65`（即相似度 > 0.35）的结果。SQL 层面支持 `conversation_id`、`msg_type`、`days`、`memory_type` 过滤，确保只在目标子集内计算向量距离，避免全表扫描。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L400-L461), [embedding.py](agent/embedding.py#L133-L198)
+
+**融合排序算法**：`_rrf_merge()` 使用带权重的改良 RRF（Reciprocal Rank Fusion）策略。先分别计算两个通道的 RRF 分数（k=60），然后根据三条信号计算综合分数：
+
+1. **语义相关性**（权重 0.75）：RRF 分数 × `(0.5 + similarity)`，其中 FTS 结果无 similarity 字段时使用 0.5 兜底
+2. **时间新鲜度**（权重 0.25）：指数衰减 `0.995^小时数`，最近 3 天衰减到约 0.87，7 天约 0.72
+3. **重要性微调**（乘法因子）：`0.8 + importance × 0.04`，重要性 3 分得 0.92 倍，5 分得 1.0 倍，8 分得 1.12 倍
+
+设计原则是**语义相关性为主、时间为辅、重要性仅做微调**——确保低相关但高重要性的记忆不会靠权重"爬上来"。
+
+Sources: [basic_tools.py](agent/tools/basic_tools.py#L463-L505)
+
+### 智能过滤与 token 控制
+
+注入前会执行两层过滤：
+1. **过滤舞蹈类记忆**：`memory_type == "dance"` 的记忆体量大（动作序列 JSON），被自动排除在自动注入之外。Agent 需要检索舞蹈动作时需显式调用 `search_memory(memory_type="dance")`
+2. **截断长度**：每条记忆超过 150 字符时截断并加 `...`，避免注入过多 token
+
+这两层过滤在 `_search_relevant_memories()` 中实现，最终的注入格式为：
+
+```
+[相关记忆]
+- 用户偏好使用简洁回答风格
+- 上次项目选择了 FastAPI 作为后端框架
+- 用户提到过正在学习 langchain 框架
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L804-L821)
+
+## 用户画像注入：静态加载与动态更新
+
+用户画像存储在 `memory/user_profile.md` 文件中，采用 Markdown 格式分章节组织（基本信息、沟通偏好、行为要求、反馈、其他）。它在 Agent 初始化时通过 `LongTermMemory.get_user_profile()` 一次性加载到 `self._user_profile` 属性中，后续每次对话都直接复用这个字符串。
+
+与记忆不同，用户画像**不做检索**——它作为"永久性背景信息"在每次对话中都无条件注入（因为信息量很小，通常不超过 500 字符）。这是设计决策：画像数据应该极精简，"宁缺毋滥"，只有真正跨项目、跨场景仍然成立的永久信息才存入。
+
+用户画像的更新只能通过 `update_user_profile` 工具，该工具解析当前画像文件的 Markdown 结构，找到或创建对应的 `## 章节` 标题后写入内容。工具链上有严格的**门禁规则**：禁止用 `file_write` 直接修改画像文件。
+
+Sources: [memory.py](agent/memory.py#L1-L64), [basic_tools.py](agent/tools/basic_tools.py#L600-L625)
+
+## 完整的上下文注入流程
+
+下图展示了从用户输入到 LLM 调用的完整数据流：
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant Agent as LangChainPocketAgent
+    participant Cache as 环境缓存
+    participant DB as SQLite + FTS5
+    participant Vec as VectorStore
+    participant LLM as LLM API
+
+    User->>Agent: 发送消息
+
+    Note over Agent: 1. 检查环境缓存
+    Agent->>Cache: 读取_cached_env_tag
+    Cache-->>Agent: [环境状态感知] ...
+
+    Note over Agent: 2. 在线程池中检索记忆
+    Agent->>+DB: FTS5 trigram 搜索
+    Agent->>+Vec: 向量语义搜索
+    DB-->>-Agent: FTS 结果 (rank排序)
+    Vec-->>-Agent: 向量结果 (similarity排序)
+
+    Note over Agent: 3. RRF 融合排序
+    Agent->>Agent: _rrf_merge(top_n=3)
+    Note over Agent: 过滤 dance 类型<br/>截断 150 字符
+
+    Note over Agent: 4. 装配三层上下文
+    Agent->>Agent: combined_message =<br/>用户画像 + 环境标签 + [相关记忆]<br/>+ "---" + 用户消息
+
+    Note over Agent: 5. 中间件链处理
+    Agent->>Agent: MCPToolResultMiddleware
+    Agent->>Agent: ImageOptimizationMiddleware
+    Agent->>Agent: SummarizationMiddleware
+    Agent->>Agent: ModelCallLimitMiddleware
+
+    Agent->>LLM: astream() 携带完整上下文
+
+    LLM-->>Agent: 流式响应
+
+    Note over Agent: 6. 对话完成后
+    Agent->>Agent: asyncio.create_task<br/>_refresh_env_cache()
+    Agent-->>User: 响应内容
+```
+
+链式中间件在 `_create_agent()` 中按顺序注册，依次为：MCP 图片格式优化 → 历史图片清理 → 重复工具调用检测 → 工具调用 ID 修复 → 上下文压缩（token 超过 64K 时触发） → 模型调用次数限制。这些中间件在内存检索和上下文注入之后执行，确保 LLM 收到的消息已经过优化。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L802-L828), [agent_langchain.py](agent/agent_langchain.py#L840-L865)
+
+## 提示词中的记忆使用约束
+
+为了让 Agent 正确使用注入的上下文，`agent_enhance.py` 中定义了三条关键规则（违反会被"严厉批评"）：
+
+1. **"系统已自动注入 top 3 相关记忆（标记为 [相关记忆]），不包含 dance 类型记忆"** — 告诉 Agent 上下文中已有记忆，无需重复调用 `search_memory`
+2. **"需要深入搜索时才调用 search_memory"** — 明确什么情况下才需要主动搜索（上下文不够用、用户要求回忆、需要按类型/时间过滤）
+3. **"严禁说'根据记忆''从记忆中''我记得'等话术"** — 要求 Agent 把记忆内容当作自然知道的事实输出，不能暴露上下文注入的存在
+
+最后一条是**幻觉伪装技术**（hallucination masking）——不是让 Agent 产生幻觉，而是让它以自然的方式引用真实信息，避免破坏用户体验的沉浸感。
+
+Sources: [prompts/agent_enhance.py](agent/prompts/agent_enhance.py#L74-L95)
+
+## 去重与冲突处理
+
+两层去重机制确保上下文注入不会导致输出重复：
+
+**第一层：会话级去重**。在 `run_conversation()` 的流式处理中，`[去重检测]` 逻辑会检查当前收到的 chunk 内容（≥15 字符）是否已在 `full_response` 的后 400 字符窗口中出现过。这是针对 LLM 在调用工具后可能重新生成相同文本的防御机制。
+
+**第二层：后处理去重**。流结束后，取 `full_response` 前 80 字符在后文中搜索第二次出现的位置，如果找到则截断。这对 tts_speak 等工具调用后模型重复输出内容的情况有效。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1031-L1035), [agent_langchain.py](agent/agent_langchain.py#L1175-L1182)
+
+上下文压缩中间件 `SummarizationMiddleware` 在 token 总量超过 `MAX_CONTEXT_TOKENS // 2`（即 64K）时自动触发，保留最近 20 条消息并压缩历史。这是防止长期对话中上下文无限膨胀的兜底机制。
+
+## 上下文窗口审计
+
+`get_context_usage()` 方法提供了精确的 token 用量审计，它直接构建当前状态中的 `[系统提示词 + 所有历史消息 + 工具定义]` 完整数组，通过 `count_tokens_approximately()` 以 `chars_per_token=2.0`（中英文混合场景）估算。结果随每次对话完成输出，格式为 `64.8K/128K (50.6%) ████████░░░░░░`。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L936-L972)
+
+## 设计决策总结
+
+| 决策 | 选择 | 替代方案 | 理由 |
+|------|------|---------|------|
+| 上下文注入位置 | HumanMessage 内容前缀 | System prompt 动态更新 | 避免修改 LangGraph 状态结构，支持差异化每轮注入 |
+| 环境感知频率 | 对话间缓存刷新 | 实时同步采集 | 避免传感器 I/O 阻塞对话启动，毫秒级响应 |
+| 记忆检索时机 | 每轮对话自动检索 | 仅 Agent 主动调用 | 被动注入让 Agent 无需感知记忆存在 |
+| 检索融合策略 | RRF(全文+向量) | 仅向量搜索 | 中英文混合场景 FTS5 trigram 准确率高于向量 |
+| 舞蹈记忆处理 | 排除在自动注入外 | 全部注入 | 动作 JSON 数据量大，按需检索更经济 |
+| 用户画像更新 | 仅通过 update_user_profile 工具 | 允许 file_write | 门禁约束防止数据污染 |
+
+## 下一步阅读
+
+- [分层记忆架构（用户画像 + 事实记忆 + 事件记忆）](15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi) — 记忆系统的数据模型与分层设计原理
+- [RRF 融合排序策略](18-rrf-rong-he-pai-xu-ce-lue) — 融合排序算法的数学推导与参数调优
+- [向量语义搜索（EmbeddingClient + numpy 余弦相似度）](17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du) — 向量存储与相似度计算实现细节
+- [中间件链深度解析（上下文压缩、重复检测、模型调用限制）](11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi) — 上下文注入后的中间件处理流水线

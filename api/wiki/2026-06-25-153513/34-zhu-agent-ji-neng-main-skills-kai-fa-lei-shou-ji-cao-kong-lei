@@ -1,0 +1,243 @@
+主 Agent 技能系统是 Pocket-Agent 中面向主 Agent（master agent）的知识文档体系，存储在 `agent/skills/main-skills/` 目录下。与工具（tools）不同——工具是可执行的函数调用接口，而技能是结构化的 **SKILL.md 知识文档**，主 Agent 通过 `file_read` 工具读取这些文档，获取特定领域的执行方法论、规范流程和参考数据，再据此行动。技能的本质是"教 Agent 如何思考"，而非"替 Agent 执行操作"。
+
+技能系统的设计遵循**懒加载与按需注入**原则：每次对话启动时，系统扫描 `main-skills/` 目录下所有 SKILL.md，提取其 `description` 元数据字段，格式化后注入到系统提示词中供主 Agent 知晓可用技能列表。但技能文档的完整内容不会自动读入上下文——主 Agent 只在判断需要某个技能时，才主动用 `file_read` 读取对应的 SKILL.md 全文。这种设计避免了上下文窗口被大量静态知识文档浪费，仅在需要时按需加载。
+
+Sources: [agent/config.py](agent/config.py#L35-L38) | [agent/agent_langchain.py](agent/agent_langchain.py#L55-L65) | [agent/agent_langchain.py](agent/agent_langchain.py#L773-L781)
+
+---
+
+## 技能目录结构与分类体系
+
+`main-skills/` 目录采用**两层嵌套分类**结构，通过文件系统目录组织技能的层级关系。顶层目录（`dev/`、`phone/`、`body-moves/`）作为分类命名空间，其下的子目录是具体的技能单元，每个技能单元目录内含一个 `SKILL.md` 文件作为技能定义。加载机制根据目录深度自动识别分类模式——如果顶层子目录直接含 `SKILL.md`（如 `body-moves/`），则为扁平模式（无分类前缀）；如果顶层子目录下嵌套了含 `SKILL.md` 的子子目录（如 `dev/systematic-debugging/`），则为分类模式，在技能列表中自动添加 `【dev】` 分类标签分组显示。
+
+```
+agent/skills/main-skills/
+├── body-moves/              # 扁平模式：3D身体动作控制
+│   ├── SKILL.md
+│   ├── 坐下.json
+│   ├── 广播体操.md
+│   ├── 死机舞.json
+│   └── 疯狂傻子舞V2.json
+├── dev/                     # 分类模式：开发类技能
+│   ├── brainstorming/       → SKILL.md
+│   ├── code-review/         → SKILL.md
+│   ├── skill-creator/       → SKILL.md
+│   ├── systematic-debugging/→ SKILL.md + 配套文档 + 测试
+│   ├── test-driven-development/→ SKILL.md
+│   ├── verification-before-completion/→ SKILL.md
+│   └── writing-plans/       → SKILL.md
+└── phone/                   # 分类模式：手机操控类
+    └── phone-control-quickref/→ SKILL.md
+```
+
+Sources: [agent/config.py](agent/config.py#L35) | [agent/agent_langchain.py](agent/agent_langchain.py#L70-L115)
+
+---
+
+## 开发类技能（dev/）：工程方法论的六边形战士
+
+开发类技能是主 Agent 最核心的知识储备，覆盖从需求构思到代码交付的完整工程生命周期。每个技能都由实践经验沉淀而来，遵循**铁律（Iron Law）**式的强约束规则——不是"建议按此操作"，而是"不按此操作即为违规"——以对抗主 Agent 在时间压力下的理性化（rationalization）倾向。
+
+### 1. systematic-debugging：系统化调试方法论
+
+这是整个技能系统中最为**厚重**的技能，包含一个核心 SKILL.md（297行）和四份配套文档（root-cause-tracing.md、defense-in-depth.md、condition-based-waiting.md）以及三份压力测试文档。其核心理念是**"无根因分析，不修 Bug"**——要求在提出任何修复方案之前，必须先完成完整的根因调查阶段（Phase 1）。技能定义了四个强制顺序阶段：
+
+| 阶段 | 核心要求 | 关键约束 |
+|------|----------|----------|
+| **Phase 1: 根因调查** | 读错误信息→复现→检查近期的变更→多组件系统加诊断埋点→跟踪数据流 | 在此之前禁止提出任何修复方案 |
+| **Phase 2: 模式分析** | 找正常示例→对照参考实现→列出差异→理解依赖关系 | 读参考实现必须逐行读完，不能跳读 |
+| **Phase 3: 假设检验** | 单一假设→最小改动验证→失败则提新假设 | 一次只改一个变量，禁止"顺带修" |
+| **Phase 4: 实施修复** | 先写失败测试→单修复→验证→若≥3次修复失败则质疑架构 | 连续3次修复失败后必须 STOP |
+
+特别值得关注的是**"3次修复失败"规则**：当主 Agent 连续尝试3次修复仍未解决问题，禁止继续尝试第4次修复（"Fix #4"），而必须退回到架构层面进行讨论和重新审视。这与 condition-based-waiting.md 中的条件等待模式（wait for condition, not time）形成呼应——都是通过外在约束防止 Agent 在压力下做出次优决策。
+
+配套文档中 defense-in-depth.md 提出了四层防护验证体系（入口验证→业务逻辑验证→环境守卫→调试埋点），强调"从修复一个 Bug 到让这个 Bug 在结构上不可能重现"的思维转变。
+
+Sources: [agent/skills/main-skills/dev/systematic-debugging/SKILL.md](agent/skills/main-skills/dev/systematic-debugging/SKILL.md#L1-L200) | [agent/skills/main-skills/dev/systematic-debugging/root-cause-tracing.md](agent/skills/main-skills/dev/systematic-debugging/root-cause-tracing.md#L1-L170) | [agent/skills/main-skills/dev/systematic-debugging/defense-in-depth.md](agent/skills/main-skills/dev/systematic-debugging/defense-in-depth.md#L1-L123)
+
+### 2. test-driven-development：TDD 红-绿-重构循环
+
+严格遵循经典的 TDD 三重循环：**Red（写失败测试）→ Green（最小实现代码）→ Refactor（清理重构）**。技能强调"铁律"——不先写测试就写生产代码？删除重来。测试不验证失败就直接通过？你测的是已有行为，改测试。技能中对"好测试"与"坏测试"进行了精确对比，要求每个测试必须是**一个行为、一个清晰命名、使用真实代码**（非必要不用 mock）。
+
+值得注意的是，该技能与 systematic-debugging 存在明确的协作边界：SKILL.md 中明确指出 TDD 的"最小代码通过测试"原则不适用于调试场景，调试中"最小改动"不是目的，"找到根因"才是。两个技能的边界划分体现了技能系统的**正交性设计**——避免技能之间产生冲突性的指令矛盾。
+
+Sources: [agent/skills/main-skills/dev/test-driven-development/SKILL.md](agent/skills/main-skills/dev/test-driven-development/SKILL.md#L1-L200)
+
+### 3. verification-before-completion：验证驱动完成声明
+
+这个技能解决的是 AI 系统中一个经典问题——**Agent 在未验证的情况下声称任务完成**。技能的核心铁律是"没有新鲜的验证证据，就不能声称完成"。它定义了一个"门函数（Gate Function）"：识别验证命令→执行完整命令→读取完整输出→检查输出是否确认声明→最后才做声明。任何绕过这个流程的完成声明，在技能中的定义都是"说谎（lying）"而非省略。
+
+技能还提供了常见的**理性化预防映射表**（Rationalization Prevention），将 Agent 常用的自我说服话术（"应该能行""我有信心""就这一次"）与它们的真实含义（"去运行验证""信心≠证据""没有例外"）一一对应打穿。这种设计源自 CREATION-LOG.md 中提到的关键洞察——"展示反模式比正面要求更有效"。
+
+Sources: [agent/skills/main-skills/dev/verification-before-completion/SKILL.md](agent/skills/main-skills/dev/verification-before-completion/SKILL.md#L1-L140)
+
+### 4. writing-plans：实现计划编制规范
+
+从需求规格到可执行计划的**转换方法论**。技能要求计划必须以原子粒度（2-5分钟/步）分解任务，每步都是独立可执行的操作。计划文档必须包含完整的文件结构映射、精确的代码片段（而不是"TBD"占位符）、以及预期输出验证方式。执行完成后提供两种执行路线选择：子 Agent 逐任务驱动（推荐）或内联批量执行。
+
+技能中嵌入了一个**自我审查（Self-Review）清单**：规范覆盖度扫描、占位符扫描、类型一致性检查——要求在计划编制完后立即运行，发现缺口就地修复。
+
+Sources: [agent/skills/main-skills/dev/writing-plans/SKILL.md](agent/skills/main-skills/dev/writing-plans/SKILL.md#L1-L153)
+
+### 5. brainstorming：创意构想到规格文档
+
+作为开发流程的**起点**，brainstorming 技能定义了从获取原始需求到输出设计规格文档的完整流程：探索项目上下文→提出视觉辅助（可选）→逐一澄清问题→提出 2-3 个方案对比→分节呈现设计→用户确认→编写设计文档→自我审查→用户审查→转交 writing-plans。技能中设置了**硬关卡（HARD-GATE）**：在获得用户批准之前，不允许调用任何实现技能、写任何代码。
+
+Sources: [agent/skills/main-skills/dev/brainstorming/SKILL.md](agent/skills/main-skills/dev/brainstorming/SKILL.md#L1-L165)
+
+### 6. code-review：全面代码审查清单
+
+这是一个结构化的审查清单式技能，覆盖五个维度：**安全性**（注入/认证/授权/数据泄露/加密/依赖）、**正确性**（逻辑错误/竞态条件/资源泄漏/错误处理/类型安全）、**性能**（N+1查询/内存/阻塞/低效算法/缓存）、**可维护性**（命名/复杂度/重复/死代码/注释）、**测试**（覆盖率/边界情况/模拟/断言）。每个维度都配有具体的检查子项、Shell 命令示例和 Python/JavaScript 常见反模式对照。
+
+Sources: [agent/skills/main-skills/dev/code-review/SKILL.md](agent/skills/main-skills/dev/code-review/SKILL.md#L1-L161)
+
+### 7. skill-creator：经验沉淀工具
+
+这是一个**元技能**——用于创建其他技能的技能。主 Agent 在执行完多步骤任务后，通过这个技能判断是否值得将执行流程沉淀为 SKILL.md 文档（判断标准：≥3步、成功完成、可重复、有参考价值）。沉淀的格式统一、写入 `auto-skills/main/` 目录，实现了主 Agent 执行经验的自我进化闭环。
+
+Sources: [agent/skills/main-skills/dev/skill-creator/SKILL.md](agent/skills/main-skills/dev/skill-creator/SKILL.md#L1-L75)
+
+---
+
+## 开发类技能的流程关系图
+
+```mermaid
+graph TB
+    subgraph "开发流程阶段"
+        A[需求提出] --> B[brainstorming<br/>创意→规格]
+        B --> C[writing-plans<br/>规格→执行计划]
+        C --> D{TDD 循环}
+        D --> E[test-driven-development<br/>红-绿-重构]
+        E --> F{调试触发?}
+        F -->|是| G[systematic-debugging<br/>四阶段调试]
+        G --> E
+        F -->|否| H[code-review<br/>五维审查]
+        H --> I[verification-before-completion<br/>验证后声明完成]
+        I --> J[skill-creator<br/>经验沉淀]
+    end
+    
+    subgraph "调试配套体系"
+        G --> GA[root-cause-tracing<br/>逆向跟踪]
+        G --> GB[defense-in-depth<br/>四层防护]
+        G --> GC[condition-based-waiting<br/>条件等待]
+    end
+
+    style A fill:#e1f5fe
+    style J fill:#fff3e0
+    style G fill:#ffebee
+```
+
+---
+
+## 手机操控类技能（phone/）：单步命令速查
+
+`phone-control-quickref` 是主 Agent 用于执行**单步手机操作**的速查手册。其设计哲学是"查即用"——不需要子 Agent 介入的简单操作，主 Agent 直接通过 `shell_exec` 工具执行 Termux API 命令或 Android shell 命令完成。
+
+### 使用边界与委托判断
+
+技能明确了主 Agent 与子 Agent（executor）之间的**职责边界**：
+
+| 操作类型 | 执行者 | 判断依据 |
+|----------|--------|----------|
+| 单步 Termux API（通知/TTS/剪贴板/音量/手电筒等） | **主 Agent** | 一条 shell_exec 命令可完成 |
+| 系统信息查询（getprop、free、df、top） | **主 Agent** | 同属单步 shell 命令 |
+| 应用启动（am start -p + 包名） | **主 Agent** | 已知包名时单步完成 |
+| 多步 UI 交互（点击、输入、滑动、UI 树分析） | **子 Agent** | 需 NeuralBridge MCP 全流程操控 |
+| 复杂任务（应用内多步操作） | **子 Agent** | 全盘委托，主 Agent 不做任何准备工作 |
+
+### 技能内容速查表
+
+技能文档组织为**命令速查字典**格式，按功能域分类：
+
+```bash
+# 应用启动（pm list packages / am start -p）
+# 通知与交互（termux-tts-speak / termux-notification / termux-clipboard）
+# 系统功能（termux-battery-status / termux-brightness / termux-volume）
+# WiFi/手电筒/震动/位置/壁纸/下载
+# 媒体（termux-camera-photo / termux-media-player / termux-microphone-record）
+# 传感器（termux-sensor）
+# 系统信息（getprop / free / df / top）
+```
+
+技能文档中还附带了常用应用包名表（微信/抖音/支付宝/淘宝/拼多多/B站/Chrome/设置），避免了主 Agent 在简单操作前还要先查包名的冗余步骤。
+
+Sources: [agent/skills/main-skills/phone/phone-control-quickref/SKILL.md](agent/skills/main-skills/phone/phone-control-quickref/SKILL.md#L1-L83)
+
+---
+
+## 3D 身体动作技能（body-moves/）：预设 + 编排 + 记忆闭环
+
+`body-moves` 技能管理 3D 虚拟身体的动作控制，建立了一套**三级查找优先级**和**动作记忆闭环**。主 Agent 控制身体动作时，按照"查预设 → 搜记忆 → 现场编排"的优先级逐步降级执行。
+
+### 三级动作查找体系
+
+```
+第1级：查找预设动作文件
+       ├── 按文件名精确匹配（坐下.json）
+       └── 按 description 字段模糊匹配（读文件内容）
+       
+第2级：搜索记忆（search_memory）
+       ├── 按动作名搜索（"坐下"）
+       └── 按特征关键词搜索（"挥手"）
+       
+第3级：现场编排（兜底方案）
+       ├── 先 body_idle() 归位
+       ├── 参考 control_tool.py 部位方向文档
+       ├── 多部位协调编排
+       └── 用 body_script 一次性执行完整序列
+```
+
+### 动作执行规范
+
+技能强制要求**多步骤动作必须使用 `body_script` 一次传入完整动作数组**，禁止逐个调用 `control_body`。原因是 HTTP 请求的累积延迟会导致动作卡顿不流畅——每次 `control_body` 调用约 50-100ms 网络往返，10 步动作就是 0.5-1 秒的额外延迟，这在动作编排中是致命的。单步动作（如"抬一下右手"）才允许直接用 `control_body`。
+
+### 动作记忆沉淀流程
+
+当用户说"记住这个动作"时，主 Agent 执行一个**双写操作**：
+
+1. **写 JSON 文件**：保存到 `agent/skills/main-skills/body-moves/` 目录，文件名 = 动作名.json。内容包含 `name`、`description`（含特征关键词）、`moves`（完整动作数据）
+2. **写记忆系统**：通过 `save_memory(type="dance")` 保存到数据库。第一行为文字描述（含动作名+特征关键词），第二行开始为完整 JSON 数据。这种双格式的设计利用了记忆系统的语义搜索特性——系统只嵌入第一行描述用于向量搜索，JSON 全文存 SQLite 用于精确检索
+
+当前预设动作库包含 4 个动作：自然坐下（12步动作序列）、疯狂傻子舞V2（夸张搞怪风格）、死机舞（125步机械故障风格）、广播体操（待验证）。
+
+Sources: [agent/skills/main-skills/body-moves/SKILL.md](agent/skills/main-skills/body-moves/SKILL.md#L1-L111) | [agent/skills/main-skills/body-moves/坐下.json](agent/skills/main-skills/body-moves/坐下.json#L1-L19)
+
+---
+
+## 技能注入机制与运行时行为
+
+### 启动时清单注入
+
+主 Agent 启动时（`_create_agent()`），系统通过 `load_skills_list("main")` 扫描 `main-skills/` 目录，为每个技能提取 `description` 元数据，生成结构化的技能列表文本，格式为：`- [技能名]: [描述]（路径：[具体路径]）`。这个列表被格式化为 Markdown 后注入到系统提示词的"技能系统"段落中。
+
+### 运行时按需加载
+
+主 Agent 看到的提示词包含这样一段指令：*"需要用某个技能时，用 file_read 读取对应 SKILL.md；已经读过的技能不要重复读取。"* 这意味着：
+
+- **技能文档不会自动加载**——只暴露元数据入口
+- **读取决策由主 Agent 自主判断**——根据任务类型决定是否读取
+- **同一技能不重复读取**——防止上下文膨胀
+- **读取后立即执行**——读完后按技能指导行动
+
+### 与子 Agent 技能系统的差异
+
+主 Agent 技能（`main-skills/`）与子 Agent 技能（`executor-skills/`）在加载机制上使用**同一套代码**（`_scan_skills()` 和 `load_skills_list()`），只是传入的 `agent_type` 参数不同。子 Agent 额外加载 `auto-skills/executor/` 中的自动沉淀技能，而主 Agent 不加载自动沉淀（`auto-skills/main/` 目录当前仅含 `.gitkeep` 占位符，暂无内容）。
+
+这种设计暗示了未来的进化方向：主 Agent 也可以通过 skill-creator 技能将自己的执行经验沉淀到 `auto-skills/main/`，实现自身技能的自动积累——但目前这个功能尚未激活。
+
+Sources: [agent/agent_langchain.py](agent/agent_langchain.py#L116-L135) | [agent/agent_langchain.py](agent/agent_langchain.py#L770-L781) | [agent/prompts/agent_enhance.py](agent/prompts/agent_enhance.py#L66-L73)
+
+---
+
+## 技能系统的设计哲学总结
+
+| 维度 | 设计选择 | 设计意图 |
+|------|----------|----------|
+| **加载策略** | 元数据注入 + 按需全量读取 | 避免静态知识抢占上下文窗口 |
+| **规则强度** | 铁律式约束（ALWAYS/NEVER） | 抵抗 Agent 在压力下的理性化倾向 |
+| **目录结构** | 文件系统 = 分类体系 | 零配置，无需注册中心 |
+| **技能粒度** | SKILL.md + 配套文档 | 主文档定义规范，辅文档深入技术细节 |
+| **跨技能边界** | 明确引用（如 TDD→debugging） | 防止指令冲突，建立协作关系 |
+| **进化机制** | skill-creator 元技能 | 执行经验→技能文档→自动积累的闭环 |
+
+**下一步阅读建议**：了解子 Agent 如何加载和执行其独立的技能体系，见 [子 Agent 技能（executor-skills：快速模式、操控指南）](35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan)；理解技能与工具的本质区别，见 [技能系统概述（SKILL.md 知识文档 vs 工具）](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)；深入了解自动沉淀机制，见 [自动沉淀技能（auto-skills：执行经验自动积累）](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)。

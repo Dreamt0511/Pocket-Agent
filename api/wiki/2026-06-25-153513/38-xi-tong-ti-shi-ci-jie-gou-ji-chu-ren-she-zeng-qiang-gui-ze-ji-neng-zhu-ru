@@ -1,0 +1,157 @@
+Pocket-Agent 的系统提示词采用**三层组装架构**：基础人设定义 Agent 的身份与边界，增强规则注入操作规范与约束条件，技能注入在运行时动态加载可用知识文档。这种分层设计使得人设与规则解耦、静态模板与动态内容分离，既保持了核心人格的稳定性，又赋予了系统灵活扩展的能力。
+
+## 三层架构总览
+
+整体提示词由三个独立的提示词文件及运行时动态内容拼接而成，最终作为 `SystemMessage` 注入 LangChain Agent。
+
+```mermaid
+flowchart TB
+    subgraph Static["静态层（编译时确定）"]
+        A[system_base.py<br/>基础人设] 
+        B[agent_enhance.py<br/>增强规则]
+    end
+    
+    subgraph Dynamic["动态层（运行时注入）"]
+        C[技能列表<br/>load_skills_list()]
+        D[工具列表<br/>ALL_TOOLS]
+        E[路径变量<br/>tasks_dir / logs_dir]
+    end
+    
+    F["最终系统提示词<br/>SystemMessage"]
+
+    A --> F
+    B --> F
+    C -- "format() 注入 {skills_list}" --> B
+    D -- "format() 注入 {tool_names}" --> B
+    E -- "format() 注入 {tasks_dir}/{logs_dir}" --> B
+```
+
+这三层在 `agent_langchain.py` 的第 768-782 行完成组装：
+
+```python
+enhanced_system_prompt = self.base_system_prompt + "\n\n" + agent_enhance_prompt.format(
+    tool_names=tool_names,
+    skills_list=skills_list,
+    tasks_dir=TASKS_DIR,
+    logs_dir=LOGS_DIR
+)
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L768-L782)
+
+其核心逻辑是：**基础人设 + 两个换行符 + 格式化后的增强规则**。`format()` 方法将 `{tool_names}`、`{skills_list}`、`{tasks_dir}`、`{logs_dir}` 四个占位符替换为运行时的实际值。
+
+---
+
+## 第一层：基础人设（system_base.py）
+
+`agent/prompts/system_base.py` 是整个提示词的基石，定义了 Agent 的**身份、运行环境与核心能力边界**。代码仅 20 行，内容高度凝练：
+
+| 维度 | 内容 | 意图 |
+|------|------|------|
+| **身份声明** | "你是 Pocket-Agent，一个安装在手机上的 AI 助手" | 确立助手人格，而非通用 AI |
+| **运行环境** | "直接运行在 Termux 终端中" | 告知模型其真实运行上下文 |
+| **核心能力** | 文件操作、系统命令执行、安卓手机控制、MCP 服务集成 | 界定能力范围，防止越界 |
+| **操作准则** | 简单操作自己执行，复杂 UI 派发给 executor | 建立第一层决策门限 |
+| **行为红线** | 禁止拒绝能力内请求；不明确时先问清楚 | 防御性行为约束 |
+
+Sources: [system_base.py](agent/prompts/system_base.py#L1-L20)
+
+基础人设的设计原则是**最小化但不可绕过**——它只包含 Agent 必须认知的"我是谁"和"我在哪"，把操作细节和规则下沉到增强层，保持核心人格的纯净。当用户询问"你能做什么"时，Agent 的回答根基来自这一层。
+
+---
+
+## 第二层：增强规则（agent_enhance.py）
+
+`agent/prompts/agent_enhance.py` 是提示词中体量最大的部分（122 行），包含五个子系统维度的详细约束。它是运行时注入动态内容的目标模块，通过 Python 的 `str.format()` 接收四个外部变量：
+
+### 五大规则域
+
+**一、工具使用规范** — 定义了工具调用边界（只能使用 `{tool_names}` 列表内的工具）和记忆存储路径（所有记忆只能通过 `save_memory` 工具写入，**严格禁止** `file_write` 手动写入记忆文件）。这条规则的存在是因为系统经历了"Agent 私自用文件写入绕过记忆系统"的架构违规教训，通过显式禁令形成防御。
+
+**二、回答与执行规则** — 包含六条子规则：简洁回答（移动端场景）、禁止提及背景信息（伪装自然记忆）、文件操作优先使用专用工具、多步骤任务的类型判断与派发逻辑、TTS 朗读规则、禁止重复输出。其中任务类型判断是核心决策逻辑：
+
+```mermaid
+flowchart LR
+    A[用户请求] --> B{单步操作？}
+    B -->|是| C[自己执行<br/>shell_exec]
+    B -->|否| D{需要UI交互？}
+    D -->|否| E[自己执行<br/>查资料/读文件]
+    D -->|是| F[全盘委托给<br/>delegate_task()]
+    F --> G[子Agent后台执行]
+    G --> H[file_read 查看进度]
+```
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L41-L58)
+
+**三、子 Agent 使用规则** — 强制要求任务按**原子粒度**分解（禁止多步合并），`description` 和 `tasks_json` 均必填。例如 `"去拼多多买鞋"` 必须拆分为 `打开APP → 搜索商品 → 筛选价格` 三个步骤。子 Agent 异步执行，不阻塞当前对话，执行完成后自动沉淀技能到 `auto-skills/executor/` 目录。
+
+**四、技能系统说明** — 明确区分**工具**（可调用的函数）与**技能**（知识文档 SKILL.md）。当用户询问"你有哪些 skills"时，Agent 必须回答技能列表而非工具名称。技能通过 `file_read` 阅读后按指导行动，已读的技能不重复读取。`{skills_list}` 占位符在运行时由 `load_skills_list("main")` 动态填充。
+
+**五、身体动作控制规则** — 预设动作用 `body_script`/`control_body` 直接执行（不读 SKILL.md），不熟悉的动作先读 `body-moves` 技能的 SKILL.md。多步骤动作必须用 `body_script` 一次性执行，禁止多次调用 `control_body` 导致卡顿。
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L1-L122)
+
+### 三个动态占位符
+
+| 占位符 | 来源 | 注入方式 | 示例值 |
+|--------|------|----------|--------|
+| `{tool_names}` | `ALL_TOOLS` 的 name 属性 | `", ".join([tool.name for tool in ALL_TOOLS])` | "file_read, file_write, shell_exec, …" |
+| `{skills_list}` | `load_skills_list("main")` 扫描 `agent/skills/main-skills/` 目录 | 按分类分组输出 markdown 列表 | `【开发】\n- brainstorming: 创意工作前置…\n…` |
+| `{tasks_dir}` / `{logs_dir}` | `agent/config.py` 的 `TASKS_DIR` / `LOGS_DIR` | 直接字符串替换 | `/data/data/…/tasks` |
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L762-L777)
+
+技能列表的加载逻辑 `load_skills_list()` 支持两种目录布局：**flat 模式**（子目录直接含 SKILL.md → 无分类）和 **category 模式**（子目录下再含子目录 → 按分类分组），这使得技能目录可以随需求自然演化。
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L57-L148)
+
+---
+
+## 子 Agent 的平行提示词体系
+
+主 Agent 和子 Agent（executor）拥有两套独立的提示词体系，但遵循相同的三层结构模式：
+
+| 层次 | 主 Agent | 子 Agent |
+|------|----------|----------|
+| **基础人设** | `system_base.py` — 手机 AI 助手 | `executor_system.py` — 手机操控执行助手 |
+| **增强规则** | `agent_enhance.py` — 工具/记忆/子 Agent 规则 | `executor_enhance.py` — 工具/技能/执行流程 |
+| **动态注入** | `{skills_list}` 来自 `main-skills/` | `{skills_list}` 来自 `executor-skills/` + `auto-skills/executor/` |
+
+子 Agent 的人设更聚焦：只负责按 `task.json` 的步骤执行手机操控任务，**禁止提前终止**，**禁止只输出文字不调用工具**。其增强规则在 `agent_langchain.py` 第 1604-1609 行组装：
+
+```python
+enhanced = executor_enhance_prompt.format(
+    tool_names=executor_tool_names_str,
+    skills_list=executor_skills,
+)
+system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L1604-L1609)
+
+注意子 Agent 的组装方式略有不同：`executor_system.py` 使用 `{tool_rules_and_skills}` 占位符，而 `executor_enhance.py` 使用 `{tool_names}` 和 `{skills_list}`。前者通过 `str.replace()` 注入完整的增强段，后者通过 `str.format()` 注入具体变量。子 Agent 的可选工具集也较小（7 个工具：`shell_exec`、`file_read`、`file_write`、`file_search`、`mcp_call`、`system_info`、`tts_speak`），过滤掉了主 Agent 的记忆和身体控制类工具。
+
+Sources: [executor_system.py](agent/prompts/executor_system.py#L1-L23), [executor_enhance.py](agent/prompts/executor_enhance.py#L1-L35)
+
+---
+
+## 架构设计理念
+
+三层分离的设计并非随意为之，而是基于三个核心考量：
+
+**人设与规则的关注点分离**。基础人设回答"你是谁"，增强规则回答"你怎么做"。当需要调整 Agent 的执行策略（如修改记忆规则、调整派发逻辑）时，只需修改 `agent_enhance.py`，而不必触碰核心人设。反之，如果要改变 Agent 的身份定位，也只需修改 `system_base.py` 的 20 行内容。
+
+**静态模板与动态内容的时态分离**。`{tool_names}` 和 `{skills_list}` 在 Agent 初始化时注入一次，此后在整个会话生命周期内保持不变。这种"编译时确定 + 运行时组装"的模式避免了每次对话都重新扫描磁盘的开销。技能目录的变化也只在下一次 Agent 重启时生效。
+
+**主-子 Agent 的继承与分化**。子 Agent 复用了主 Agent 的增强规则模式（工具列表 + 技能列表的动态注入），但通过 `executor_enhance.py` 的独立定义实现了执行策略的分化——子 Agent 使用更严格的坐标规则、更激进的等待优化、更精简的工具集。这种"同一模板，不同填充"的设计使得两套提示词体系保持结构一致性的同时，各自独立演进。
+
+---
+
+## 下一步阅读
+
+系统提示词是 Agent 行为的"宪法"，但它的效果依赖于具体执行。建议继续阅读：
+
+- [子 Agent 提示词设计（独立系统人设与执行流程）](39-zi-agent-ti-shi-ci-she-ji-du-li-xi-tong-ren-she-yu-zhi-xing-liu-cheng) — 深入子 Agent 的提示词细节，理解其强制规则与执行流
+- [记忆检索与环境感知的上下文注入策略](40-ji-yi-jian-suo-yu-huan-jing-gan-zhi-de-shang-xia-wen-zhu-ru-ce-lue) — 了解用户画像、环境感知、相关记忆如何在运行时注入到对话上下文中
+- [技能自动发现与加载机制](37-ji-neng-zi-dong-fa-xian-yu-jia-zai-ji-zhi) — 理解 `load_skills_list()` 如何扫描目录、按分类分组、生成技能列表

@@ -1,0 +1,238 @@
+Pocket-Agent 的 HTTP API 服务基于 FastAPI 框架构建，为 Android App 客户端提供 AI Agent 的远程调用能力。**核心设计思路**是在 Termux 手机环境中以轻量级方式运行完整的 Agent 引擎，并通过心跳机制实现客户端断开后的自动清理，避免服务资源泄漏。
+
+## 架构概览
+
+```mermaid
+flowchart TD
+    subgraph 客户端层
+        A[Android App]
+        B[HTTP Client<br>curl / Postman]
+    end
+
+    subgraph 服务层_app.py
+        direction TB
+        C[Uvicorn ASGI Server<br>0.0.0.0:8000]
+        D[FastAPI App<br>路由分发]
+        E[Agent 单例缓存<br>_get_or_create_agent]
+        F[心跳看门狗线程<br>daemon thread]
+    end
+
+    subgraph 持久化层
+        G[(pocket_agent.db<br>SQLite WAL)]
+        H[AsyncSqliteSaver<br>LangGraph Checkpoint]
+        I[VectorStore<br>SQLite + numpy]
+    end
+
+    subgraph 子进程
+        J[llama-server<br>Embedding 服务:8080]
+    end
+
+    A -->|POST /chat SSE流| D
+    B -->|GET /health| D
+    A -->|POST /heartbeat 每30s| D
+    D -->|初始化| E
+    D -->|启动时| F
+    D -->|读写| G
+    D -->|持久化对话状态| H
+    D -->|语义搜索| I
+    D -->|启动时| J
+    F -->|60s无心跳| C
+```
+
+启动方式为 Uvicorn 直接运行：
+
+```bash
+source .venv/bin/activate
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+文件开头的 docstring 记录了标准启动命令，确保 `load_dotenv()` 在导入 `agent` 模块之前执行，否则 `config.py` 读不到 `.env` 环境变量。Sources: [app.py](app.py#L1-L15)
+
+## 启动生命周期（Startup Event）
+
+服务启动时通过 `@app.on_event("startup")` 触发一系列初始化动作，按严格顺序执行：
+
+```mermaid
+flowchart LR
+    A[加载.env] --> B[SQLite WAL模式强制设定]
+    B --> C[建表: conversations + messages + FTS5]
+    C --> D[初始化 AsyncSqliteSaver<br>失败降级 MemorySaver]
+    D --> E[启动 llama-server 嵌入服务<br>子进程方式]
+    E --> F[初始化 VectorStore<br>补录缺失 embedding]
+    F --> G[清理过期向量索引<br>遗忘机制]
+    G --> H[启动心跳看门狗线程]
+```
+
+**第一步：数据库 WAL 模式强制设定。** 在异步连接之前，先用同步 `sqlite3` 连接强制设置 `PRAGMA journal_mode=WAL` 和 `PRAGMA busy_timeout=30000`，确保多进程并发安全。Sources: [app.py](app.py#L169-L177)
+
+**第二步：异步建表。**`_init_db()` 创建 `conversations` 和 `messages` 两张核心表，并通过三条触发器（INSERT/DELETE/UPDATE）维护 `messages_fts` 全文搜索虚拟表。FTS5 使用 `tokenize='trigram'` 参数实现中文分词支持。首次建表时执行全量重建，后续由触发器增量维护。Sources: [app.py](app.py#L64-L146)
+
+**第三步：Checkpoint 持久化初始化。** 尝试初始化 `AsyncSqliteSaver`——这是 LangGraph 框架提供的异步 SQLite 持久化方案，用于保存对话状态和分支历史。若初始化失败（例如 `aiosqlite` 或 `langgraph` 版本兼容问题），降级为 `MemorySaver`（仅内存存储，重启后历史丢失）。Sources: [app.py](app.py#L178-L193)
+
+**第四步：嵌入服务启动。** `asyncio.ensure_future(asyncio.to_thread(start_embedding_server))` 在独立线程中启动 `llama-server` 子进程，提供本地 BGE-M3 模型的 embedding API。若端口已被占用则直接复用，不会重复启动。Sources: [app.py](app.py#L195-L197) 与 [agent/embedding.py](agent/embedding.py#L252-L295)
+
+**第五步：向量存储初始化。** 创建 `VectorStore`（基于 SQLite + numpy 的轻量级向量存储），并从 `messages` 表中补录缺失的 embedding 索引。随后执行 `_cleanup_old_messages()`，清理 30 天前且重要性 ≤ 2 的记忆的向量索引——这是系统的"遗忘机制"。Sources: [app.py](app.py#L199-L233)
+
+**第六步：心跳看门狗启动。** 创建独立守护线程。Sources: [app.py](app.py#L235-L251)
+
+## 心跳机制详解
+
+心跳机制是**客户端保活 + 服务端自清理**的双向保障体系。其设计背景是：Android App 可能因用户关闭、后台被杀、网络切换等原因断开连接，而 Termux 中的 Python 进程如果没有自动退出机制，会持续占用系统资源。
+
+```mermaid
+sequenceDiagram
+    participant Client as Android App
+    participant Thread as 看门狗线程<br>daemon=True
+    participant Server as FastAPI 主进程
+
+    Note over Client,Server: 正常运行时
+    Client->>Server: POST /heartbeat
+    Server->>Server: _last_heartbeat = now()
+    
+    loop 每30秒检查
+        Thread->>Thread: if now - _last_heartbeat > 60
+    end
+
+    Note over Client,Server: App 被用户关闭
+    Client-->>Server: ❌ 心跳中断
+
+    Thread->>Thread: 超时检测触发
+    Thread->>Server: stop_embedding_server()
+    Thread->>Server: os.kill(SIGTERM)
+    Server->>Server: 进程终止，端口释放
+
+    Note over Client,Server: 下次启动时端口可用
+```
+
+### 关键参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `_last_heartbeat` | `time.time()` | 上次心跳时间戳，全局变量 |
+| `_HEARTBEAT_TIMEOUT` | `60` 秒 | 超时阈值，超过此时间未收到心跳则关闭 |
+| 检查周期 | `30` 秒 | 看门狗线程检测间隔 |
+| 清理对象 | embedding 服务 + 自身进程 | 两层清理确保资源释放 |
+
+Sources: [app.py](app.py#L48-L50)
+
+### 看门狗线程实现
+
+看门狗以 `threading.Thread(daemon=True)` 启动，核心逻辑在无限循环中：
+
+```python
+def _heartbeat_watchdog():
+    while True:
+        time.sleep(30)                                          # 每30秒检测一次
+        if time.time() - _last_heartbeat > _HEARTBEAT_TIMEOUT:  # 判断是否超时
+            # 1. 停止 embedding 子进程
+            from agent.embedding import stop_embedding_server
+            stop_embedding_server()
+            # 2. 停止自身
+            os.kill(os.getpid(), signal.SIGTERM)
+            break
+```
+
+两个关键设计细节：
+
+- **守护线程属性**（`daemon=True`）：确保该线程不会阻止主进程退出。即使看门狗线程还在运行，主进程退出时也会自动终止。
+- **`stop_embedding_server()` 先执行**：`llama-server` 子进程占用 8080 端口，必须先释放，否则下次启动时端口冲突需要重试。
+- **`os.kill(os.getpid(), signal.SIGTERM)`**：向自身发送 `SIGTERM` 信号，Uvicorn 捕获后会优雅关闭，等待所有请求处理完成再退出。
+
+Sources: [app.py](app.py#L237-L251)
+
+### App 端的心跳调用
+
+客户端需要启动一个定时器线程，每 30 秒调用一次 `POST /heartbeat`。心跳接口实现极其轻量：
+
+```python
+@app.post("/heartbeat")
+async def heartbeat():
+    global _last_heartbeat
+    _last_heartbeat = time.time()
+    return {"status": "ok"}
+```
+
+无数据库查询，无业务逻辑，仅更新时间戳。Sources: [app.py](app.py#L349-L353)
+
+## Agent 单例缓存与配置变更
+
+服务启动后只创建一份 Agent 实例，通过 LangGraph 的 `thread_id` 参数隔离不同会话的历史状态。这种设计避免了每个请求都重建 Agent 的开销：
+
+```python
+def _get_or_create_agent(llm_config: dict):
+    config_key = json.dumps(llm_config, sort_keys=True)
+    if _agent_instance is not None and _agent_llm_config_key == config_key:
+        return _agent_instance
+    # 配置变化 → 释放旧 Agent，重建新 Agent
+    # ...
+    _agent_instance = LangChainPocketAgent(llm_config=llm_config, checkpointer=_checkpoint_saver)
+```
+
+配置缓存键通过 `json.dumps(llm_config, sort_keys=True)` 生成，确保相同配置复用实例，配置变化时自动重建并清理旧资源。Sources: [app.py](app.py#L253-L282)
+
+## SSE 流式聊天接口
+
+`/chat` 接口是核心业务端点，使用 `StreamingResponse` 实现 Server-Sent Events 流式输出。响应头配置如下：
+
+```python
+Response(
+    media_type="text/event-stream",
+    headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+)
+```
+
+- `Cache-Control: no-cache, no-transform`：禁止代理和客户端缓存
+- `X-Accel-Buffering: no`：禁止 Nginx 缓冲（若前端有反向代理）
+- `Connection: keep-alive`：保持长连接
+
+流式输出协议通过 `\n\n` 分隔事件，支持多种事件类型：`token`（文本令牌）、`progress`（工具执行进度）、`tool_start/tool_end`（工具调用生命周期）、`error`（错误信息）、`[DONE]`（流结束标记）。每个事件以 `data: ` 前缀发送，符合 SSE 标准。Sources: [app.py](app.py#L465-L596)
+
+## 服务关闭（Shutdown）
+
+手动关闭通过 `POST /shutdown` 实现，分三步清理：
+
+1. **清理 Agent 实例**：调用 `_agent_instance.cleanup()` 释放 LangGraph 资源
+2. **停止 Embedding 服务**：`stop_embedding_server()` 终止 `llama-server` 子进程
+3. **延迟自杀**：`asyncio.sleep(0.3)` 等待响应返回后，发送 `SIGTERM`
+
+```python
+async def _die():
+    await asyncio.sleep(0.3)
+    os.kill(os.getpid(), signal.SIGTERM)
+```
+
+Sources: [app.py](app.py#L1039-L1059)
+
+## 健康检查与调试接口
+
+| 端点 | 方法 | 用途 |
+|------|------|------|
+| `/health` | GET | 返回服务状态、Python 版本、项目路径 |
+| `/uptime` | GET | 服务运行时长（秒）和启动时间戳 |
+| `/version` | GET | 当前 Git commit SHA（前 7 位） |
+| `/version/history` | GET | 安装过的版本历史（最多 5 条） |
+| `/debug_chat` | GET | 最近一次 `/chat` 请求参数 |
+
+其中 `/uptime` 通过 `_start_time` 全局变量（`time.time()` 记录在模块级别）计算运行时长。Sources: [app.py](app.py#L46, L330-L346)
+
+## 与终端模式的关系
+
+FastAPI 服务与终端交互模式（`main.py`）共享同一套数据库（`pocket_agent.db`），两者是同一 Agent 引擎的不同接入方式：
+
+| 维度 | 终端模式 (`main.py`) | HTTP API 模式 (`app.py`) |
+|------|----------------------|-------------------------|
+| 启动方式 | `python main.py` | `uvicorn app:app --host 0.0.0.0 --port 8000` |
+| 交互界面 | Rich 终端 UI | SSE 流式 HTTP |
+| 适用场景 | 本地直接使用 | 远程 App 调用 |
+| 生命周期 | 用户主动退出 | 心跳超时自动退出 |
+| Agent 实例 | 每次启动新建 | 共享单例，配置变化重建 |
+
+两者的数据库初始化逻辑保持高度一致（共享表结构、FTS5 索引、兼容字段迁移），确保数据层面无缝切换。Sources: [main.py](main.py#L37-L111) 与 [app.py](app.py#L64-L146)
+
+---
+
+> **延伸阅读**：了解 Android App 如何对接本 HTTP 服务，请参阅 [Android App 客户端集成指南](46-android-app-ke-hu-duan-ji-cheng-zhi-nan)。如需配置 LLM 和 Embedding 的完整环境变量，参见 [agent/config.py 核心配置项](42-agent-config-py-he-xin-pei-zhi-xiang)。

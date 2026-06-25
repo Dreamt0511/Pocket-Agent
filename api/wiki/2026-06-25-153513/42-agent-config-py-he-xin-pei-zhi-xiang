@@ -1,0 +1,223 @@
+`agent/config.py` 是 Pocket-Agent 的非隐私公共配置中心，全文件仅 106 行，却承载了整个项目运行所需的**所有默认参数与路径拓扑**。它与 `.env` 文件形成严格的"公私分离"契约——`config.py` 存放通用默认值和目录结构，`.env` 存放 API Key、Base URL 等隐私凭证。理解这份文件，就等于拿到了项目配置架构的"总钥匙"。
+
+---
+
+## 设计哲学：公私分离的配置架构
+
+在深入具体配置项之前，有必要先理解 config.py 在整个项目中的定位。它的文件头注释一语道破天机：
+
+> "存放非隐私的通用配置，隐私配置（API密钥、URL等）请在.env文件中设置"
+
+这意味着 config.py 的代码是**可以公开的**——它不包含任何密钥、Token 或私有 URL。所有敏感值都通过 `os.getenv()` 从 `.env` 文件中按需读取，且均提供合理的默认值。这种设计带来三大好处：
+
+- **版本控制安全**：`config.py` 可以安心提交到 Git，`.env` 则被 `.gitignore` 排除
+- **配置组合灵活**：切换 API 提供商只需改 `.env` 一行，不改代码
+- **新开发者友好**：参考 `.env.example` + `config.py` 即可理解所有配置维度
+
+Sources: [agent/config.py](agent/config.py#L1-L10)
+
+---
+
+## 配置项全景总览
+
+下表列出 config.py 中定义的全部配置常量，方便快速检索。每个常量按照"配置分组"归类，并标注其值来源（是硬编码默认值，还是从 `.env` 读取）：
+
+| 配置分组 | 常量名 | 值/来源 | 作用简述 |
+|---|---|---|---|
+| **Agent 运行** | `MAX_ITERATIONS` | `300`（硬编码） | 单次对话最多工具调用轮数 |
+| | `RECURSION_LIMIT` | `600`（硬编码） | LangGraph 底层递归兜底上限 |
+| | `MAX_CONTEXT_TOKENS` | `128000`（硬编码） | 模型上下文窗口大小 |
+| **路径系统** | `PROJECT_ROOT` | 自动计算（项目根目录） | 所有相对路径的基准锚点 |
+| | `SKILLS_DIR` | `agent/skills/main-skills` | 主 Agent 技能文档目录 |
+| | `EXECUTOR_SKILLS_DIR` | `agent/skills/executor-skills` | 子 Agent 技能文档目录 |
+| | `AUTO_SKILLS_DIR` | `agent/skills/auto-skills` | 自动沉淀技能目录 |
+| | `TASKS_DIR` | `tasks` | 子 Agent 任务文件存储目录 |
+| | `LOGS_DIR` | `logs` | 结构化日志归档目录 |
+| | `PROMPTS_DIR` | `agent/prompts` | 提示词 Python 模块目录 |
+| **LLM 配置** | `LLM_DEFAULT_CONFIG` | dict（硬编码默认值） | 主 Agent 模型温度/最大 Token |
+| | `EXECUTOR_LLM_CONFIG` | dict（全字段从 `.env` 读取） | 子 Agent 独立模型配置 |
+| **Embedding** | `EMBEDDING_BASE_URL` | `.env` or `""` | 远程 Embedding API 地址 |
+| | `EMBEDDING_API_KEY` | `.env` or `""` | 远程 Embedding API 密钥 |
+| | `EMBEDDING_MODEL` | `.env` or `"bge-m3"` | Embedding 模型名称 |
+| | `EMBEDDING_SERVER_URL` | `.env` or `"http://127.0.0.1:8080/v1"` | 本地 llama-server 地址 |
+| | `EMBEDDING_MODEL_PATH` | `.env` or `""` | GGUF 模型文件绝对路径 |
+| **Termux API** | `TERMUX_API_CHECK_CMD` | `"which termux-battery-status"` | 检测 Termux API 是否安装 |
+| | `TERMUX_API_INSTALL_GUIDE` | 多行字符串 | 未安装时的提示信息 |
+| | `ENV_LIGHT_SENSOR_CMD` | 终端命令 | 环境光传感器采样 |
+| | `ENV_ACCEL_SENSOR_CMD` | 终端命令 | 加速度传感器采样 |
+| | `ENV_TIME_CMD` | `"date +%H:%M"` | 获取当前时间 |
+| | `ENV_TIMEZONE_CMD` | `"getprop persist.sys.timezone"` | 获取系统时区 |
+
+Sources: [agent/config.py](agent/config.py#L1-L107)
+
+---
+
+## 核心配置分组详解
+
+### 1. Agent 运行配置：控制模型调用节奏
+
+```python
+MAX_ITERATIONS = 300       # 单次对话最多调用模型 300 次
+RECURSION_LIMIT = 600      # LangGraph 递归深度上限（MAX_ITERATIONS 的 2 倍）
+MAX_CONTEXT_TOKENS = 128000  # 适配 DeepSeek/Qwen 等云端模型的 128K 窗口
+```
+
+这三者构成 Agent 运行时的**三重安全边界**。`MAX_ITERATIONS` 限制了 Agent 在单次对话中最多能调用多少次工具——如果 Agent 陷入死循环，300 轮后会被强制终止。`RECURSION_LIMIT` 是 LangGraph 底层的递归深度兜底，设置为 `MAX_ITERATIONS` 的两倍（600）以确保不会先于迭代限制被触发。`MAX_CONTEXT_TOKENS` 则用于上下文压缩触发阈值——当 Token 数达到 64K（即一半）时，系统会自动激活上下文压缩中间件。
+
+这些配置在 `agent/agent_langchain.py` 中被消费，分别传入 LangGraph 的编译参数和中间件链的触发条件。
+
+Sources: [agent/config.py](agent/config.py#L14-L24), [agent/agent_langchain.py](agent/agent_langchain.py#L541-L559)
+
+### 2. 路径系统：项目的骨架拓扑
+
+config.py 以 `PROJECT_ROOT` 为锚点，通过 `os.path.join` 构建出一棵完整的路径树：
+
+```
+PROJECT_ROOT                          # 自动计算：config.py 的父级父级目录
+├── agent/
+│   ├── skills/
+│   │   ├── main-skills/     ← SKILLS_DIR
+│   │   ├── executor-skills/ ← EXECUTOR_SKILLS_DIR
+│   │   └── auto-skills/     ← AUTO_SKILLS_DIR
+│   └── prompts/             ← PROMPTS_DIR
+├── tasks/                   ← TASKS_DIR（运行时自动创建）
+└── logs/                    ← LOGS_DIR（运行时自动创建）
+```
+
+这种集中式路径管理的优势在于：**任何模块需要定位技能文档、任务文件或日志目录时，都只需从 config.py 导入常量，而非自己拼接路径**。例如 `agent/tools/basic_tools.py` 中的任务文件操作就导入了 `TASKS_DIR`：
+
+```python
+from agent.config import TASKS_DIR
+```
+
+路径全部使用 `os.path.join` 而非字符串拼接，确保跨平台兼容（Windows 使用反斜杠，Linux/macOS 使用正斜杠，`os.path.join` 自动适配）。
+
+Sources: [agent/config.py](agent/config.py#L9-L10, L30-L63, L78-L84), [agent/tools/basic_tools.py](agent/tools/basic_tools.py#L946)
+
+### 3. LLM 配置：主 Agent 与子 Agent 的双轨模型策略
+
+这是 config.py 中最具设计巧思的部分。主 Agent 和子 Agent（Executor）采用**可分离的双轨模型配置**：
+
+**主 Agent 配置**（`LLM_DEFAULT_CONFIG`）：
+```python
+LLM_DEFAULT_CONFIG = {
+    "temperature": 0.7,      # 创意/严谨平衡
+    "max_tokens": 8000,      # 单次回复最大 Token 数
+}
+```
+这些是硬编码的默认值，会被 `agent/agent_langchain.py` 中读取的 `.env` 变量(`LLM_TEMPERATURE`, `LLM_MAX_TOKENS`)覆盖。
+
+**子 Agent 配置**（`EXECUTOR_LLM_CONFIG`）：
+```python
+EXECUTOR_LLM_CONFIG = {
+    "base_url": os.getenv("EXECUTOR_LLM_BASE_URL"),      # 未设置时继承主 Agent
+    "api_key": os.getenv("EXECUTOR_API_KEY"),             # 同上
+    "model": os.getenv("EXECUTOR_MODEL"),                 # 同上
+    "temperature": os.getenv("EXECUTOR_TEMPERATURE"),     # 同上
+    "max_tokens": os.getenv("EXECUTOR_MAX_TOKENS"),       # 同上
+}
+```
+五个字段**全部从 `.env` 读取**，如果一个都没有设置，表示子 Agent 与主 Agent 共用同一模型。这种设计使得用户可以有三种策略选择：
+- **同模型同参数**：不设置任何 `EXECUTOR_*` 变量
+- **同模型不同参数**：只设置 `EXECUTOR_TEMPERATURE`（如子 Agent 用更低温度保证准确性）
+- **完全独立模型**：设置全部五个变量（如主 Agent 用 GPT-4o，子 Agent 用本地的 Qwen2.5:7b）
+
+这种"优雅降级"的配置模式，让新手可以零配置上手，同时为高级用户保留了精细调优的空间。
+
+Sources: [agent/config.py](agent/config.py#L35-L51), [agent/agent_langchain.py](agent/agent_langchain.py#L1612-L1616)
+
+### 4. Embedding 配置：本地优先的语义检索
+
+Embedding 配置项体现了项目对**本地优先**的坚持。五个配置变量覆盖了两条技术路线：
+
+| 路线 | 适用场景 | 关键配置 |
+|---|---|---|
+| **本地 llama-server**（推荐） | Termux 环境，要求离线运行 | `EMBEDDING_SERVER_URL` + `EMBEDDING_MODEL_PATH` |
+| **远程 Embedding API** | 有公网或内网 API 服务 | `EMBEDDING_BASE_URL` + `EMBEDDING_API_KEY` |
+
+默认值指向本地服务（`http://127.0.0.1:8080/v1`），模型默认名为 `bge-m3`。如果 `EMBEDDING_MODEL_PATH` 设置了 GGUF 模型文件的绝对路径，项目启动时还会自动拉起 `llama-server` 进程——这在 `agent/embedding.py` 中有完整的实现逻辑。
+
+Sources: [agent/config.py](agent/config.py#L67-L72), [agent/embedding.py](agent/embedding.py#L265)
+
+### 5. Termux API 配置：手机环境感知
+
+这一组配置专为 Android + Termux 运行环境设计，负责检测和操控手机硬件：
+
+- `TERMUX_API_CHECK_CMD`：通过检查 `termux-battery-status` 命令是否存在来判断 API 是否安装
+- `TERMUX_API_INSTALL_GUIDE`：未安装时的引导提示（含 pkg 安装和商店安装两步）
+- `ENV_LIGHT_SENSOR_CMD` / `ENV_ACCEL_SENSOR_CMD`：环境光传感器和加速度传感器采样命令
+- `ENV_TIME_CMD` / `ENV_TIMEZONE_CMD`：获取系统时间和时区
+
+这些传感器数据会在系统提示词构建时注入上下文，让 Agent 能够感知"用户当前是在白天还是夜晚、手机是静止还是运动中"，从而实现更智能的交互决策。
+
+Sources: [agent/config.py](agent/config.py#L92-L106)
+
+---
+
+## config.py 与 .env 的契约关系
+
+为了更直观地理解公私分离，下图展示了配置读取的完整链路：
+
+```mermaid
+flowchart LR
+    subgraph 公有层[公有层 - 可版本控制]
+        CP[config.py<br/>硬编码默认值<br/>路径拓扑]
+    end
+    
+    subgraph 私有层[私有层 - .gitignore]
+        ENV[.env<br/>API Keys<br/>Base URLs<br/>模型选择]
+    end
+    
+    subgraph 消费层[消费层]
+        AG[agent_langchain.py<br/>主Agent引擎]
+        EM[embedding.py<br/>向量服务]
+        TB[tools/basic_tools.py<br/>工具实现]
+    end
+    
+    CP -->|"os.getenv() 读取"| ENV
+    ENV -->|"如果设置了<br/>覆盖默认值"| CP
+    CP -->|"import 导入"| AG
+    CP -->|"import 导入"| EM
+    CP -->|"import 导入"| TB
+```
+
+关键规则：
+- 如果 `.env` 设置了某个变量（如 `EXECUTOR_LLM_BASE_URL`），则 `os.getenv()` 返回该值，覆盖 config.py 中的 `None`
+- 如果 `.env` 未设置，`os.getenv()` 返回 `None`，消费端代码通过 `or` 逻辑回退到主 Agent 配置
+- 路径常量（`SKILLS_DIR` 等）完全由 config.py 硬编码，不受 `.env` 影响
+
+Sources: [agent/config.py](agent/config.py#L1-L10, L42-L51), [.env.example](.env.example#L1-L38)
+
+---
+
+## 配置项的消费模式
+
+理解配置在哪里被使用，比记住配置值本身更重要。以下是主要配置项的消费分布：
+
+| 配置项 | 消费者 | 用途 |
+|---|---|---|
+| `MAX_ITERATIONS` | `agent_langchain.py` | 限制 Agent 迭代轮数 |
+| `RECURSION_LIMIT` | `agent_langchain.py` | LangGraph 编译参数 |
+| `MAX_CONTEXT_TOKENS` | `agent_langchain.py` | 上下文压缩触发阈值、Token 统计 |
+| `SKILLS_DIR` / `EXECUTOR_SKILLS_DIR` | `agent_langchain.py` | 技能自动发现与加载 |
+| `AUTO_SKILLS_DIR` | `agent_langchain.py` | 自动沉淀技能的存储 |
+| `TASKS_DIR` | `agent_langchain.py`, `basic_tools.py` | 子 Agent 任务文件管理 |
+| `LOGS_DIR` | `agent_langchain.py` | 日志文件输出目录 |
+| `LLM_DEFAULT_CONFIG` | `agent_langchain.py` | 主 Agent 模型默认超参 |
+| `EXECUTOR_LLM_CONFIG` | `agent_langchain.py` | 子 Agent 独立模型配置 |
+| `EMBEDDING_*` | `embedding.py` | 向量检索服务初始化 |
+| `TERMUX_API_CHECK_CMD` | `agent_langchain.py` | 环境能力检测 |
+| 传感器命令 | `agent_langchain.py` | 环境上下文注入 |
+
+Sources: [agent/config.py](agent/config.py#L1-L107), [agent/agent_langchain.py](agent/agent_langchain.py#L29-L45)
+
+---
+
+## 总结
+
+`agent/config.py` 是 Pocket-Agent 配置体系的"宪法"——它定义了路径拓扑结构、运行安全边界、模型参数默认值和手机环境感知能力。作为一个仅有 106 行的文件，它的代码量虽小，但每一个常量都与项目中的核心模块紧密耦合。对于初学者来说，理解这份文件有助于建立起对整个项目配置架构的全局认知。
+
+建议的下一步阅读：
+- **[环境变量配置说明](41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent)**：了解 `.env` 中每个变量与 config.py 配置项的对应关系
+- **[LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian)**：查看 `MAX_ITERATIONS` 和 `RECURSION_LIMIT` 如何在 Agent 引擎中被实际使用
+- **[技能系统概述](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)**：理解 `SKILLS_DIR` 路径背后的技能加载逻辑

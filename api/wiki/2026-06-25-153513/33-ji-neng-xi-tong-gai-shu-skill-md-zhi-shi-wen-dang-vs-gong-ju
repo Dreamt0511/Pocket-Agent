@@ -1,0 +1,211 @@
+对于刚接触 Pocket-Agent 的开发者来说，「技能」和「工具」这两个概念是最容易混淆的。究其原因，两者都让 Agent「能做更多事」——但它们的本质、作用方式和生命周期截然不同。本文将从第一性原理出发，厘清这两个核心概念的边界，并完整呈现技能系统的三层架构、发现机制和使用流程。
+
+## 核心概念区分：工具 vs 技能
+
+在 Pocket-Agent 中，**工具（Tools）是 Agent 的"双手"，技能（Skills）是 Agent 的"大脑"**。两者有本质区别：
+
+**工具是可调用的函数**——它们在代码中定义，由 `@tool` 装饰器注册，Agent 可以直接调用它们来执行具体操作。例如 `file_read()` 读取文件、`shell_exec()` 执行 shell 命令、`mcp_call()` 调用 NeuralBridge 接口。工具是确定的、可执行的、硬编码的，Agent 调用工具就像你用手指点击按钮一样直接。所有工具定义在 `agent/tools/basic_tools.py` 中，通过 LangChain 的 `@tool` 装饰器注册为可调用函数 [basic_tools.py](agent/tools/basic_tools.py#L1-L22)。
+
+**技能是知识文档**——它们以 `SKILL.md` 文件的形式存在，是用 Markdown 编写的操作指南。Agent 不能直接「执行」技能，而是需要用 `file_read` 工具阅读技能文档，然后按照文档中的指导去调用工具。技能告诉你「打开拼多多买鞋要经过哪些步骤、使用什么参数、注意什么坑」，但它本身不执行任何操作。技能是可选的、可积累的、经验性的，Agent 在提示词中被明确教导：「需要用某个技能时，用 file_read 读取对应 SKILL.md」[agent_enhance.py](agent/prompts/agent_enhance.py#L64-L71)。
+
+以下是两者完整的对比：
+
+| 维度 | 工具（Tools） | 技能（Skills） |
+|:---|:---|:---|
+| **本质** | 可调用的函数 | Markdown 知识文档 |
+| **存储位置** | `agent/tools/basic_tools.py` | `agent/skills/` 下的 `SKILL.md` 文件 |
+| **注册方式** | `@tool` 装饰器，代码中硬编码 | 文件系统发现，运行时动态加载 |
+| **Agent 调用方式** | 直接调用（函数名+参数） | 先用 `file_read` 阅读，再按指导操作 |
+| **是否强制使用** | 是，Agent 必须使用工具执行操作 | 否，技能提供参考，Agent 可选择是否读取 |
+| **谁创建** | 开发者编写代码 | 开发者预设 + 子 Agent 自动沉淀 |
+| **能否运行时新增** | 不能，需修改代码 | 能，子 Agent 完成任务后自动写 SKILL.md |
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L57-L71) | [basic_tools.py](agent/tools/basic_tools.py#L1-L22) | [config.py](agent/config.py#L28-L44)
+
+## 技能系统三层架构
+
+Pocket-Agent 的技能目录分为三个层级，分别服务于不同的 Agent 角色和生命周期阶段，其结构如下：
+
+```
+agent/skills/
+├── main-skills/          ← 主 Agent 技能（开发者预设）
+│   ├── dev/              ← 开发类（调试、代码审查、测试驱动）
+│   ├── body-moves/       ← 3D 身体动作指导
+│   └── phone/            ← 手机操控速查
+│
+├── executor-skills/      ← 子 Agent 技能（开发者预设）
+│   ├── fast-mode/        ← 高速模式规范
+│   ├── phone-control-guide/  ← 手机操纵指南（首选方案）
+│   ├── neuralbridge-operation-standard/  ← NeuralBridge 规范（降级方案）
+│   └── skill-creator/    ← 技能沉淀规范
+│
+└── auto-skills/          ← 自动沉淀技能（运行时自动生成）
+    ├── executor/         ← 子 Agent 执行经验沉淀
+    │   ├── pinduoduo_buy_shoes/
+    │   ├── douyin-like-comment/
+    │   ├── deepseek-chat/
+    │   └── ...（按需增长）
+    └── main/             ← 主 Agent 沉淀（预留）
+```
+
+Sources: [skills directory](agent/skills) | [config.py](agent/config.py#L28-L44)
+
+### 主 Agent 技能（main-skills）
+
+由开发者预先编写，存放于 `agent/skills/main-skills/` 目录。主 Agent（即与你对话的智能体）在运行时会通过 `load_skills_list("main")` 加载该目录下的所有技能，并作为提示词的一部分注入到其增强规则中。主 Agent 的技能分为两类：
+
+- **开发类技能**（`dev/` 子目录）：包括 `systematic-debugging`（系统化调试）、`code-review`（代码审查）、`test-driven-development`（测试驱动开发）、`verification-before-completion`（完成前验证）、`writing-plans`（方案编写）和 `skill-creator`（技能创建指导）。这些技能帮助主 Agent 在开发场景中保持规范和高效。
+- **身体动作技能**（`body-moves/`）：指导主 Agent 如何控制 3D 虚拟身体执行动作（坐下、挥手、跳舞等），包含预设动作文件的查找方法和多部位协调编排规范。
+- **手机操控速查**（`phone/phone-control-quickref`）：为主 Agent 提供 Termux API 和 Shell 单步操作的快速参考，适用于无需子 Agent 介入的简单操作——如发通知、查电池状态、启动应用等。
+
+主 Agent 技能的特点是**稳定性高**，一旦编写后不会频繁变动，它们是 Agent 核心能力的知识支撑 [agent_enhance.py](agent/prompts/agent_enhance.py#L668)。
+
+Sources: [main-skills directory](agent/skills/main-skills) | [body-moves/SKILL.md](agent/skills/main-skills/body-moves/SKILL.md#L1-L20) | [phone-control-quickref/SKILL.md](agent/skills/main-skills/phone/phone-control-quickref/SKILL.md#L1-L15)
+
+### 子 Agent 技能（executor-skills）
+
+由开发者预先编写，存放于 `agent/skills/executor-skills/` 目录。子 Agent（Executor）是专门用于执行手机操控任务的独立智能体，它的技能配置与主 Agent 隔离，拥有独立的系统提示词和执行规范。当前包括四个核心技能：
+
+- **`fast-mode`**（高速模式）：定义了链式点击、剪贴板粘贴、减少验证等加速策略，可将多步骤手机操作的速度提升 3-10 倍。核心思想是「信任计算，减少人肉验证」——在同一页面内一次获取 UI 树后复用坐标，将操作间隔压缩至 0.3-0.5 秒。
+- **`phone-control-guide`**（手机操纵指南）：子 Agent 执行手机操控任务的**首选方案**。包含常用应用的包名对照表、Termux Shell 命令参考、Termux API 调用方式。明确规定了「先查本技能，确认不行后再降级到 NeuralBridge」的执行优先级。
+- **`neuralbridge-operation-standard`**（NeuralBridge 操作规范）：作为**降级方案**使用。当 shell 命令和 Termux API 无法完成操作时，提供 NeuralBridge MCP 服务的全部工具调用规范（32 个工具）、核心操作三原则、坐标计算规则、输入方案选择和故障重试流程。
+- **`skill-creator`**（技能创建规范）：定义了子 Agent 完成任务后如何自动沉淀技能的格式和规则。这是「自动学习」闭环的关键一环。
+
+子 Agent 技能与主 Agent 技能互不干扰——子 Agent 加载的是 `executor-skills/` 目录，主 Agent 加载的是 `main-skills/` 目录，两者通过 `load_skills_list()` 函数的 `agent_type` 参数区分 [agent_langchain.py](agent/agent_langchain.py#L116-L161)。
+
+Sources: [executor-skills directory](agent/skills/executor-skills) | [executor_enhance.py](agent/prompts/executor_enhance.py#L1-L35) | [agent_langchain.py](agent/agent_langchain.py#L1595-L1620)
+
+### 自动沉淀技能（auto-skills）
+
+这是技能系统中最具特色的部分——**技能可以自动生长**。当子 Agent 完成一个多步骤的手机操控任务后，它会自动将执行路径沉淀为 SKILL.md 文档，存入 `agent/skills/auto-skills/executor/` 目录。这意味着 Agent 从每一次成功的执行中学习，下次遇到类似任务时可以直接参考之前的经验。
+
+自动沉淀的触发条件非常明确（由 `skill-creator` 技能定义）：
+1. 任务步骤 >= 3 步（单步操作不值得沉淀）
+2. 任务成功完成（失败的任务不沉淀）
+3. 未来可能重复执行（一次性操作不沉淀）
+4. 流程有参考价值（不是一句话能说清的内容）
+
+沉淀流程由子 Agent 在任务完成后自动触发：先 `file_read` 读取 `executor-skills/skill-creator/SKILL.md` 了解沉淀规范，然后调用 `file_write` 将执行路径写入 `auto-skills/executor/<技能名称>/SKILL.md`。每次沉淀的记录会追加到 `skill-deposit-log.md` 文件中，形成完整的技能演化历史 [skill-deposit-log.md](agent/skills/auto-skills/executor/skill-deposit-log.md#L1-L131)。
+
+目前 auto-skills/executor 目录下已有 11 个自动沉淀的技能，覆盖了从拼多多购物、抖音点赞评论、到小米备忘录写入等真实手机操作场景。每个技能都包含：基础信息（包名、启动方式）、核心操作流程（按步骤列出 MCP 工具调用）、注意事项（排查过的坑和解决方案）和适用场景说明 [pinduoduo_buy_shoes/SKILL.md](agent/skills/auto-skills/executor/pinduoduo_buy_shoes/SKILL.md#L1-L64)。
+
+Sources: [auto-skills directory](agent/skills/auto-skills/executor) | [skill-creator (executor)](agent/skills/executor-skills/skill-creator/SKILL.md#L1-L46) | [skill-deposit-log.md](agent/skills/auto-skills/executor/skill-deposit-log.md#L1-L131)
+
+## 技能发现与加载机制
+
+技能系统通过文件系统扫描实现自动发现，无需手动注册。其核心实现位于 `agent/agent_langchain.py` 中的几个函数：
+
+1. **`_scan_skills(scan_dir)`**：递归扫描指定目录，查找所有包含 `SKILL.md`（或 `skill.md`，大小写均可）的子目录。支持两种目录结构：**flat 模式**（子目录直接包含 SKILL.md）和 **category 模式**（子目录下有二级分类目录）。对于每个找到的技能，读取其 SKILL.md 前 20 行中的 `description:` 字段作为技能描述，返回 `(category, name, desc, path)` 元组列表 [agent_langchain.py](agent/agent_langchain.py#L70-L115)。
+
+2. **`load_skills_list(agent_type)`**：根据 Agent 类型（`"main"` 或 `"executor"`）加载对应的技能目录。主 Agent 加载 `main-skills/` 目录；子 Agent 加载 `executor-skills/` 目录，**并额外加载** `auto-skills/executor/` 目录——这意味着自动沉淀的技能立即对后续的子 Agent 任务可见。返回格式化后的技能列表文本，包含技能名称、描述和文件路径，以及使用说明 [agent_langchain.py](agent/agent_langchain.py#L116-L161)。
+
+3. **运行时注入**：在 Agent 初始化时，`load_skills_list()` 的返回结果作为 `{skills_list}` 占位符替换到提示词模板中。主 Agent 的提示词注入发生在 `_create_agent()` 方法中，子 Agent 的注入发生在 `_run_executor_foreground()` 方法中 [agent_langchain.py](agent/agent_langchain.py#L773-L779)。
+
+```python
+# 注入过程示意（简化）
+skills_list = load_skills_list("main")
+enhanced_prompt = agent_enhance_prompt.format(
+    tool_names=tool_names,
+    skills_list=skills_list,  # ← 技能列表嵌入提示词
+    ...
+)
+```
+
+Sources: [agent_langchain.py](agent/agent_langchain.py#L70-L161) | [agent_langchain.py](agent/agent_langchain.py#L768-L790) | [agent_langchain.py](agent/agent_langchain.py#L1595-L1620)
+
+## SKILL.md 文档格式规范
+
+每个技能文档使用统一的 Markdown 格式，包含 YAML 前置元数据：
+
+```markdown
+---
+name: <技能名称>
+description: <一句话描述，100字以内>
+---
+
+# <技能名称>
+
+## 任务目标
+<这个技能解决什么问题>
+
+## 前置条件（可选）
+- 需要什么环境/工具/权限
+
+## 执行步骤
+1. 步骤1描述
+2. 步骤2描述
+...
+
+## 关键操作
+- 包名：用到的 APP 包名
+- MCP 工具：用到的工具和参数
+- 注意事项：执行过程中的坑和解决方案
+
+## 适用场景
+什么情况下应该使用这个技能
+```
+
+自动沉淀的技能（auto-skills）还额外在「执行步骤」中使用 `[completed]` 标记每个已验证通过的步骤，并记录完整的 MCP 工具调用参数（如 `android_tap(x=315, y=1002)`），形成可直接复用的执行模板 [skill-creator/SKILL.md (executor)](agent/skills/executor-skills/skill-creator/SKILL.md#L1-L46)。
+
+## 技能在提示词中的呈现方式
+
+当 Agent 启动时，`load_skills_list()` 生成的文本会按分类分组注入到增强提示词中，呈现效果如下：
+
+```
+【dev】
+- systematic-debugging: Use when encountering any bug...（路径：.../SKILL.md）
+- code-review: ...（路径：.../SKILL.md）
+...
+
+【phone】
+- phone-control-quickref: 手机操控速查...（路径：.../SKILL.md）
+
+...
+
+使用说明：需要使用某个技能时，用file_read读取对应SKILL.md即可
+```
+
+同时，提示词中明确教导 Agent：「当用户问"你有哪些skills"时，你必须回答以上技能列表，而不是罗列工具名称」——这也是区分技能和工具的重要行为规则 [agent_enhance.py](agent/prompts/agent_enhance.py#L64-L71)。
+
+Sources: [agent_enhance.py](agent/prompts/agent_enhance.py#L57-L71) | [agent_langchain.py](agent/agent_langchain.py#L135-L161)
+
+## 技能与工具的交互关系
+
+理解技能与工具的交互，可以用一句话概括：**技能指导工具的使用，工具实现技能的目标**。
+
+当一个任务到来时，Agent 的工作流程如下：
+
+```mermaid
+flowchart TD
+    A[用户提出任务] --> B{Agent 判断：<br>是否需要技能指导？}
+    B -->|是| C[file_read 读取相关 SKILL.md]
+    B -->|否| D[直接调用工具执行]
+    C --> E[按技能指导<br>调用具体工具]
+    E --> F{任务是否成功？<br>且步骤>=3步？}
+    F -->|是| G[子 Agent 自动沉淀为<br>新的 auto-skill]
+    F -->|否| H[结束]
+    G --> I[下次类似任务<br>可直接参考此技能]
+    D --> H
+```
+
+## 技能系统的设计哲学
+
+从架构层面看，技能系统体现了三个核心设计原则：
+
+**知识即文档**。技能不是代码，不是配置，而是纯文本的 Markdown 文档。这意味着任何人都可以直接阅读和编写技能，无需了解代码实现。这也是为什么 Agent 需要用 `file_read` 工具来「读取」技能——在架构层面，技能与项目中的其他文档没有区别。
+
+**学习即沉淀**。系统不依赖开发者预判所有使用场景，而是让 Agent 在实际执行中积累经验。每次成功的多步骤操作都自动转化为可复用的技能文档，形成「执行→沉淀→复用」的自我进化闭环。
+
+**分层隔离**。主 Agent 技能、子 Agent 技能、自动沉淀技能分别服务于不同的角色和生命周期阶段。主 Agent 和子 Agent 拥有独立的技能目录和提示词模板，确保了关注点分离——主 Agent 负责规划与决策，子 Agent 负责执行与沉淀。
+
+Sources: [config.py](agent/config.py#L28-L44) | [agent_enhance.py](agent/prompts/agent_enhance.py#L57-L71)
+
+## 下一步阅读
+
+理解了技能与工具的区别后，建议按以下顺序深入了解技能系统的各个侧面：
+
+- 深入了解主 Agent 如何使用开发类和手机操控类技能完成具体任务：[主 Agent 技能（main-skills：开发类、手机操控类）](34-zhu-agent-ji-neng-main-skills-kai-fa-lei-shou-ji-cao-kong-lei)
+- 了解子 Agent 的技能套件和高速执行模式：[子 Agent 技能（executor-skills：快速模式、操控指南）](35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan)
+- 探索自动沉淀的完整流程和触发条件：[自动沉淀技能（auto-skills：执行经验自动积累）](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)
+- 掌握技能如何被自动发现和加载到 Agent 提示词中：[技能自动发现与加载机制](37-ji-neng-zi-dong-fa-xian-yu-jia-zai-ji-zhi)
+- 回到技能列表的开头，从更高视角浏览系统全貌：[技能系统概述](33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju)

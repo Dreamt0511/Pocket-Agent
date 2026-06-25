@@ -1,0 +1,305 @@
+NeuralBridge MCP 服务是 Pocket-Agent 实现 Android 设备 UI 自动化的核心基础设施。它通过无障碍服务（AccessibilityService）提供了一套完整的手机操控工具集——从获取屏幕 UI 结构树、模拟点击滑动，到截取屏幕截图——使 AI Agent 能够像人类一样「看懂」并「操作」手机界面。
+
+> **设计定位**：在 Pocket-Agent 的手机操控体系中，NeuralBridge MCP 作为**第二方案**存在。第一方案是 `phone-control-guide`（基于 Termux Shell 命令 + Termux API，零 token 消耗），只有 Shell 方案无法完成的场景（如复杂 UI 交互、元素定位、截图分析）才降级使用 NeuralBridge。详见 [手机操纵指南与包名管理](25-shou-ji-cao-zong-zhi-nan-yu-bao-ming-guan-li)。
+
+## 架构全景
+
+### 通信架构
+
+```
+┌──────────────────────────────────────────────────┐
+│                  Pocket-Agent                      │
+│  ┌───────────────────────────────────────────┐   │
+│  │          Agent（主/子 Agent）               │   │
+│  │    mcp_call(server_url, tool_name, args)   │   │
+│  └──────────────┬────────────────────────────┘   │
+│                 │ HTTP POST (JSON-RPC 2.0)        │
+│                 ▼                                 │
+│  ┌───────────────────────────────────────────┐   │
+│  │        NeuralBridge MCP Server              │   │
+│  │     Ktor HTTP Server @ 127.0.0.1:7474      │   │
+│  └──────────────┬────────────────────────────┘   │
+│                 │ Android AccessibilityService    │
+│                 ▼                                 │
+│  ┌───────────────────────────────────────────┐   │
+│  │          Android 设备                       │   │
+│  │  dispatchGesture() / AccessibilityNodeInfo │   │
+│  │  MediaProjection / PackageManager          │   │
+│  └───────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
+```
+
+**三层架构解析**：
+
+| 层级 | 实现技术 | 职责 |
+|------|---------|------|
+| **通信层** | Ktor HTTP 服务器（端口 7474），JSON-RPC 2.0 协议 | 接收 Agent 的 MCP 调用请求，序列化/反序列化，CORS 跨域支持 |
+| **控制核心层** | `AccessibilityService.dispatchGesture()`、`performGlobalAction()`、PackageManager | 执行手势（点击/滑动/长按/缩放）、系统操作（返回/主页/最近任务）、应用管理（启动/关闭） |
+| **感知能力层** | `UiTreeWalker`（无障碍节点遍历）、`MediaProjection`（截图）、`NotificationListenerService`（通知监听） | 获取 UI 结构树、屏幕截图、通知与 Toast 消息 |
+
+Sources: [docs/经验/05-Neuralbridge MCP Server说明.md](../../docs/经验/05-Neuralbridge%20MCP%20Server说明.md#L14-L55)
+
+### 在 Pocket-Agent 中的集成方式
+
+NeuralBridge MCP 并非作为独立模块存在，而是通过 `mcp_call` 这个通用工具函数来进行调用：
+
+```python
+# agent/tools/basic_tools.py 中的 mcp_call 工具
+@tool
+async def mcp_call(server_url: str, tool_name: str, arguments: Optional[str] = None) -> str:
+    """
+    调用 MCP 服务的工具。支持任何 MCP 协议的 JSON-RPC 服务。
+    注意：NeuralBridge 的 MCP 地址为 http://127.0.0.1:7474/mcp
+    """
+```
+
+配置方式：在 `.env` 文件中设置 `MCP_SERVER_URL=http://127.0.0.1:7474/mcp`，Agent 调用时通过环境变量注入。具体调用示例：
+
+```python
+# 获取 UI 树
+mcp_call(server_url="http://127.0.0.1:7474/mcp", tool_name="android_get_ui_tree")
+
+# 点击坐标 (315, 1002)
+mcp_call(server_url="http://127.0.0.1:7474/mcp", tool_name="android_tap", 
+         arguments='{"x": 315, "y": 1002}')
+
+# 截取屏幕
+mcp_call(server_url="http://127.0.0.1:7474/mcp", tool_name="android_screenshot")
+```
+
+Sources: [agent/tools/basic_tools.py](../../agent/tools/basic_tools.py#L626-L632), [.env.example](../../.env.example#L5)
+
+## 工具分类详解
+
+NeuralBridge MCP 服务提供约 32 个工具，按功能划分为 6 大类：
+
+### 📱 设备与系统基础工具
+
+| 工具名 | 功能 | 关键参数 |
+|--------|------|---------|
+| `android_get_device_info` | 获取厂商、型号、Android 版本、SDK 等级、屏幕尺寸 | 无 |
+| `android_list_devices` | 列出所有已连接设备 | 无 |
+| `android_select_device` | 选择目标设备 | `device_id` |
+| `android_global_action` | 系统操作：`back`/`home`/`recents`/`notifications`/`quick_settings` | `action` |
+| `android_press_key` | 按键：全局键 + 输入框键（`enter`/`delete`/`tab`/`space`/`copy`/`paste`/`select_all`） | `key` |
+
+### 🖱️ UI 交互操作工具
+
+| 工具名 | 功能 | 关键参数 |
+|--------|------|---------|
+| `android_tap` | 点击 | `x`/`y` 坐标，或 `text`/`resource_id`/`content_desc` 定位 |
+| `android_double_tap` | 双击 | 同上 |
+| `android_long_press` | 长按（默认 1000ms） | 同上，可选 `duration_ms` |
+| `android_swipe` | 滑动（默认 300ms，<200ms 为快速滑动） | `start_x`/`start_y`/`end_x`/`end_y` |
+| `android_drag` | 拖拽（默认 500ms） | `from_x`/`from_y`/`to_x`/`to_y` |
+| `android_pinch` | 捏合缩放 | `center_x`/`center_y` + `scale`（>1 放大，<1 缩小） |
+| `android_input_text` | 输入文本 | `text` + 可选 `element_text`/`resource_id` 定位、`append` 追加 |
+| `android_set_clipboard` | 设置剪贴板 | `text` |
+
+### 🔍 UI 元素与页面分析工具
+
+| 工具名 | 功能 | 关键参数 |
+|--------|------|---------|
+| `android_find_elements` | 按条件查找元素 | `text`/`resource_id`/`content_desc`/`class_name` + 可过滤 `clickable`/`scrollable`/`focusable` |
+| `android_get_ui_tree` | 获取当前屏幕完整 UI 树 | `filter`（`all`/`interactive`/`text`）、`include_invisible`、`max_depth` |
+| `android_get_screen_context` | 一站式获取页面上下文（前台应用 + 简化 UI 树 + 缩略截图） | `include_all_elements` |
+| `android_scroll_to_element` | 滚动查找屏幕外元素 | `text`/`resource_id`/`content_desc` + `direction`/`max_scrolls`/`timeout_ms` |
+| `android_wait_for_element` | 等待元素出现（默认超时 5000ms） | `text`/`resource_id`/`content_desc`/`timeout_ms` |
+| `android_wait_for_gone` | 等待元素消失 | 同上 |
+| `android_wait_for_idle` | 等待 UI 稳定（300ms 无变化） | `timeout_ms` |
+
+### 📸 截图与视觉工具
+
+| 工具名 | 功能 | 关键参数 |
+|--------|------|---------|
+| `android_screenshot` | 捕获屏幕截图 | `quality`（`full`/`thumbnail`）、`max_width` |
+| `android_screenshot_diff` | 视觉对比测试 | `reference_base64`（参考截图），返回相似度评分 0.0-1.0 |
+
+### 其他工具
+
+通知工具（`android_get_notifications`、`android_get_recent_toasts`、`android_enable_events`）、无障碍审计工具（`android_accessibility_audit`）、应用管理工具（`android_launch_app`/`android_close_app`/`android_list_apps`/`android_open_url`）、工具管理工具（`android_describe_tools`/`android_search_tools`）。
+
+Sources: [docs/经验/05-Neuralbridge MCP Server说明.md](../../docs/经验/05-Neuralbridge%20MCP%20Server说明.md#L14-L124)
+
+## 核心操作规范
+
+### 坐标来源原则
+
+**所有点击/长按/滑动的坐标必须来自 `android_get_ui_tree` 返回的 bounds**。禁止猜测坐标，禁止从截图估算。坐标计算方式：
+
+```
+从 bounds [left, top, right, bottom] 计算中心点：
+    x = (left + right) // 2
+    y = (top + bottom) // 2
+```
+
+### 等待时间规范
+
+| 场景 | 等待策略 | timeout_ms |
+|------|---------|------------|
+| 点击/滑动/输入/按键后 | **不等待**，直接获取 UI 树验证 | — |
+| 启动应用 | `android_wait_for_idle` | 2000 |
+| 打开新页面/跳转 | `android_wait_for_idle` | 2000 |
+| 网络请求触发的页面变化 | `android_wait_for_idle` | 2000 |
+| 低端设备加载重型页面 | `android_wait_for_idle` | 3000（极端） |
+
+**禁止**：每个操作后都调用 `android_wait_for_idle`；timeout 超过 3000；用 `time.sleep()` 替代 `android_wait_for_idle`。
+
+### 元素定位优先级
+
+1. `resource_id` — 最精确的定位方式（如 `com.tencent.mm:id/xxx`）
+2. `text` — 通过显示文本定位（如「发送」「确认」）
+3. `content_desc` — 通过无障碍内容描述定位
+
+### 输入方案（三步法）
+
+对于文本输入，优先使用**剪贴板 + paste 按键**的通用方案：
+
+1. `android_tap(x=输入框中心x, y=输入框中心y)` — 点击输入框聚焦
+2. `android_set_clipboard(text="目标文本")` — 存入系统剪贴板
+3. `android_press_key(key="paste")` — 发送粘贴按键事件
+4. 获取 UI 树验证输入框 text 已变化
+
+降级链路：`android_input_text` → 剪贴板 + paste 按键 → 键盘粘贴建议坐标 → OCR 动态定位。
+
+Sources: [agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md](../../agent/skills/executor-skills/neuralbridge-operation-standard/SKILL.md#L40-L128)
+
+## 子 Agent 中的 MCP 调用集成
+
+子 Agent（Executor）是专门执行手机操控任务的角色。在 Pocket-Agent 中，子 Agent 的工具集被精简为 7 个核心工具，其中 `mcp_call` 是进行 UI 自动化的**唯一**入口：
+
+```python
+executor_tool_names = {"shell_exec", "file_read", "file_write", 
+                       "file_search", "mcp_call", "system_info", "tts_speak"}
+```
+
+子 Agent 的执行流程遵循清晰的决策路径：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 任务开始                              │
+├─────────────────────────────────────────────────────┤
+│ 1. file_read(task.json) — 读取任务目标与步骤           │
+│ 2. file_read(SKILL.md) — 读取操作指南                 │
+│ 3. 步骤执行循环：                                      │
+│    ├─ shell_exec — 优先尝试 Shell 方案                 │
+│    │   （启动App、查包名、Termux API）                  │
+│    └─ mcp_call — Shell 不可行的 UI 操作                │
+│        ├─ android_get_ui_tree — 获取界面结构           │
+│        ├─ android_tap — 点击元素                      │
+│        ├─ android_swipe — 滑动页面                    │
+│        └─ android_screenshot — 截图验证               │
+│ 4. file_write(task.json) — 更新步骤状态               │
+└─────────────────────────────────────────────────────┘
+```
+
+子 Agent 的增强提示词中明确规定了 MCP 调用规范：
+
+```python
+# agent/prompts/executor_enhance.py
+- **mcp_call**：NeuralBridge 的唯一调用方式。参数用 Python dict 如 {{"x":315,"y":1002}}。
+  tap/press_key 等返回"无返回内容"是正常成功。禁止用 curl 调 MCP 端口。
+```
+
+Sources: [agent/agent_langchain.py](../../agent/agent_langchain.py#L1598-L1600), [agent/prompts/executor_enhance.py](../../agent/prompts/executor_enhance.py#L12-L14)
+
+## 配置与部署
+
+### 前置条件
+
+- Android SDK API 24+（Android 7.0+）
+- Java JDK 17（用于编译 NeuralBridge 项目）
+- Termux 环境（Pocket-Agent 运行依托）
+
+### 配置流程
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ 构建安装  │ →  │ 启用无障碍  │ →  │ 获取 IP  │ →  │ 配置 MCP │
+│ App      │    │ 服务      │    │ 地址     │    │ 连接     │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+```
+
+**步骤一：构建并安装 NeuralBridge App**
+
+```bash
+git clone https://github.com/dondetir/NeuralBridge_mcp.git
+cd NeuralBridge_mcp/android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+**步骤二：启用无障碍服务**
+
+```bash
+adb shell settings put secure enabled_accessibility_services \
+  com.neuralbridge.companion/.service.NeuralBridgeAccessibilityService
+adb shell settings put secure accessibility_enabled 1
+```
+
+> Android 15+ 需额外在「设置 → 应用 → NeuralBridge」中启用「允许受限设置」。
+
+**步骤三：在 Termux 中获取真实 IP**
+
+```bash
+# 安装网络工具
+pkg install net-tools
+# 查看所有网络接口
+ifconfig
+```
+
+关键识别：`wlan0`/`wlan2` 是 WiFi/热点 IP，`rmnet_data*` 是移动数据 IP。忽略 `lo`（本地回环）和 `10.2.0.2` 等可疑地址。
+
+**步骤四：在 `.env` 中配置 MCP 地址**
+
+```ini
+MCP_SERVER_URL=http://<真实IP>:7474/mcp
+```
+
+> 注意：App 显示的 IP 可能不准确，**始终用 `ifconfig` 验证**。设备重启或网络重连后 IP 可能变化，需要重新获取。USB 网络共享比 WiFi 热点更稳定。
+
+Sources: [docs/经验/06-NeuralBridge配置SKILL.md](../../docs/经验/06-NeuralBridge配置SKILL.md#L10-L80), [.env.example](../../.env.example#L5)
+
+## 已知问题与限制
+
+### 截图相关问题
+- **Android 14+ 权限失效**：`MediaProjection` 为单次授权，应用或设备重启后需用户手动重新确认
+- **屏幕旋转不适配**：旋转后 `VirtualDisplay` 分辨率不匹配导致截图变形
+- **硬件位图兼容性**：部分设备上无障碍服务 fallback 截图转换可能失败
+
+### 输入相关问题
+- **剪贴板污染**：输入 fallback 方案会覆盖用户剪贴板内容
+- **自定义输入框兼容差**：不支持 `ACTION_SET_TEXT` 的自定义控件缺少模拟按键输入的兜底方案
+
+### 安全风险
+- **无身份认证**：HTTP 接口无认证机制，同一局域网任何设备可控制手机
+- **CORS 配置过宽**：`Access-Control-Allow-Origin: *` 允许任意网站跨域调用
+
+Sources: [docs/经验/05-Neuralbridge MCP Server说明.md](../../docs/经验/05-Neuralbridge%20MCP%20Server说明.md#L83-L124)
+
+## 与相关模块的协作关系
+
+```
+┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ phone-control │ 优先 │  NeuralBridge    │     │  3D 身体控制     │
+│ -guide        │ ──→ │  MCP 服务         │     │  (body_control)  │
+│ (Shell/Termux)│ 降级 │  (UI自动化)       │     │  (虚拟身体动画)   │
+└──────────────┘     └────────┬─────────┘     └─────────────────┘
+                              │ 通过 mcp_call 调用
+                              ▼
+                    ┌──────────────────┐
+                    │  Pocket-Agent     │
+                    │  Agent 引擎       │
+                    │  (create_agent)   │
+                    └──────────────────┘
+```
+
+- **上方**：[手机操纵指南与包名管理](25-shou-ji-cao-zong-zhi-nan-yu-bao-ming-guan-li) 提供 Shell 优先方案
+- **右侧**：[3D 身体控制工具](26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle) 是独立的虚拟身体动画系统，与手机控制正交
+- **核心引擎**：[LangChain Agent 核心实现](10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian) 通过 `mcp_call` 工具桥接
+
+## 推荐阅读顺序
+
+1. **先理解对手机构架**：[手机操纵指南与包名管理](25-shou-ji-cao-zong-zhi-nan-yu-bao-ming-guan-li) — 了解 Shell 方案与 MCP 方案的边界
+2. **再理解整体工具系统**：[内置工具一览](22-nei-zhi-gong-ju-lan-wen-jian-cao-zuo-shell-zhi-xing-xi-tong-xin-xi-mcp-diao-yin-yong) — 了解 `mcp_call` 在工具体系中的定位
+3. **深入子 Agent 执行**：[子 Agent 前台同步执行与流式输出](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu) — 了解子 Agent 如何使用 MCP 执行手机操控任务

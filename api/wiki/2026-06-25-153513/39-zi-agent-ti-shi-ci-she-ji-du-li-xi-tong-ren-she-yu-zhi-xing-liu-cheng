@@ -1,0 +1,165 @@
+子 Agent（Executor）是 Pocket-Agent 中专用于手机操控的执行单元，拥有与主 Agent **完全独立的系统人设**、**专属技能体系**和**自包含的执行流程提示词**。其设计核心是"**读任务文件 → 读技能文档 → 逐步执行 → 更新状态 → 沉淀技能**"的闭环范式，主 Agent 仅通过 `delegate_task` 派发任务定义（task.json），后续全部由子 Agent 独立完成。
+
+提示词架构采用双层设计：**系统人设层**（`executor_system_prompt`）定义身份与强制规则，**增强规则层**（`executor_enhance_prompt`）注入工具列表、技能列表和执行流程。运行时在 `_run_executor_foreground` 中组装——增强提示词通过 `.format()` 注入动态内容后，替换系统人设中的 `{tool_rules_and_skills}` 占位符，最终形成完整的子 Agent 系统提示词。
+Sources: [executor_system.py](agent/prompts/executor_system.py#L1-L23), [executor_enhance.py](agent/prompts/executor_enhance.py#L1-L35), [agent_langchain.py#L1595-L1608](agent/agent_langchain.py#L1595-L1608)
+
+---
+
+## 一、独立系统人设：身份、任务目标与强制规则
+
+子 Agent 的系统人设在 `executor_system_prompt` 中定义，与主 Agent 的用户交互助手角色完全切割。
+
+**身份定位**：子 Agent 被定义为"**手机操控执行助手**"，运行在 Android Termux 环境中。这一定位限定了子 Agent 不负责对话交流、不处理用户咨询，唯一的职责就是**操作手机完成任务**。主 Agent 侧的 `system_base.py` 定义的角色是"安装在手机上的 AI 助手"，而子 Agent 则被降级为纯执行者。
+
+**最高优先级规则**：必须完成 `task.json` 中的所有步骤才能停止，禁止提前终止。这一条写在系统人设的第一行加粗强调，是整个子 Agent 行为的**最高约束**。与之配合的是**强制执行规则集合**：
+
+- **必须执行**：读取 task.json 后必须继续调用工具执行每个步骤，禁止只读取不执行
+- **禁止纯文本**：禁止只输出文字描述而不调用工具，每一步都必须通过工具调用完成
+- **先读后做**：先读相关 SKILL.md 获取操作指导，然后按步骤执行
+- **逐步标记**：每完成一个步骤，立即用 `file_write` 更新 task.json 将该步骤的 status 改为 "completed"
+- **最终标记**：所有步骤都标记为 completed 后，再将 task.json 的 `all_completed` 改为 true
+- **沉淀规范**：需要沉淀技能前，必须先读取 `executor-skills/skill-creator/SKILL.md`，严格按格式编写
+- **坐标来源**：所有点击/长按/滑动的坐标必须 100% 来自 `android_get_ui_tree` 返回的 bounds，禁止猜测
+- **禁止过度等待**：操作后禁止无脑 sleep，一般操作后直接获取 UI 树验证，仅在页面明显需要加载时等待且最长不超过 2 秒
+
+这些规则被硬编码在系统人设中，不允许被后续的增强提示词覆盖。它们构成了子 Agent 的行为底线，特别是**坐标禁止猜测**和**禁止过度等待**两条，直接针对手机操控中最容易出错的两种行为模式。
+Sources: [executor_system.py](agent/prompts/executor_system.py#L6-L22)
+
+---
+
+## 二、增强提示词的三段式结构
+
+增强提示词（`executor_enhance_prompt`）在运行时注入动态参数后嵌入系统人设，包含三个明确的逻辑段落，用 Markdown 分隔线（`---`）隔开。
+
+### 2.1 工具说明（注入 `tool_names`）
+
+子 Agent 可用的工具集与主 Agent 不同，是一个经过筛选的**7 工具子集**：`shell_exec`、`file_read`、`file_write`、`file_search`、`mcp_call`、`system_info`、`tts_speak`。增强提示词为每个工具标注了使用场景和优先级：
+
+| 工具 | 用途场景 | 使用要求 |
+|------|---------|---------|
+| `shell_exec` | 启动 App、Termux API、查系统信息 | **优先方案**，零 token 消耗 |
+| `mcp_call` | NeuralBridge 手机操控（点击、滑动、UI 树） | 参数用 Python dict，禁止用 curl 调 MCP 端口 |
+| `file_read/write` | 读 task.json、写最终状态 | 开始时读，全部执行完再写一次最终状态 |
+| `tts_speak` | **仅人工介入时使用**，通知用户 | 禁止自己拼 shell 调 termux-tts-speak |
+| `file_search/system_info` | 搜索文件、获取设备状态 | 辅助性工具 |
+
+这套工具选择体现了设计意图：**子 Agent 不具备记忆写入能力**（无 `save_memory`/`update_user_profile`）、**不具备身体控制能力**（无 `control_body` 等），专注于手机操控的原子操作链条。
+Sources: [executor_enhance.py#L7-L17](agent/prompts/executor_enhance.py#L7-L17), [agent_langchain.py#L1598-L1599](agent/agent_langchain.py#L1598-L1599)
+
+### 2.2 可用技能列表（注入 `skills_list`）
+
+子 Agent 拥有自己的专属技能目录体系：
+
+- **executor-skills/**：预置的 4 项核心技能——`phone-control-guide`（Shell/Termux API 操控指南）、`neuralbridge-operation-standard`（MCP 操作标准规范）、`fast-mode`（高速链式执行规范）、`skill-creator`（技能沉淀格式规范）
+- **auto-skills/executor/**：自动沉淀的技能目录，由子 Agent 在每次任务执行完毕后自行写入。这些技能记录了具体的执行路径、包名、操作参数和注意事项，供后续同类任务复用
+
+增强提示词还指定了**强制前置读取**规则：手机操控任务执行前，必须先读取 `phone-control-guide` 和 `neuralbridge-operation-standard` 两个技能文档。已读过的技能不重复读取。
+Sources: [executor_enhance.py#L19-L23](agent/prompts/executor_enhance.py#L19-L23), [load_skills_list#L116-L160](agent/agent_langchain.py#L116-L160), [executor-skills 目录](agent/skills/executor-skills/)
+
+### 2.3 执行流程（5 步闭环）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   子 Agent 执行流程                       │
+│                                                         │
+│  ① 读 task.json → 理解目标 → 读相关技能 → 按序执行      │
+│             ↓                                            │
+│  ② 按顺序执行每个步骤（无需每步都写 task.json）          │
+│             ↓                                            │
+│  ③ 不适用/可跳过的步骤直接跳过                           │
+│             ↓                                            │
+│  ④ 失败处理：同一方案最多换 1 个替代方案                 │
+│     └─ 仍失败 → tts_speak 通知用户 → 等待 30s           │
+│             ↓                                            │
+│  ⑤ 所有步骤执行完毕 → 一次 file_write 写入最终状态       │
+│     ├─ status: completed                                 │
+│     └─ summary: 执行摘要                                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+这里的 **快速失败机制**（同一方案最多试 1 个替代方案仍失败即人工介入）是关键的鲁棒性设计——避免子 Agent 在某个步骤上无限重试陷入死循环。人工介入通过 `tts_speak` 语音通知用户，等待 30 秒让用户手动解决，然后继续后续步骤。
+Sources: [executor_enhance.py#L27-L34](agent/prompts/executor_enhance.py#L27-L34)
+
+---
+
+## 三、技能注入与运行时分段策略
+
+子 Agent 的技能注入采用**三段式分层**，与主 Agent 的注入方式一致但内容独立：
+
+```python
+# 运行时组装
+enhanced = executor_enhance_prompt.format(
+    tool_names=executor_tool_names_str,   # 注入工具列表
+    skills_list=executor_skills,          # 注入技能列表（executor-skills + auto-skills/executor）
+)
+system_content = executor_system_prompt.replace(
+    "{tool_rules_and_skills}", enhanced   # 将增强内容注入系统人设
+)
+```
+
+这种设计带来的效果是：系统人设（强制规则）**始终在上下文头部**优先影响模型行为，增强内容（工具/技能/流程）紧随其后提供操作指南。两部分在物理上是分割的 Python 模块，每次运行时重新组装，确保动态内容（技能列表随沉淀增加而变化）被正确刷新。
+Sources: [agent_langchain.py#L1604-L1608](agent/agent_langchain.py#L1604-L1608)
+
+### 技能发现范围差异
+
+| 维度 | 主 Agent | 子 Agent |
+|------|---------|---------|
+| 基础技能目录 | `main-skills/` | `executor-skills/` |
+| 自动沉淀目录 | `auto-skills/main/` | `auto-skills/executor/` |
+| 技能加载函数 | `load_skills_list("main")` | `load_skills_list("executor")` |
+| 注入时机 | Agent 初始化时一次注入 | 每次执行任务时注入 |
+
+子 Agent 的 `load_skills_list("executor")` 函数会同时扫描 `executor-skills/`（预置技能）和 `auto-skills/executor/`（历史沉淀技能），因此随着任务执行次数的增加，子 Agent 的可读技能列表会自动增长。这种**增量知识积累**机制使得后续任务可以参考前序任务的执行经验。
+Sources: [agent_langchain.py#L129-L133](agent/agent_langchain.py#L129-L133), [config.py#L56-L60](agent/config.py#L56-L60)
+
+---
+
+## 四、LLM 配置独立性与任务驱动输入
+
+子 Agent 的 LLM 配置独立于主 Agent，通过环境变量 `EXECUTOR_LLM_BASE_URL`、`EXECUTOR_API_KEY`、`EXECUTOR_MODEL`、`EXECUTOR_TEMPERATURE`、`EXECUTOR_MAX_TOKENS` 控制。未设置的字段自动继承主 Agent 的对应值，默认共用同一模型。专门为子 Agent 配置一个较轻量的本地模型（如 qwen2.5:7b）可以显著降低 API 成本。
+
+`_run_executor_foreground` 在第一次执行时延迟初始化 `_executor_llm`，使用 ChatOpenAI 封装，超时时间设为 30 秒（主 Agent 为 10 秒），因为手机操控包含 MCP 调用和 Shell 命令，响应时间更长。
+
+子 Agent 的输入不是用户的自然语言，而是由主 Agent 通过 `delegate_task` 创建的 **task.json 文件驱动**。系统提示词中的第一条指令就是"请读取 `{task_path}` 并开始执行"。task.json 中包含了 `objective`（任务目标）、`steps`（原子步骤数组，每个含 id/desc/status）、`all_completed`（完成标志）等字段。这种**文件驱动的输入模式**与主 Agent 的对话式输入有本质区别：
+Sources: [agent_langchain.py#L1610-L1635](agent/agent_langchain.py#L1610-L1635), [agent_langchain.py#L1700-L1704](agent/agent_langchain.py#L1700-L1704), [basic_tools.py#L918-L989](agent/tools/basic_tools.py#L918-L989)
+
+```
+主 Agent 输入流:  用户消息 → 系统提示词 + 记忆注入 + 技能注入 → 回复
+子 Agent 输入流:  task.json路径 → 系统提示词 + 技能注入 → file_read → 执行
+```
+
+---
+
+## 五、技能沉淀流程：执行闭环的最后一环
+
+子 Agent 每次任务执行完毕后，必须将执行路径沉淀为 SKILL.md 写入 `auto-skills/executor/` 目录。沉淀逻辑由 `skill-creator` 技能规范和系统提示词中的强制规则共同约束：
+
+1. **触发条件**：所有步骤标记为 `completed` 且 `all_completed` 设为 `true`
+2. **前置检查**：必须先 `file_read` 读取 `executor-skills/skill-creator/SKILL.md`，按其中的格式要求编写
+3. **命名规则**：从任务目标提取关键词，最多 3 个词用下划线连接（如 `pinduoduo_buy_shoes`）
+4. **跳过规则**：不足 3 步的任务不沉淀；失败的任务不沉淀
+5. **不阻塞汇报**：先沉淀 skill，再返回最终摘要
+
+沉淀结果会通过 `load_skills_list("executor")` 在下次执行时自动出现在子 Agent 的技能列表中，形成"**执行 → 沉淀 → 复用**"的知识循环。
+Sources: [executor_system.py#L17](agent/prompts/executor_system.py#L17), [skill-creator/SKILL.md](agent/skills/executor-skills/skill-creator/SKILL.md#L1-L46), [agent_langchain.py#L1689-L1696](agent/agent_langchain.py#L1689-L1696)
+
+---
+
+## 六、失败重试：两层兜底机制
+
+子 Agent 的执行可靠性由两层兜底机制保障：
+
+**第一层（提示词内）**：增强提示词中明确规定了"同一方案失败后最多换 1 个替代方案，仍失败则人工介入（tts_speak 通知用户 → 等待 30 秒 → 用户可能手动解决）"。这一规则内置于提示词中，由 LLM 自主判断和触发。
+
+**第二层（代码层面）**：如果子 Agent 仅执行了 2 步或更少的工具调用就停止了（典型场景：只读取了 task.json 但没有真正执行步骤），`_run_executor_foreground` 会自动化检测并触发**强制重试**。重试使用全新的 Agent 实例（避免历史消息格式问题），跳过读 task.json 环节，直接将任务目标与步骤内联到指令中要求立即执行。最多重试 2 次，仍失败则放弃。
+Sources: [agent_langchain.py#L1784-L1825](agent/agent_langchain.py#L1784-L1825)
+
+---
+
+## 延伸阅读
+
+- 主 Agent 提示词结构（基础人设 + 增强规则 + 技能注入）详见：[系统提示词结构](38-xi-tong-ti-shi-ci-jie-gou-ji-chu-ren-she-zeng-qiang-gui-ze-ji-neng-zhu-ru)
+- 子 Agent 委托机制（delegate_task 任务分解与派发）详见：[子 Agent 委托机制](29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa)
+- 子 Agent 前台同步执行与流式输出详见：[子 Agent 前台同步执行](30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu)
+- 子 Agent 独立配置与技能隔离详见：[子 Agent 独立配置与技能隔离](31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi)
+- 自动沉淀技能机制详见：[自动沉淀技能](36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei)
