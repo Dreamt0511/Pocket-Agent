@@ -1,0 +1,94 @@
+site_name: Pocket-Agent 文档
+site_description: 轻量级移动端 AI Agent 技术文档
+repo_url: https://github.com/Dreamt0511/Pocket-Agent
+repo_name: Dreamt0511/Pocket-Agent
+
+theme:
+  name: material
+  language: zh
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切换到暗色模式
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切换到亮色模式
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+
+nav:
+  - 入门指南:
+      - 项目概述: 1-xiang-mu-gai-shu.md
+      - 快速启动: 2-kuai-su-qi-dong.md
+      - 环境搭建:
+          - Termux 安装与配置: 3-termux-an-zhuang-yu-pei-zhi.md
+          - 依赖安装与环境变量配置: 4-yi-lai-an-zhuang-yu-huan-jing-bian-liang-pei-zhi.md
+          - 本地大模型部署: 5-ben-di-da-mo-xing-bu-shu-llama-cpp-vulkan-gpu-jia-su.md
+          - Embedding 模型配置: 6-embedding-mo-xing-pei-zhi-bge-m3-yu-yi-jian-suo.md
+      - 运行模式:
+          - 终端交互模式: 7-zhong-duan-jiao-hu-mo-shi-main-py.md
+          - HTTP API 模式: 8-http-api-mo-shi-fastapi-sse-liu-shi.md
+  - 核心架构:
+      - 整体架构与设计哲学: 9-zheng-ti-jia-gou-yu-she-ji-zhe-xue.md
+      - Agent 引擎:
+          - LangChain Agent 核心实现: 10-langchain-agent-he-xin-shi-xian-create_agent-zhong-jian-jian-lian.md
+          - 中间件链深度解析: 11-zhong-jian-jian-lian-shen-du-jie-xi-shang-xia-wen-ya-suo-zhong-fu-jian-ce-mo-xing-diao-yong-xian-zhi.md
+          - DeepSeek reasoning_content 兼容性补丁: 12-deepseek-reasoning_content-jian-rong-xing-bu-ding-ji-zhi.md
+      - 对话管理:
+          - 对话生命周期与流式输出: 13-dui-hua-sheng-ming-zhou-qi-yu-liu-shi-shu-chu.md
+          - LangGraph Checkpoint 持久化: 14-langgraph-checkpoint-chi-jiu-hua-asyncsqlitesaver.md
+  - 记忆系统:
+      - 分层记忆架构: 15-fen-ceng-ji-yi-jia-gou-yong-hu-hua-xiang-shi-shi-ji-yi-shi-jian-ji-yi.md
+      - 存储与检索:
+          - SQLite + FTS5 全文搜索: 16-sqlite-fts5-quan-wen-sou-suo-trigram-zhong-wen-zhi-chi.md
+          - 向量语义搜索: 17-xiang-liang-yu-yi-sou-suo-embeddingclient-numpy-yu-xian-xiang-si-du.md
+          - RRF 融合排序策略: 18-rrf-rong-he-pai-xu-ce-lue.md
+      - 记忆管理:
+          - 记忆工具使用: 19-ji-yi-gong-ju-shi-yong-save_memory-search_memory-update_user_profile.md
+          - 记忆判断规则与存储策略: 20-ji-yi-pan-duan-gui-ze-yu-cun-chu-ce-lue.md
+          - 记忆清理与向量索引维护: 21-ji-yi-qing-li-yu-xiang-liang-suo-yin-wei-hu.md
+  - 工具系统:
+      - 内置工具一览: 22-nei-zhi-gong-ju-lan-wen-jian-cao-zuo-shell-zhi-xing-xi-tong-xin-xi-mcp-diao-yong.md
+      - 手机控制:
+          - Termux API 操控: 23-termux-api-cao-kong-tong-zhi-tts-chuan-gan-qi-dian-chi-deng.md
+          - NeuralBridge MCP 服务: 24-neuralbridge-mcp-fu-wu-ui-shu-fen-xi-dian-ji-hua-dong-jie-tu.md
+          - 手机操纵指南与包名管理: 25-shou-ji-cao-zong-zhi-nan-yu-bao-ming-guan-li.md
+      - 3D 虚拟身体:
+          - 3D 身体控制工具: 26-3d-shen-ti-kong-zhi-gong-ju-control_body-move_body-body_script-body_idle.md
+          - Three.js 前端渲染与 SSE 实时推送: 27-three-js-qian-duan-xuan-ran-yu-sse-shi-shi-tui-song.md
+          - 浏览器双向交互: 28-liu-lan-qi-shuang-xiang-jiao-hu-xiao-xi-shu-ru-xiang-ying-liu.md
+  - 子 Agent 系统:
+      - 子 Agent 委托机制: 29-zi-agent-wei-tuo-ji-zhi-delegate_task-ren-wu-fen-jie-yu-pai-fa.md
+      - 子 Agent 执行:
+          - 子 Agent 前台同步执行与流式输出: 30-zi-agent-qian-tai-tong-bu-zhi-xing-yu-liu-shi-shu-chu.md
+          - 子 Agent 独立配置与技能隔离: 31-zi-agent-du-li-pei-zhi-yu-ji-neng-ge-chi.md
+          - 任务文件管理与进度追踪: 32-ren-wu-wen-jian-guan-li-yu-jin-du-zhui-zong.md
+  - 技能系统:
+      - 技能系统概述: 33-ji-neng-xi-tong-gai-shu-skill-md-zhi-shi-wen-dang-vs-gong-ju.md
+      - 技能自动发现与加载机制: 37-ji-neng-zi-dong-fa-xian-yu-jia-zai-ji-zhi.md
+      - 技能类型:
+          - 主 Agent 技能: 34-zhu-agent-ji-neng-main-skills-kai-fa-lei-shou-ji-cao-kong-lei.md
+          - 子 Agent 技能: 35-zi-agent-ji-neng-executor-skills-kuai-su-mo-shi-cao-kong-zhi-nan.md
+          - 自动沉淀技能: 36-zi-dong-chen-dian-ji-neng-auto-skills-zhi-xing-jing-yan-zi-dong-ji-lei.md
+  - 提示词工程:
+      - 系统提示词结构: 38-xi-tong-ti-shi-ci-jie-gou-ji-chu-ren-she-zeng-qiang-gui-ze-ji-neng-zhu-ru.md
+      - 子 Agent 提示词设计: 39-zi-agent-ti-shi-ci-she-ji-du-li-xi-tong-ren-she-yu-zhi-xing-liu-cheng.md
+      - 记忆检索与环境感知的上下文注入策略: 40-ji-yi-jian-suo-yu-huan-jing-gan-zhi-de-shang-xia-wen-zhu-ru-ce-lue.md
+  - 配置与扩展:
+      - 环境变量配置说明: 41-huan-jing-bian-liang-pei-zhi-shuo-ming-llm-embedding-mcp-zi-agent.md
+      - agent/config.py 核心配置项: 42-agent-config-py-he-xin-pei-zhi-xiang.md
+      - 终端 UI 与进度显示系统: 43-zhong-duan-ui-yu-jin-du-xian-shi-xi-tong-rich-ku.md
+      - 结构化日志系统: 44-jie-gou-hua-ri-zhi-xi-tong-an-tian-gui-dang-dui-hua-gong-ju-zi-agent-quan-lian-lu-shen-ji.md
+  - 部署与运维:
+      - FastAPI HTTP 服务启动与心跳机制: 45-fastapi-http-fu-wu-qi-dong-yu-xin-tiao-ji-zhi.md
+      - Android App 客户端集成指南: 46-android-app-ke-hu-duan-ji-cheng-zhi-nan.md
+      - 无线 ADB 调试配置: 47-wu-xian-adb-diao-shi-pei-zhi.md

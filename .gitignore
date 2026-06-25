@@ -88,6 +88,9 @@ ENV/
 # Project specific ignore rules for Pocket-Agent
 # ==============================================
 
+# MkDocs build output
+site/
+
 # Memory data (conversations, vector indexes)
 memory/
 *.faiss
