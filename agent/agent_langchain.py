@@ -46,7 +46,7 @@ from .config import (
 )
 from .prompts.agent_enhance import prompt as agent_enhance_prompt
 from .logger import AgentLogger
-from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id, _fts_search, _vector_search, _rrf_merge
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id, _fts_search, _vector_search, _rrf_merge, _rerank_memories
 from .prompts.executor_system import executor_system_prompt
 from .prompts.executor_enhance import prompt as executor_enhance_prompt
 
@@ -716,7 +716,8 @@ class LangChainPocketAgent:
             def _do_search():
                 fts_results = _fts_search(query, msg_type="memory")
                 vec_results = _vector_search(query, msg_type="memory")
-                return _rrf_merge(fts_results, vec_results, top_n=top_n)
+                merged = _rrf_merge(fts_results, vec_results, top_n=8)
+                return _rerank_memories(merged, top_k=top_n)
             results = await loop.run_in_executor(None, _do_search)
             if not results:
                 return ""

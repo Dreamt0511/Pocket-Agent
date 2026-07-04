@@ -522,23 +522,24 @@ def _vector_search(query: str, conversation_id: str = None, days: int = None, ms
     except Exception:
         return []
 
-def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 3) -> list:
-    """综合排序：RRF + 相似度加权 + 时间衰减 + 重要性微调
+def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 20) -> list:
+    """纯 RRF 融合：将 FTS5 和向量检索结果通过 Reciprocal Rank Fusion 合并。
 
-    设计原则：语义相关性是主排序信号，重要性仅作微调避免低相关结果靠高分爬上来。
+    RRF 分数 = 1/(k + rank + 1)，出现在两路中的结果分数累加。
+    仅做融合排序，不做加权——加权由上游 _rerank_memories 负责。
+
+    参数：
+        k: RRF 平滑参数（越大越平滑，默认 60）
+        top_n: 返回候选数（默认 20，给上游 rerank 留足空间）
     """
-    current_time = time.time() * 1000  # 毫秒
-    DECAY_RATE = 0.995  # 每小时衰减
-
     scores = {}
 
-    # FTS5 结果按 rank 排序
+    # FTS5 结果已按 rank 排序
     for rank, msg in enumerate(fts_results):
         key = msg.get("id")
-        rrf_score = 1 / (k + rank + 1)
-        scores[key] = {"rrf": rrf_score, "msg": msg}
+        scores[key] = {"rrf": 1 / (k + rank + 1), "msg": msg}
 
-    # 向量结果按 similarity 排序（similarity 越高越靠前）
+    # 向量结果按 similarity 降序排列后算 RRF
     sorted_vec = sorted(vec_results, key=lambda x: x.get("similarity", 0), reverse=True)
     for rank, msg in enumerate(sorted_vec):
         key = msg.get("id")
@@ -548,37 +549,54 @@ def _rrf_merge(fts_results: list, vec_results: list, k: int = 60, top_n: int = 3
         else:
             scores[key] = {"rrf": rrf_score, "msg": msg}
 
-    # 计算综合分数
-    for key, data in scores.items():
-        msg = data["msg"]
-
-        # 语义相关性：RRF 分数 × 相似度加权
-        semantic_score = data["rrf"]
-        similarity = msg.get("similarity", 0.5)
-        # 向量结果有 similarity 字段，FTS 结果没有 → 用 0.5 兜底
-        weighted_semantic = semantic_score * (0.5 + similarity)
-
-        # 时间相关性：指数衰减
-        last_access = msg.get("last_access_at", current_time)
-        if last_access == 0:
-            last_access = current_time
-        hours_passed = (current_time - last_access) / 3600000  # 毫秒转小时
-        recency_score = DECAY_RATE ** hours_passed
-
-        # 重要性：乘法微调（0.8~1.2 范围），确保低语义相关性不会被 importance 拉上来
-        importance = msg.get("importance", 3)
-        importance_factor = 0.8 + importance * 0.04  # imp=5 → 1.0, imp=8 → 1.12, imp=3 → 0.92
-
-        # 综合分数：语义为主（乘以 importance 微调），时间为辅
-        data["final_score"] = (
-            0.75 * weighted_semantic * importance_factor +
-            0.25 * recency_score
-        )
-
-    # 按综合分数排序
-    sorted_items = sorted(scores.values(), key=lambda x: x["final_score"], reverse=True)
+    # 按纯 RRF 分数排序
+    sorted_items = sorted(scores.values(), key=lambda x: x["rrf"], reverse=True)
 
     return [item["msg"] for item in sorted_items[:top_n]]
+
+
+def _rerank_memories(memories: list, alpha: float = 0.45, beta: float = 0.25, gamma: float = 0.3, top_k: int = 5) -> list:
+    """对 RRF 融合后的候选记忆二次排序。
+
+    综合分 = α·语义相似度 + β·时间衰减 + γ·重要性
+    三个维度归一化到 0~1 后加权，确保量级一致。
+
+    参数：
+        alpha: 语义权重（默认 0.45）
+        beta:   时间衰减权重（默认 0.25）
+        gamma:  重要性权重（默认 0.3）
+        top_k:  返回条数（默认 5）
+    """
+    if not memories:
+        return []
+
+    current_time = time.time() * 1000  # 毫秒
+    DECAY_RATE = 0.995  # 每小时衰减
+
+    for mem in memories:
+        # 语义相似度：向量结果有 similarity，FTS 结果用 0.5 兜底
+        similarity = mem.get("similarity", 0.5)
+
+        # 时间衰减：last_access_at 越近越高
+        last_access = mem.get("last_access_at", current_time)
+        if last_access == 0:
+            last_access = current_time
+        hours_passed = (current_time - last_access) / 3600000
+        recency_score = DECAY_RATE ** hours_passed
+
+        # 重要性：1~10 归一化到 0~1
+        importance = mem.get("importance", 3)
+        importance_score = min(importance / 10.0, 1.0)
+
+        # 加权综合
+        mem["_final_score"] = (
+            alpha * similarity +
+            beta * recency_score +
+            gamma * importance_score
+        )
+
+    memories.sort(key=lambda x: x["_final_score"], reverse=True)
+    return memories[:top_k]
 
 
 @tool
@@ -863,8 +881,10 @@ def search_memory(query: str, scope: str = "memory", memory_type: str = None, da
             fts_results = _fts_search(query, days=days, msg_type="memory", memory_type=memory_type)
             _notify_progress("正在语义搜索...")
             vec_results = _vector_search(query, days=days, msg_type="memory", memory_type=memory_type)
-            _notify_progress("正在合并排序...")
-            results = _rrf_merge(fts_results, vec_results, top_n=5)
+            _notify_progress("正在融合排序...")
+            merged = _rrf_merge(fts_results, vec_results, top_n=12)
+            _notify_progress("正在综合排序...")
+            results = _rerank_memories(merged, top_k=5)
         else:
             return f"无效的 scope '{scope}'，只能是 'memory' 或 'session'"
 
